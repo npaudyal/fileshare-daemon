@@ -1,0 +1,20 @@
+[device]
+# Device ID will be auto-generated on first run
+# name will default to hostname
+
+[network]
+port = 9876
+discovery_port = 9877
+service_name = "_fileshare._tcp.local."
+timeout_seconds = 30
+
+[transfer]
+chunk_size = 65536  # 64KB chunks
+max_concurrent_transfers = 5
+# bandwidth_limit_mbps = 100  # Optional bandwidth limit
+# temp_dir = "/path/to/temp"  # Optional custom temp directory
+
+[security]
+require_pairing = true
+encryption_enabled = true
+allowed_devices = []  # UUIDs of allowed devices
