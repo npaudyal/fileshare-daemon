@@ -359,24 +359,49 @@ impl FileshareDaemon {
         let listener = tokio::net::TcpListener::bind("0.0.0.0:9876").await?;
         info!("Peer manager listening on 0.0.0.0:9876");
 
-        loop {
-            match listener.accept().await {
-                Ok((stream, addr)) => {
-                    info!("New connection from {}", addr);
-                    let pm = peer_manager.clone();
+        // Spawn a task to handle incoming connections
+        let connection_pm = peer_manager.clone();
+        let connection_handle = tokio::spawn(async move {
+            loop {
+                match listener.accept().await {
+                    Ok((stream, addr)) => {
+                        info!("New connection from {}", addr);
+                        let pm = connection_pm.clone();
 
-                    tokio::spawn(async move {
-                        let mut pm = pm.write().await;
-                        if let Err(e) = pm.handle_connection(stream).await {
-                            warn!("Failed to handle connection from {}: {}", addr, e);
-                        }
-                    });
-                }
-                Err(e) => {
-                    error!("Failed to accept connection: {}", e);
-                    tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+                        tokio::spawn(async move {
+                            let mut pm = pm.write().await;
+                            if let Err(e) = pm.handle_connection(stream).await {
+                                warn!("Failed to handle connection from {}: {}", addr, e);
+                            }
+                        });
+                    }
+                    Err(e) => {
+                        error!("Failed to accept connection: {}", e);
+                        tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+                    }
                 }
             }
+        });
+
+        // Spawn a task to process messages
+        let message_pm = peer_manager.clone();
+        let message_handle = tokio::spawn(async move {
+            let mut interval = tokio::time::interval(tokio::time::Duration::from_millis(100));
+            loop {
+                interval.tick().await;
+                let mut pm = message_pm.write().await;
+                if let Err(e) = pm.process_messages().await {
+                    error!("Error processing messages: {}", e);
+                }
+            }
+        });
+
+        // Wait for either task to complete
+        tokio::select! {
+            _ = connection_handle => {},
+            _ = message_handle => {},
         }
+
+        Ok(())
     }
 }

@@ -34,6 +34,8 @@ pub struct PeerManager {
     file_transfer: Arc<RwLock<FileTransferManager>>,
     message_tx: mpsc::UnboundedSender<(Uuid, Message)>,
     message_rx: mpsc::UnboundedReceiver<(Uuid, Message)>,
+    // Store active connections to send messages
+    connections: HashMap<Uuid, mpsc::UnboundedSender<Message>>,
 }
 
 impl PeerManager {
@@ -43,13 +45,25 @@ impl PeerManager {
             FileTransferManager::new(settings.clone()).await?,
         ));
 
-        Ok(Self {
+        let peer_manager = Self {
             settings,
             peers: HashMap::new(),
             file_transfer,
-            message_tx,
+            message_tx: message_tx.clone(),
             message_rx,
-        })
+            connections: HashMap::new(),
+        };
+
+        // Set up the message sender for file transfers
+        peer_manager.set_file_transfer_message_sender().await;
+
+        Ok(peer_manager)
+    }
+
+    // Connect file transfer manager with message sender
+    async fn set_file_transfer_message_sender(&self) {
+        let mut ft = self.file_transfer.write().await;
+        ft.set_message_sender(self.message_tx.clone());
     }
 
     pub async fn on_device_discovered(&mut self, device_info: DeviceInfo) -> Result<()> {
@@ -250,33 +264,58 @@ impl PeerManager {
     async fn handle_authenticated_connection(
         &mut self,
         peer_id: Uuid,
-        mut connection: PeerConnection,
+        connection: PeerConnection,
     ) -> Result<()> {
         info!("Handling authenticated connection with peer {}", peer_id);
 
         let message_tx = self.message_tx.clone();
+        let (conn_tx, mut conn_rx) = mpsc::unbounded_channel::<Message>();
 
-        // Spawn a task to handle this connection
-        tokio::spawn(async move {
+        // Store the connection sender so we can send messages to this peer
+        self.connections.insert(peer_id, conn_tx);
+
+        // Split the connection into read and write halves
+        let (mut read_half, mut write_half) = connection.split();
+
+        // Spawn task to handle reading messages
+        let read_message_tx = message_tx.clone();
+        let read_task = tokio::spawn(async move {
             loop {
-                match connection.read_message().await {
+                match read_half.read_message().await {
                     Ok(message) => {
                         debug!(
                             "Received message from {}: {:?}",
                             peer_id, message.message_type
                         );
-                        if let Err(e) = message_tx.send((peer_id, message)) {
+                        if let Err(e) = read_message_tx.send((peer_id, message)) {
                             error!("Failed to forward message: {}", e);
                             break;
                         }
                     }
                     Err(e) => {
-                        warn!("Connection error with peer {}: {}", peer_id, e);
+                        warn!("Connection read error with peer {}: {}", peer_id, e);
                         break;
                     }
                 }
             }
+        });
 
+        // Spawn task to handle writing messages
+        let write_task = tokio::spawn(async move {
+            while let Some(message) = conn_rx.recv().await {
+                if let Err(e) = write_half.write_message(&message).await {
+                    error!("Failed to write message to peer {}: {}", peer_id, e);
+                    break;
+                }
+            }
+        });
+
+        // Clean up when connection ends
+        tokio::spawn(async move {
+            tokio::select! {
+                _ = read_task => {},
+                _ = write_task => {},
+            }
             info!("Connection handler for peer {} ended", peer_id);
         });
 
@@ -306,11 +345,10 @@ impl PeerManager {
     }
 
     pub fn get_connected_peers(&self) -> Vec<Peer> {
-        // Changed from Vec<&Peer> to Vec<Peer>
         self.peers
             .values()
             .filter(|peer| matches!(peer.connection_status, ConnectionStatus::Authenticated))
-            .cloned() // Clone the peers instead of returning references
+            .cloned()
             .collect()
     }
 
@@ -325,7 +363,10 @@ impl PeerManager {
         match message.message_type {
             MessageType::Ping => {
                 debug!("Received ping from {}", peer_id);
-                // TODO: Send pong response
+                // Send pong response
+                if let Some(conn) = self.connections.get(&peer_id) {
+                    let _ = conn.send(Message::pong());
+                }
             }
             MessageType::Pong => {
                 debug!("Received pong from {}", peer_id);
@@ -340,6 +381,19 @@ impl PeerManager {
                 info!("Received file offer from {}: {}", peer_id, metadata.name);
                 let mut ft = self.file_transfer.write().await;
                 ft.handle_file_offer(peer_id, transfer_id, metadata).await?;
+            }
+            MessageType::FileOfferResponse {
+                transfer_id,
+                accepted,
+                reason,
+            } => {
+                info!(
+                    "Received file offer response from {}: {}",
+                    peer_id, accepted
+                );
+                let mut ft = self.file_transfer.write().await;
+                ft.handle_file_offer_response(peer_id, transfer_id, accepted, reason)
+                    .await?;
             }
             MessageType::FileChunk { transfer_id, chunk } => {
                 let mut ft = self.file_transfer.write().await;
@@ -359,6 +413,16 @@ impl PeerManager {
                 ft.handle_transfer_error(peer_id, transfer_id, error)
                     .await?;
             }
+            MessageType::FileChunkAck {
+                transfer_id,
+                chunk_index,
+            } => {
+                debug!(
+                    "Received chunk ack for transfer {} chunk {}",
+                    transfer_id, chunk_index
+                );
+                // Could implement flow control here
+            }
             _ => {
                 debug!(
                     "Unhandled message type from {}: {:?}",
@@ -370,8 +434,17 @@ impl PeerManager {
     }
 }
 
-struct PeerConnection {
+// Split PeerConnection into read and write halves
+pub struct PeerConnection {
     stream: TcpStream,
+}
+
+pub struct PeerConnectionReadHalf {
+    stream: tokio::io::ReadHalf<TcpStream>,
+}
+
+pub struct PeerConnectionWriteHalf {
+    stream: tokio::io::WriteHalf<TcpStream>,
 }
 
 impl PeerConnection {
@@ -379,11 +452,25 @@ impl PeerConnection {
         Self { stream }
     }
 
+    fn split(self) -> (PeerConnectionReadHalf, PeerConnectionWriteHalf) {
+        let (read_half, write_half) = tokio::io::split(self.stream);
+        (
+            PeerConnectionReadHalf { stream: read_half },
+            PeerConnectionWriteHalf { stream: write_half },
+        )
+    }
+
     async fn read_message(&mut self) -> Result<Message> {
         // Read message length first (4 bytes)
         let mut len_bytes = [0u8; 4];
         self.stream.read_exact(&mut len_bytes).await?;
         let message_len = u32::from_be_bytes(len_bytes) as usize;
+
+        // Validate message length to prevent memory attacks
+        if message_len > 100_000_000 {
+            // 100MB max message size
+            return Err(FileshareError::Transfer("Message too large".to_string()));
+        }
 
         // Read the message data
         let mut message_data = vec![0u8; message_len];
@@ -394,6 +481,44 @@ impl PeerConnection {
         Ok(message)
     }
 
+    async fn write_message(&mut self, message: &Message) -> Result<()> {
+        // Serialize the message
+        let message_data = bincode::serialize(message)?;
+        let message_len = message_data.len() as u32;
+
+        // Write length first, then data
+        self.stream.write_all(&message_len.to_be_bytes()).await?;
+        self.stream.write_all(&message_data).await?;
+        self.stream.flush().await?;
+
+        Ok(())
+    }
+}
+
+impl PeerConnectionReadHalf {
+    async fn read_message(&mut self) -> Result<Message> {
+        // Read message length first (4 bytes)
+        let mut len_bytes = [0u8; 4];
+        self.stream.read_exact(&mut len_bytes).await?;
+        let message_len = u32::from_be_bytes(len_bytes) as usize;
+
+        // Validate message length to prevent memory attacks
+        if message_len > 100_000_000 {
+            // 100MB max message size
+            return Err(FileshareError::Transfer("Message too large".to_string()));
+        }
+
+        // Read the message data
+        let mut message_data = vec![0u8; message_len];
+        self.stream.read_exact(&mut message_data).await?;
+
+        // Deserialize the message
+        let message: Message = bincode::deserialize(&message_data)?;
+        Ok(message)
+    }
+}
+
+impl PeerConnectionWriteHalf {
     async fn write_message(&mut self, message: &Message) -> Result<()> {
         // Serialize the message
         let message_data = bincode::serialize(message)?;

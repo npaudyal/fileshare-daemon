@@ -7,12 +7,9 @@ use uuid::Uuid;
 pub async fn show_file_picker() -> Result<Option<Vec<PathBuf>>> {
     info!("Opening file picker");
 
-    // Use blocking task since rfd is sync
     let result = tokio::task::spawn_blocking(|| {
-        // Just use the simplest approach - no custom directory
         FileDialog::new()
             .set_title("Select files to share")
-            .add_filter("All Files", &["*"])
             .pick_files()
     })
     .await;
@@ -43,7 +40,6 @@ pub async fn show_device_selector(peers: Vec<Peer>) -> Result<Option<Uuid>> {
     info!("Showing device selector for {} peers", peers.len());
 
     if peers.is_empty() {
-        // Show notification that no devices are available
         show_notification(
             "No Devices Available",
             "No connected devices found. Make sure other devices are running the app and connected to the same network."
@@ -52,7 +48,6 @@ pub async fn show_device_selector(peers: Vec<Peer>) -> Result<Option<Uuid>> {
     }
 
     if peers.len() == 1 {
-        // If only one device, auto-select it
         let peer = &peers[0];
         info!(
             "Auto-selecting single device: {} ({})",
@@ -68,14 +63,21 @@ pub async fn show_device_selector(peers: Vec<Peer>) -> Result<Option<Uuid>> {
         return Ok(Some(peer.device_info.id));
     }
 
-    // For now, show a simple notification and select the first device
-    // In a future version, we could show a proper selection dialog
-    let selected_peer = &peers[0];
+    println!("\n📱 Available devices:");
+    for (i, peer) in peers.iter().enumerate() {
+        println!(
+            "  {}. {} ({})",
+            i + 1,
+            peer.device_info.name,
+            peer.device_info.addr
+        );
+    }
 
+    let selected_peer = &peers[0];
     show_notification(
         "Multiple Devices Found",
         &format!(
-            "Sending to {} (first available device)",
+            "Sending to {} (first available device). In future versions, you'll be able to choose.",
             selected_peer.device_info.name
         ),
     )

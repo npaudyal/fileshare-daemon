@@ -4,8 +4,12 @@ use std::fs::File;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::PathBuf;
 use std::sync::Arc;
+use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
+
+// Add this new type for sending messages to peers
+pub type MessageSender = mpsc::UnboundedSender<(Uuid, Message)>;
 
 #[derive(Debug)]
 pub struct FileTransfer {
@@ -39,6 +43,7 @@ pub enum TransferStatus {
 pub struct FileTransferManager {
     settings: Arc<Settings>,
     active_transfers: HashMap<Uuid, FileTransfer>,
+    message_sender: Option<MessageSender>,
 }
 
 impl FileTransferManager {
@@ -46,13 +51,17 @@ impl FileTransferManager {
         Ok(Self {
             settings,
             active_transfers: HashMap::new(),
+            message_sender: None,
         })
+    }
+
+    pub fn set_message_sender(&mut self, sender: MessageSender) {
+        self.message_sender = Some(sender);
     }
 
     pub async fn send_file(&mut self, peer_id: Uuid, file_path: PathBuf) -> Result<()> {
         info!("Starting file transfer to {}: {:?}", peer_id, file_path);
 
-        // Validate file exists and is readable
         if !file_path.exists() {
             return Err(FileshareError::FileOperation(
                 "File does not exist".to_string(),
@@ -65,11 +74,9 @@ impl FileTransferManager {
             ));
         }
 
-        // Create file metadata
         let metadata = FileMetadata::from_path(&file_path)?;
         let transfer_id = Uuid::new_v4();
 
-        // Create transfer record
         let transfer = FileTransfer {
             id: transfer_id,
             peer_id,
@@ -84,9 +91,166 @@ impl FileTransferManager {
 
         self.active_transfers.insert(transfer_id, transfer);
 
-        // TODO: Send file offer to peer
-        // This would normally send a FileOffer message through the peer manager
-        info!("File offer sent for transfer {}", transfer_id);
+        if let Some(ref sender) = self.message_sender {
+            let file_offer = Message::new(MessageType::FileOffer {
+                transfer_id,
+                metadata: metadata.clone(),
+            });
+
+            if let Err(e) = sender.send((peer_id, file_offer)) {
+                error!("Failed to send file offer: {}", e);
+                return Err(FileshareError::Transfer(format!(
+                    "Failed to send file offer: {}",
+                    e
+                )));
+            }
+
+            info!(
+                "File offer sent for transfer {} to peer {}",
+                transfer_id, peer_id
+            );
+        } else {
+            return Err(FileshareError::Transfer(
+                "Message sender not configured".to_string(),
+            ));
+        }
+
+        Ok(())
+    }
+
+    pub async fn handle_file_offer_response(
+        &mut self,
+        peer_id: Uuid,
+        transfer_id: Uuid,
+        accepted: bool,
+        reason: Option<String>,
+    ) -> Result<()> {
+        if !accepted {
+            info!(
+                "File offer {} was rejected by peer {}: {:?}",
+                transfer_id, peer_id, reason
+            );
+            if let Some(transfer) = self.active_transfers.get_mut(&transfer_id) {
+                transfer.status = TransferStatus::Cancelled;
+            }
+            return Ok(());
+        }
+
+        info!("File offer {} accepted by peer {}", transfer_id, peer_id);
+        self.start_file_transfer(transfer_id).await?;
+        Ok(())
+    }
+
+    async fn start_file_transfer(&mut self, transfer_id: Uuid) -> Result<()> {
+        let (file_path, peer_id, chunk_size) = {
+            let transfer = self
+                .active_transfers
+                .get_mut(&transfer_id)
+                .ok_or_else(|| FileshareError::Transfer("Transfer not found".to_string()))?;
+
+            transfer.status = TransferStatus::Active;
+            (
+                transfer.file_path.clone(),
+                transfer.peer_id,
+                self.settings.transfer.chunk_size,
+            )
+        };
+
+        let message_sender = self
+            .message_sender
+            .clone()
+            .ok_or_else(|| FileshareError::Transfer("Message sender not configured".to_string()))?;
+
+        tokio::spawn(async move {
+            if let Err(e) =
+                Self::send_file_chunks(message_sender, peer_id, transfer_id, file_path, chunk_size)
+                    .await
+            {
+                error!("Failed to send file chunks: {}", e);
+            }
+        });
+
+        Ok(())
+    }
+
+    async fn send_file_chunks(
+        message_sender: MessageSender,
+        peer_id: Uuid,
+        transfer_id: Uuid,
+        file_path: PathBuf,
+        chunk_size: usize,
+    ) -> Result<()> {
+        use sha2::{Digest, Sha256};
+
+        info!("Starting to send file chunks for transfer {}", transfer_id);
+
+        let mut file = File::open(&file_path)?;
+        let mut buffer = vec![0u8; chunk_size];
+        let mut chunk_index = 0u64;
+        let mut hasher = Sha256::new();
+
+        loop {
+            match file.read(&mut buffer) {
+                Ok(0) => {
+                    let checksum = format!("{:x}", hasher.finalize());
+
+                    let complete_msg = Message::new(MessageType::TransferComplete {
+                        transfer_id,
+                        checksum,
+                    });
+
+                    if let Err(e) = message_sender.send((peer_id, complete_msg)) {
+                        error!("Failed to send transfer complete: {}", e);
+                    } else {
+                        info!("File transfer {} completed successfully", transfer_id);
+                    }
+                    break;
+                }
+                Ok(bytes_read) => {
+                    let chunk_data = buffer[..bytes_read].to_vec();
+                    let is_last = bytes_read < chunk_size;
+
+                    hasher.update(&chunk_data);
+
+                    let chunk = TransferChunk {
+                        index: chunk_index,
+                        data: chunk_data,
+                        is_last,
+                    };
+
+                    let message = Message::new(MessageType::FileChunk { transfer_id, chunk });
+
+                    if let Err(e) = message_sender.send((peer_id, message)) {
+                        error!("Failed to send chunk {}: {}", chunk_index, e);
+
+                        let error_msg = Message::new(MessageType::TransferError {
+                            transfer_id,
+                            error: format!("Failed to send chunk: {}", e),
+                        });
+                        let _ = message_sender.send((peer_id, error_msg));
+                        break;
+                    }
+
+                    debug!(
+                        "Sent chunk {} for transfer {} ({} bytes)",
+                        chunk_index, transfer_id, bytes_read
+                    );
+                    chunk_index += 1;
+
+                    tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+                }
+                Err(e) => {
+                    error!("Error reading file: {}", e);
+                    let error_msg = Message::new(MessageType::TransferError {
+                        transfer_id,
+                        error: format!("Read error: {}", e),
+                    });
+
+                    let _ = message_sender.send((peer_id, error_msg));
+                    break;
+                }
+            }
+        }
 
         Ok(())
     }
@@ -102,20 +266,20 @@ impl FileTransferManager {
             peer_id, metadata.name, metadata.size
         );
 
-        // Determine where to save the file
         let save_path = self.get_save_path(&metadata.name)?;
-
-        // Calculate number of chunks
         let chunk_size = self.settings.transfer.chunk_size as u64;
-        let num_chunks = (metadata.size + chunk_size - 1) / chunk_size;
+        let num_chunks = if metadata.size == 0 {
+            1
+        } else {
+            (metadata.size + chunk_size - 1) / chunk_size
+        };
         let chunks_received = vec![false; num_chunks as usize];
 
-        // Create transfer record
         let transfer = FileTransfer {
             id: transfer_id,
             peer_id,
             metadata: metadata.clone(),
-            file_path: save_path,
+            file_path: save_path.clone(),
             direction: TransferDirection::Incoming,
             status: TransferStatus::Pending,
             bytes_transferred: 0,
@@ -125,9 +289,25 @@ impl FileTransferManager {
 
         self.active_transfers.insert(transfer_id, transfer);
 
-        // Auto-accept for now (in a real app, you'd show a prompt)
-        self.accept_file_transfer(transfer_id).await?;
+        if let Some(ref sender) = self.message_sender {
+            let response = Message::new(MessageType::FileOfferResponse {
+                transfer_id,
+                accepted: true,
+                reason: None,
+            });
 
+            if let Err(e) = sender.send((peer_id, response)) {
+                error!("Failed to send file offer response: {}", e);
+                return Err(FileshareError::Transfer(format!(
+                    "Failed to send response: {}",
+                    e
+                )));
+            }
+
+            info!("Sent file offer acceptance for transfer {}", transfer_id);
+        }
+
+        self.accept_file_transfer(transfer_id).await?;
         Ok(())
     }
 
@@ -137,7 +317,6 @@ impl FileTransferManager {
             .get_mut(&transfer_id)
             .ok_or_else(|| FileshareError::Transfer("Transfer not found".to_string()))?;
 
-        // Create the file
         let file = File::create(&transfer.file_path)
             .map_err(|e| FileshareError::FileOperation(format!("Failed to create file: {}", e)))?;
 
@@ -149,7 +328,6 @@ impl FileTransferManager {
             transfer_id, transfer.file_path
         );
 
-        // TODO: Send acceptance message to peer
         Ok(())
     }
 
@@ -159,8 +337,9 @@ impl FileTransferManager {
         transfer_id: Uuid,
         chunk: TransferChunk,
     ) -> Result<()> {
-        // Split the borrowing to avoid conflicts
-        let (_file_path, chunk_size) = {
+        // Extract necessary data without keeping mutable borrow
+        let (chunk_size, should_send_ack) = {
+            // Scope the borrow to just this block
             let transfer = self
                 .active_transfers
                 .get(&transfer_id)
@@ -176,47 +355,57 @@ impl FileTransferManager {
                 return Err(FileshareError::Transfer("Transfer not active".to_string()));
             }
 
-            (
-                transfer.file_path.clone(),
-                self.settings.transfer.chunk_size as u64,
-            )
-        };
+            (self.settings.transfer.chunk_size as u64, true)
+        }; // Borrow ends here
 
-        // Now we can safely get mutable access
-        let transfer = self.active_transfers.get_mut(&transfer_id).unwrap();
+        // Now get mutable access for writing
+        let is_complete = {
+            let transfer = self.active_transfers.get_mut(&transfer_id).unwrap();
 
-        // Write chunk to file
-        if let Some(ref mut file) = transfer.file_handle {
-            let offset = chunk.index * chunk_size;
+            if let Some(ref mut file) = transfer.file_handle {
+                let offset = chunk.index * chunk_size;
 
-            file.seek(SeekFrom::Start(offset))
-                .map_err(|e| FileshareError::FileOperation(format!("Seek failed: {}", e)))?;
+                file.seek(SeekFrom::Start(offset))
+                    .map_err(|e| FileshareError::FileOperation(format!("Seek failed: {}", e)))?;
 
-            file.write_all(&chunk.data)
-                .map_err(|e| FileshareError::FileOperation(format!("Write failed: {}", e)))?;
+                file.write_all(&chunk.data)
+                    .map_err(|e| FileshareError::FileOperation(format!("Write failed: {}", e)))?;
 
-            file.flush()
-                .map_err(|e| FileshareError::FileOperation(format!("Flush failed: {}", e)))?;
+                file.flush()
+                    .map_err(|e| FileshareError::FileOperation(format!("Flush failed: {}", e)))?;
 
-            // Update transfer progress
-            if chunk.index < transfer.chunks_received.len() as u64 {
-                transfer.chunks_received[chunk.index as usize] = true;
-                transfer.bytes_transferred += chunk.data.len() as u64;
+                if chunk.index < transfer.chunks_received.len() as u64 {
+                    transfer.chunks_received[chunk.index as usize] = true;
+                    transfer.bytes_transferred += chunk.data.len() as u64;
 
-                debug!(
-                    "Received chunk {} for transfer {} ({} bytes)",
-                    chunk.index,
+                    debug!(
+                        "Received chunk {} for transfer {} ({} bytes, {}/{} chunks)",
+                        chunk.index,
+                        transfer_id,
+                        chunk.data.len(),
+                        transfer.chunks_received.iter().filter(|&&x| x).count(),
+                        transfer.chunks_received.len()
+                    );
+                }
+
+                chunk.is_last || transfer.chunks_received.iter().all(|&received| received)
+            } else {
+                false
+            }
+        }; // Mutable borrow ends here
+
+        if is_complete {
+            self.complete_file_transfer(transfer_id).await?;
+        } else if should_send_ack {
+            // Now we can safely access message_sender
+            if let Some(ref sender) = self.message_sender {
+                let ack = Message::new(MessageType::FileChunkAck {
                     transfer_id,
-                    chunk.data.len()
-                );
-            }
+                    chunk_index: chunk.index,
+                });
 
-            // Check if transfer is complete
-            if chunk.is_last || transfer.chunks_received.iter().all(|&received| received) {
-                self.complete_file_transfer(transfer_id).await?;
+                let _ = sender.send((peer_id, ack));
             }
-
-            // TODO: Send chunk acknowledgment
         }
 
         Ok(())
@@ -231,7 +420,6 @@ impl FileTransferManager {
 
             transfer.status = TransferStatus::Completed;
 
-            // Close file handle
             if let Some(ref mut file) = transfer.file_handle {
                 file.flush().map_err(|e| {
                     FileshareError::FileOperation(format!("Final flush failed: {}", e))
@@ -245,20 +433,21 @@ impl FileTransferManager {
             )
         };
 
-        // Verify file integrity
-        let calculated_checksum = self.calculate_file_checksum(&file_path)?;
-        if calculated_checksum != expected_checksum {
-            error!(
-                "Checksum mismatch for transfer {}: expected {}, got {}",
-                transfer_id, expected_checksum, calculated_checksum
-            );
+        if !expected_checksum.is_empty() {
+            let calculated_checksum = self.calculate_file_checksum(&file_path)?;
+            if calculated_checksum != expected_checksum {
+                error!(
+                    "Checksum mismatch for transfer {}: expected {}, got {}",
+                    transfer_id, expected_checksum, calculated_checksum
+                );
 
-            if let Some(transfer) = self.active_transfers.get_mut(&transfer_id) {
-                transfer.status = TransferStatus::Error("Checksum mismatch".to_string());
+                if let Some(transfer) = self.active_transfers.get_mut(&transfer_id) {
+                    transfer.status = TransferStatus::Error("Checksum mismatch".to_string());
+                }
+                return Err(FileshareError::Transfer(
+                    "File integrity check failed".to_string(),
+                ));
             }
-            return Err(FileshareError::Transfer(
-                "File integrity check failed".to_string(),
-            ));
         }
 
         info!(
@@ -266,7 +455,6 @@ impl FileTransferManager {
             transfer_id, file_path
         );
 
-        // Show system notification
         if let Some(transfer) = self.active_transfers.get(&transfer_id) {
             if let Err(e) = self.show_transfer_notification(transfer).await {
                 warn!("Failed to show notification: {}", e);
@@ -283,9 +471,15 @@ impl FileTransferManager {
         _checksum: String,
     ) -> Result<()> {
         info!("Transfer {} completed by peer", transfer_id);
-        // Handle outgoing transfer completion
-        if let Some(transfer) = self.active_transfers.get_mut(&transfer_id) {
+        let transfer = self.active_transfers.get_mut(&transfer_id);
+        if let Some(transfer) = transfer {
             transfer.status = TransferStatus::Completed;
+        }
+
+        if let Some(transfer) = self.active_transfers.get(&transfer_id) {
+            if let Err(e) = self.show_transfer_notification(transfer).await {
+                warn!("Failed to show notification: {}", e);
+            }
         }
         Ok(())
     }
@@ -323,7 +517,6 @@ impl FileTransferManager {
 
         let mut save_path = downloads_dir.join(filename);
 
-        // Handle filename conflicts
         let mut counter = 1;
         while save_path.exists() {
             let stem = std::path::Path::new(filename)
