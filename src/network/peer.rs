@@ -67,16 +67,34 @@ impl PeerManager {
     }
 
     pub async fn on_device_discovered(&mut self, device_info: DeviceInfo) -> Result<()> {
+        // Check if peer already exists
+        if let Some(existing_peer) = self.peers.get_mut(&device_info.id) {
+            // Update last seen time and device info, but keep connection status
+            existing_peer.device_info = device_info;
+            debug!(
+                "Updated existing peer: {} ({})",
+                existing_peer.device_info.name, existing_peer.device_info.id
+            );
+            return Ok(());
+        }
+
+        // Create new peer only if it doesn't exist
         let peer = Peer {
             device_info: device_info.clone(),
             connection_status: ConnectionStatus::Disconnected,
             last_ping: None,
         };
 
-        info!("Adding peer: {} ({})", device_info.name, device_info.id);
+        info!("Adding new peer: {} ({})", device_info.name, device_info.id);
         self.peers.insert(device_info.id, peer);
 
-        // Optionally, attempt to connect immediately
+        // Log security settings for debugging
+        info!(
+            "Security settings - require_pairing: {}, allowed_devices: {:?}",
+            self.settings.security.require_pairing, self.settings.security.allowed_devices
+        );
+
+        // Attempt to connect to new peers only
         if self.settings.security.require_pairing {
             if self
                 .settings
@@ -84,9 +102,22 @@ impl PeerManager {
                 .allowed_devices
                 .contains(&device_info.id)
             {
+                info!(
+                    "Device {} is in allowed list, connecting...",
+                    device_info.id
+                );
                 self.connect_to_peer(device_info.id).await?;
+            } else {
+                info!(
+                    "Device {} not in allowed list, skipping connection",
+                    device_info.id
+                );
             }
         } else {
+            info!(
+                "Pairing not required, connecting to device {}",
+                device_info.id
+            );
             self.connect_to_peer(device_info.id).await?;
         }
 
@@ -103,6 +134,7 @@ impl PeerManager {
             peer.connection_status,
             ConnectionStatus::Connected | ConnectionStatus::Authenticated
         ) {
+            debug!("Peer {} already connected/authenticated", peer_id);
             return Ok(());
         }
 
@@ -113,6 +145,7 @@ impl PeerManager {
 
         match TcpStream::connect(addr).await {
             Ok(stream) => {
+                info!("Successfully connected to peer {} at {}", peer_id, addr);
                 peer.connection_status = ConnectionStatus::Connected;
                 self.handle_peer_connection(peer_id, stream).await?;
             }
@@ -172,6 +205,7 @@ impl PeerManager {
                 connection.write_message(&response).await?;
 
                 if accepted {
+                    info!("Handshake accepted for device {}", device_id);
                     // Update or create peer
                     if let Some(peer) = self.peers.get_mut(&device_id) {
                         peer.connection_status = ConnectionStatus::Authenticated;
@@ -200,6 +234,8 @@ impl PeerManager {
                     // Handle the authenticated connection
                     self.handle_authenticated_connection(device_id, connection)
                         .await?;
+                } else {
+                    info!("Handshake rejected for device {}", device_id);
                 }
             }
             _ => {
@@ -220,6 +256,7 @@ impl PeerManager {
         let handshake =
             Message::handshake(self.settings.device.id, self.settings.device.name.clone());
 
+        info!("Sending handshake to peer {}", peer_id);
         connection.write_message(&handshake).await?;
 
         // Wait for response
