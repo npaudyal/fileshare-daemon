@@ -24,10 +24,13 @@ struct Cli {
 async fn main() -> Result<()> {
     let cli = Cli::parse();
 
-    // Initialize logging
+    // Initialize logging with debug level for discovery
     let log_level = if cli.verbose { "debug" } else { "info" };
     tracing_subscriber::fmt()
-        .with_env_filter(format!("fileshare_daemon={}", log_level))
+        .with_env_filter(format!(
+            "fileshare_daemon={},fileshare_daemon::network::discovery=debug",
+            log_level
+        ))
         .init();
 
     info!("Starting Fileshare Daemon v{}", env!("CARGO_PKG_VERSION"));
@@ -43,7 +46,7 @@ async fn main() -> Result<()> {
     let shutdown_signal = setup_shutdown_handler();
 
     tokio::select! {
-        result = daemon.run() => {  // Now daemon.run() takes ownership
+        result = daemon.run() => {
             if let Err(e) = result {
                 error!("Daemon error: {}", e);
                 return Err(e);
@@ -51,8 +54,6 @@ async fn main() -> Result<()> {
         }
         _ = shutdown_signal => {
             info!("Shutdown signal received, stopping daemon...");
-            // The daemon will automatically stop when the shutdown signal is received
-            // through the internal broadcast channel
         }
     }
 

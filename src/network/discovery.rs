@@ -14,7 +14,7 @@ pub struct DeviceInfo {
     pub id: Uuid,
     pub name: String,
     pub addr: SocketAddr,
-    pub last_seen: u64, // Use timestamp instead of Instant
+    pub last_seen: u64,
     pub version: String,
 }
 
@@ -45,60 +45,120 @@ impl DiscoveryService {
         let discovered_devices = self.discovered_devices.clone();
         let peer_manager = self.peer_manager.clone();
 
-        // Start discovery listener
+        // Start broadcaster
+        let broadcast_settings = settings.clone();
         tokio::spawn(async move {
-            if let Err(e) =
-                Self::run_discovery_loop(settings, discovered_devices, peer_manager).await
-            {
-                error!("Discovery loop error: {}", e);
-            }
+            Self::run_broadcaster(broadcast_settings).await;
+        });
+
+        // Start listener
+        let listen_settings = settings.clone();
+        let listen_discovered_devices = discovered_devices.clone();
+        let listen_peer_manager = peer_manager.clone();
+        tokio::spawn(async move {
+            Self::run_listener(
+                listen_settings,
+                listen_discovered_devices,
+                listen_peer_manager,
+            )
+            .await;
         });
 
         // Start cleanup task
-        let discovered_devices_cleanup = self.discovered_devices.clone();
+        let cleanup_discovered_devices = discovered_devices.clone();
         tokio::spawn(async move {
-            Self::run_cleanup(discovered_devices_cleanup).await;
+            Self::run_cleanup(cleanup_discovered_devices).await;
         });
 
         info!("Discovery service started successfully");
         Ok(())
     }
 
-    async fn run_discovery_loop(
+    async fn run_broadcaster(settings: Arc<Settings>) {
+        info!("Starting discovery broadcaster");
+
+        loop {
+            match Self::broadcast_presence(&settings).await {
+                Ok(()) => {
+                    debug!("Successfully broadcasted presence");
+                }
+                Err(e) => {
+                    warn!("Failed to broadcast presence: {}", e);
+                }
+            }
+
+            // Wait 10 seconds before next broadcast
+            tokio::time::sleep(Duration::from_secs(10)).await;
+        }
+    }
+
+    async fn run_listener(
         settings: Arc<Settings>,
         discovered_devices: Arc<RwLock<HashMap<Uuid, DeviceInfo>>>,
         peer_manager: Arc<RwLock<PeerManager>>,
-    ) -> Result<()> {
-        info!("Starting discovery loop");
+    ) {
+        info!("Starting discovery listener");
+
+        // Create listener socket
+        let bind_addr = format!("0.0.0.0:{}", settings.network.discovery_port);
+        info!("Binding discovery listener to {}", bind_addr);
+
+        let socket = match tokio::net::UdpSocket::bind(&bind_addr).await {
+            Ok(socket) => {
+                info!("Discovery listener bound successfully to {}", bind_addr);
+                socket
+            }
+            Err(e) => {
+                error!("Failed to bind discovery listener to {}: {}", bind_addr, e);
+                return;
+            }
+        };
+
+        let mut buf = [0; 2048];
 
         loop {
-            // Broadcast our presence
-            if let Err(e) = Self::broadcast_presence(&settings).await {
-                warn!("Failed to broadcast presence: {}", e);
-            }
+            match socket.recv_from(&mut buf).await {
+                Ok((len, addr)) => {
+                    debug!("Received discovery packet from {} ({} bytes)", addr, len);
 
-            // Listen for other devices
-            if let Err(e) = Self::listen_for_broadcasts(
-                &settings,
-                discovered_devices.clone(),
-                peer_manager.clone(),
-            )
-            .await
-            {
-                warn!("Failed to listen for broadcasts: {}", e);
-            }
+                    let data = String::from_utf8_lossy(&buf[..len]);
+                    debug!("Discovery packet content: {}", data);
 
-            // Wait before next cycle
-            tokio::time::sleep(Duration::from_secs(10)).await;
+                    if let Err(e) = Self::handle_discovery_packet(
+                        &data,
+                        addr,
+                        &settings,
+                        discovered_devices.clone(),
+                        peer_manager.clone(),
+                    )
+                    .await
+                    {
+                        warn!("Failed to handle discovery packet from {}: {}", addr, e);
+                    }
+                }
+                Err(e) => {
+                    warn!("Discovery listener error: {}", e);
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                }
+            }
         }
     }
 
     async fn broadcast_presence(settings: &Settings) -> Result<()> {
         use tokio::net::UdpSocket;
 
-        let socket = UdpSocket::bind("0.0.0.0:0").await?;
-        socket.set_broadcast(true)?;
+        debug!("Broadcasting presence...");
 
+        // Create broadcast socket
+        let socket = UdpSocket::bind("0.0.0.0:0")
+            .await
+            .map_err(|e| crate::FileshareError::Network(e))?;
+
+        socket
+            .set_broadcast(true)
+            .map_err(|e| crate::FileshareError::Network(e))?;
+
+        // Create announcement
         let announcement = serde_json::json!({
             "device_id": settings.device.id,
             "device_name": settings.device.name,
@@ -110,98 +170,101 @@ impl DiscoveryService {
         let data = announcement.to_string();
         let broadcast_addr = format!("255.255.255.255:{}", settings.network.discovery_port);
 
-        socket.send_to(data.as_bytes(), &broadcast_addr).await?;
-        debug!("Broadcasted presence");
+        debug!(
+            "Sending broadcast to {} with data: {}",
+            broadcast_addr, data
+        );
 
-        Ok(())
+        match socket.send_to(data.as_bytes(), &broadcast_addr).await {
+            Ok(bytes_sent) => {
+                debug!(
+                    "Successfully broadcasted {} bytes to {}",
+                    bytes_sent, broadcast_addr
+                );
+                Ok(())
+            }
+            Err(e) => {
+                warn!("Failed to send broadcast to {}: {}", broadcast_addr, e);
+                Err(crate::FileshareError::Network(e))
+            }
+        }
     }
 
-    async fn listen_for_broadcasts(
+    async fn handle_discovery_packet(
+        data: &str,
+        addr: SocketAddr,
         settings: &Settings,
         discovered_devices: Arc<RwLock<HashMap<Uuid, DeviceInfo>>>,
         peer_manager: Arc<RwLock<PeerManager>>,
     ) -> Result<()> {
         use serde_json::Value;
-        use tokio::net::UdpSocket;
 
-        let bind_addr = format!("0.0.0.0:{}", settings.network.discovery_port);
-        let socket = UdpSocket::bind(&bind_addr).await?;
+        debug!("Parsing discovery packet from {}", addr);
 
-        let mut buf = [0; 1024];
+        let announcement: Value = serde_json::from_str(data)
+            .map_err(|e| crate::FileshareError::Unknown(format!("JSON parse error: {}", e)))?;
 
-        // Use tokio timeout instead of set_recv_timeout
-        let timeout_duration = Duration::from_secs(1);
+        let device_id_str = announcement
+            .get("device_id")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| crate::FileshareError::Discovery("Missing device_id".to_string()))?;
 
-        match tokio::time::timeout(timeout_duration, socket.recv_from(&mut buf)).await {
-            Ok(Ok((len, addr))) => {
-                let data = String::from_utf8_lossy(&buf[..len]);
+        let device_id = Uuid::parse_str(device_id_str)
+            .map_err(|e| crate::FileshareError::Discovery(format!("Invalid device_id: {}", e)))?;
 
-                if let Ok(announcement) = serde_json::from_str::<Value>(&data) {
-                    if let Some(device_id_str) =
-                        announcement.get("device_id").and_then(|v| v.as_str())
-                    {
-                        if let Ok(device_id) = Uuid::parse_str(device_id_str) {
-                            // Don't discover ourselves
-                            if device_id == settings.device.id {
-                                return Ok(());
-                            }
+        // Don't discover ourselves
+        if device_id == settings.device.id {
+            debug!("Ignoring self-discovery from {}", addr);
+            return Ok(());
+        }
 
-                            let device_name = announcement
-                                .get("device_name")
-                                .and_then(|v| v.as_str())
-                                .unwrap_or("Unknown Device")
-                                .to_string();
+        let device_name = announcement
+            .get("device_name")
+            .and_then(|v| v.as_str())
+            .unwrap_or("Unknown Device")
+            .to_string();
 
-                            let port = announcement
-                                .get("port")
-                                .and_then(|v| v.as_u64())
-                                .unwrap_or(9876) as u16;
+        let port = announcement
+            .get("port")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(9876) as u16;
 
-                            let version = announcement
-                                .get("version")
-                                .and_then(|v| v.as_str())
-                                .unwrap_or("unknown")
-                                .to_string();
+        let version = announcement
+            .get("version")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown")
+            .to_string();
 
-                            let device_info = DeviceInfo {
-                                id: device_id,
-                                name: device_name,
-                                addr: SocketAddr::new(addr.ip(), port),
-                                last_seen: SystemTime::now()
-                                    .duration_since(UNIX_EPOCH)
-                                    .unwrap()
-                                    .as_secs(),
-                                version,
-                            };
+        // Create device address using the actual IP from the packet
+        let device_addr = SocketAddr::new(addr.ip(), port);
 
-                            info!(
-                                "Discovered device: {} ({}) at {}",
-                                device_info.name, device_info.id, device_info.addr
-                            );
+        let device_info = DeviceInfo {
+            id: device_id,
+            name: device_name.clone(),
+            addr: device_addr,
+            last_seen: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_secs(),
+            version,
+        };
 
-                            // Update discovered devices
-                            {
-                                let mut devices = discovered_devices.write().await;
-                                devices.insert(device_id, device_info.clone());
-                            }
+        info!(
+            "🎯 Discovered device: {} ({}) at {}",
+            device_info.name, device_info.id, device_info.addr
+        );
 
-                            // Notify peer manager
-                            {
-                                let mut pm = peer_manager.write().await;
-                                if let Err(e) = pm.on_device_discovered(device_info).await {
-                                    warn!("Failed to notify peer manager: {}", e);
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-            Ok(Err(e)) => {
-                warn!("UDP receive error: {}", e);
-            }
-            Err(_) => {
-                // Timeout - this is expected, continue
-                debug!("Discovery listen timeout (normal behavior)");
+        // Update discovered devices
+        {
+            let mut devices = discovered_devices.write().await;
+            devices.insert(device_id, device_info.clone());
+        }
+
+        // Notify peer manager
+        {
+            let mut pm = peer_manager.write().await;
+            if let Err(e) = pm.on_device_discovered(device_info).await {
+                warn!("Failed to notify peer manager: {}", e);
             }
         }
 

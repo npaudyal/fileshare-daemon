@@ -1,6 +1,5 @@
 pub mod clipboard;
 pub mod config; // Add this
-
 pub mod error;
 pub mod hotkeys; // Add this
 pub mod network;
