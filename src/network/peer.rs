@@ -390,8 +390,17 @@ impl PeerManager {
     }
 
     pub async fn process_messages(&mut self) -> Result<()> {
+        let mut message_count = 0;
         while let Ok((peer_id, message)) = self.message_rx.try_recv() {
+            message_count += 1;
+            println!(
+                "🔧 WINDOWS DEBUG: Processing message {} from peer {}",
+                message_count, peer_id
+            );
             self.handle_message(peer_id, message).await?;
+        }
+        if message_count > 0 {
+            println!("🔧 WINDOWS DEBUG: Processed {} messages", message_count);
         }
         Ok(())
     }

@@ -383,19 +383,18 @@ impl FileshareDaemon {
             }
         });
 
-        // Spawn a task to process messages
         let message_pm = peer_manager.clone();
         let message_handle = tokio::spawn(async move {
             let mut interval = tokio::time::interval(tokio::time::Duration::from_millis(100));
             loop {
                 interval.tick().await;
+                println!("🔧 WINDOWS DEBUG: Processing messages..."); // Add this line
                 let mut pm = message_pm.write().await;
                 if let Err(e) = pm.process_messages().await {
                     error!("Error processing messages: {}", e);
                 }
             }
         });
-
         // Wait for either task to complete
         tokio::select! {
             _ = connection_handle => {},
