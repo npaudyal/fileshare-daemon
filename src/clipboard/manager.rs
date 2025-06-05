@@ -174,36 +174,51 @@ impl ClipboardManager {
 
         info!("Attempting to get selected file from Finder");
 
-        // Try multiple approaches for better reliability
-
-        // Approach 1: Direct Finder selection
-        let script1 = r#"
-        tell application "Finder"
-            if (count of selection) > 0 then
-                set selectedItem to item 1 of selection
-                if kind of selectedItem is not "Folder" then
-                    return POSIX path of (selectedItem as alias)
-                end if
-            end if
+        // Fixed script that doesn't rely on count
+        let script = r#"
+        try
+            tell application "Finder"
+                set selectedItems to selection
+                
+                -- Try to get the first item directly
+                try
+                    set firstItem to item 1 of selectedItems
+                    set itemKind to kind of firstItem
+                    
+                    -- Check if it's not a folder
+                    if itemKind is not "Folder" then
+                        set itemPath to POSIX path of (firstItem as alias)
+                        return itemPath
+                    else
+                        return ""
+                    end if
+                on error
+                    -- No items selected or error accessing first item
+                    return ""
+                end try
+            end tell
+        on error errMsg
             return ""
-        end tell
+        end try
     "#;
 
         let output = Command::new("osascript")
             .arg("-e")
-            .arg(script1)
+            .arg(script)
             .output()
             .map_err(|e| {
                 crate::FileshareError::Unknown(format!("Failed to run AppleScript: {}", e))
             })?;
 
-        let path_str = String::from_utf8_lossy(&output.stdout);
-        let path_str = path_str.trim();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let path_str = stdout.trim();
+        let stderr_str = stderr.trim();
+
         info!("AppleScript output: '{}'", path_str);
-        info!(
-            "AppleScript stderr: '{}'",
-            String::from_utf8_lossy(&output.stderr)
-        );
+        if !stderr_str.is_empty() {
+            info!("AppleScript stderr: '{}'", stderr_str);
+        }
 
         if !path_str.is_empty() && output.status.success() {
             let path = PathBuf::from(path_str);
@@ -213,50 +228,7 @@ impl ClipboardManager {
             }
         }
 
-        // Approach 2: Check if Finder is frontmost and try again
-        let script2 = r#"
-        tell application "System Events"
-            set frontApp to name of first application process whose frontmost is true
-        end tell
-        
-        if frontApp is "Finder" then
-            tell application "Finder"
-                if (count of selection) > 0 then
-                    set selectedItem to item 1 of selection
-                    return POSIX path of (selectedItem as alias)
-                end if
-            end tell
-        end if
-        return ""
-    "#;
-
-        let output2 = Command::new("osascript")
-            .arg("-e")
-            .arg(script2)
-            .output()
-            .map_err(|e| {
-                crate::FileshareError::Unknown(format!(
-                    "Failed to run AppleScript approach 2: {}",
-                    e
-                ))
-            })?;
-
-        let path_str2 = String::from_utf8_lossy(&output2.stdout);
-        let path_str2 = path_str2.trim();
-        info!("AppleScript approach 2 output: '{}'", path_str2);
-
-        if !path_str2.is_empty() && output2.status.success() {
-            let path = PathBuf::from(path_str2);
-            if path.exists() && path.is_file() {
-                info!(
-                    "Successfully detected selected file (approach 2): {:?}",
-                    path
-                );
-                return Ok(Some(path));
-            }
-        }
-
-        info!("No file selected or Finder not active");
+        info!("No file selected or could not detect selection");
         Ok(None)
     }
 
