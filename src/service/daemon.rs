@@ -2,7 +2,8 @@ use crate::{
     clipboard::ClipboardManager,
     config::Settings,
     hotkeys::{HotkeyEvent, HotkeyManager},
-    network::{DiscoveryService, PeerManager},
+    network::{DiscoveryService, MessageType, PeerManager},
+    service::file_transfer::TransferDirection, // Add this import too
     tray::SystemTray,
     utils::format_file_size,
     Result,
@@ -306,6 +307,7 @@ impl FileshareDaemon {
         Ok(())
     }
 
+    // In src/service/daemon.rs, update the message processing loop:
     async fn run_peer_manager(
         peer_manager: Arc<RwLock<PeerManager>>,
         settings: Arc<Settings>,
@@ -338,36 +340,66 @@ impl FileshareDaemon {
             }
         });
 
-        // Spawn a task to process messages and handle clipboard sync
+        // CRITICAL FIX: Modify message processing to handle FileOffers specially
         let message_pm = peer_manager.clone();
         let message_clipboard = clipboard.clone();
         let message_handle = tokio::spawn(async move {
             let mut interval = tokio::time::interval(tokio::time::Duration::from_millis(100));
             loop {
                 interval.tick().await;
+
+                // Process messages but handle FileOffers specially
                 let mut pm = message_pm.write().await;
-                if let Err(e) = pm.process_messages(&message_clipboard).await {
-                    error!("Error processing messages: {}", e);
+
+                // Check for pending messages
+                while let Ok((peer_id, message)) = pm.message_rx.try_recv() {
+                    // SPECIAL HANDLING FOR OUTGOING FILE OFFERS
+                    if let MessageType::FileOffer {
+                        ref transfer_id, ..
+                    } = message.message_type
+                    {
+                        // Check if this is our own outgoing transfer
+                        let ft = pm.file_transfer.read().await;
+                        if let Some(direction) = ft.get_transfer_direction(*transfer_id) {
+                            if matches!(direction, TransferDirection::Outgoing) {
+                                info!("🚀 ROUTING: Detected outgoing FileOffer {}, sending DIRECTLY to peer {}", transfer_id, peer_id);
+                                drop(ft); // Release the lock
+
+                                // Send directly to peer connection, bypass message processing
+                                if let Err(e) =
+                                    pm.send_direct_to_connection(peer_id, message.clone()).await
+                                {
+                                    error!(
+                                        "❌ Failed to send FileOffer directly to peer {}: {}",
+                                        peer_id, e
+                                    );
+                                } else {
+                                    info!(
+                                        "✅ FileOffer {} sent DIRECTLY to peer {}",
+                                        transfer_id, peer_id
+                                    );
+                                }
+                                continue; // Skip normal message processing for this FileOffer
+                            }
+                        }
+                        drop(ft); // Release the lock if we didn't continue
+                    }
+
+                    // Normal message processing for everything else
+                    if let Err(e) = pm
+                        .handle_message(peer_id, message, &message_clipboard)
+                        .await
+                    {
+                        error!("Error processing message: {}", e);
+                    }
                 }
             }
         });
 
-        // Add periodic status logging
-        let status_pm = peer_manager.clone();
-        let status_handle = tokio::spawn(async move {
-            let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(30));
-            loop {
-                interval.tick().await;
-                let pm = status_pm.read().await;
-                pm.debug_connection_status();
-            }
-        });
-
-        // Wait for any task to complete
+        // Wait for either task to complete
         tokio::select! {
             _ = connection_handle => {},
             _ = message_handle => {},
-            _ = status_handle => {},
         }
 
         Ok(())

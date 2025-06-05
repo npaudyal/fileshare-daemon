@@ -32,9 +32,9 @@ pub enum ConnectionStatus {
 pub struct PeerManager {
     settings: Arc<Settings>,
     peers: HashMap<Uuid, Peer>,
-    file_transfer: Arc<RwLock<FileTransferManager>>,
-    message_tx: mpsc::UnboundedSender<(Uuid, Message)>,
-    message_rx: mpsc::UnboundedReceiver<(Uuid, Message)>,
+    pub file_transfer: Arc<RwLock<FileTransferManager>>,
+    pub message_tx: mpsc::UnboundedSender<(Uuid, Message)>,
+    pub message_rx: mpsc::UnboundedReceiver<(Uuid, Message)>,
     // Store active connections to send messages
     connections: HashMap<Uuid, mpsc::UnboundedSender<Message>>,
 }
@@ -100,6 +100,24 @@ impl PeerManager {
             info!("Active connection to: {}", peer_id);
         }
         info!("=== END CONNECTION STATUS ===");
+    }
+
+    pub fn get_peer_connection(&self, peer_id: Uuid) -> Option<&mpsc::UnboundedSender<Message>> {
+        self.connections.get(&peer_id)
+    }
+
+    pub async fn send_direct_to_connection(&self, peer_id: Uuid, message: Message) -> Result<()> {
+        if let Some(conn) = self.connections.get(&peer_id) {
+            conn.send(message).map_err(|e| {
+                FileshareError::Transfer(format!("Failed to send direct message: {}", e))
+            })?;
+            Ok(())
+        } else {
+            Err(FileshareError::Transfer(format!(
+                "No connection to peer {}",
+                peer_id
+            )))
+        }
     }
 
     // Update the send_message_to_peer method to add FileOffer-specific debugging
@@ -576,7 +594,7 @@ impl PeerManager {
         Ok(())
     }
 
-    async fn handle_message(
+    pub async fn handle_message(
         &mut self,
         peer_id: Uuid,
         message: Message,
