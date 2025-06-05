@@ -704,9 +704,18 @@ impl PeerManager {
                 transfer_id,
                 metadata,
             } => {
-                // We already validated this is a legitimate incoming offer above
+                // Check if we already have this transfer
+                let ft = self.file_transfer.read().await;
+                let already_exists = ft.has_transfer(transfer_id);
+                drop(ft);
+
+                if already_exists {
+                    info!("🔄 Ignoring duplicate FileOffer {}", transfer_id);
+                    return Ok(());
+                }
+
                 info!(
-                    "✅ Processing incoming FileOffer from {}: {}",
+                    "✅ Processing new incoming FileOffer from {}: {}",
                     peer_id, metadata.name
                 );
                 let mut ft = self.file_transfer.write().await;
@@ -719,11 +728,11 @@ impl PeerManager {
                 reason,
             } => {
                 info!(
-                    "Received file offer response from {}: {} (transfer: {})",
+                    "Received file offer response from {}: accepted={} for transfer {}",
                     peer_id, accepted, transfer_id
                 );
 
-                // CRITICAL: Forward to file transfer manager
+                // Forward to file transfer manager regardless - let it decide if it cares
                 let mut ft = self.file_transfer.write().await;
                 ft.handle_file_offer_response(peer_id, transfer_id, accepted, reason)
                     .await?;
