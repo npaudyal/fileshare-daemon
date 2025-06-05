@@ -267,12 +267,31 @@ impl FileTransferManager {
                     let is_last = bytes_read < chunk_size;
                     total_bytes_sent += bytes_read as u64;
 
+                    // DEBUG: Log what we're actually reading
                     info!(
                         "Read chunk {}: {} bytes (total: {}/{})",
                         chunk_index,
                         bytes_read,
                         total_bytes_sent,
                         file_metadata.len()
+                    );
+
+                    // DEBUG: Show the actual content being read
+                    let content_preview = if chunk_data.len() <= 100 {
+                        String::from_utf8_lossy(&chunk_data).to_string()
+                    } else {
+                        format!("{}...", String::from_utf8_lossy(&chunk_data[..100]))
+                    };
+                    info!(
+                        "Chunk {} content preview: '{}'",
+                        chunk_index, content_preview
+                    );
+
+                    // DEBUG: Show raw bytes
+                    info!(
+                        "Chunk {} raw bytes: {:?}",
+                        chunk_index,
+                        &chunk_data[..std::cmp::min(20, chunk_data.len())]
                     );
 
                     hasher.update(&chunk_data);
@@ -439,6 +458,24 @@ impl FileTransferManager {
             chunk.is_last
         );
 
+        // DEBUG: Show what we're receiving
+        let content_preview = if chunk.data.len() <= 100 {
+            String::from_utf8_lossy(&chunk.data).to_string()
+        } else {
+            format!("{}...", String::from_utf8_lossy(&chunk.data[..100]))
+        };
+        info!(
+            "Received chunk {} content preview: '{}'",
+            chunk.index, content_preview
+        );
+
+        // DEBUG: Show raw bytes
+        info!(
+            "Received chunk {} raw bytes: {:?}",
+            chunk.index,
+            &chunk.data[..std::cmp::min(20, chunk.data.len())]
+        );
+
         // Extract necessary data without keeping mutable borrow
         let (chunk_size, should_send_ack) = {
             let transfer = self
@@ -490,9 +527,42 @@ impl FileTransferManager {
                 })?;
 
                 info!(
-                    "Successfully wrote and flushed chunk {} for transfer {}",
-                    chunk.index, transfer_id
+                    "Successfully wrote and flushed chunk {} for transfer {} ({} bytes at offset {})",
+                    chunk.index, transfer_id, chunk.data.len(), offset
                 );
+
+                // DEBUG: Verify what was written by reading it back
+                let current_pos = file.stream_position().map_err(|e| {
+                    error!("Failed to get current position: {}", e);
+                    FileshareError::FileOperation(format!("Position check failed: {}", e))
+                })?;
+
+                file.seek(SeekFrom::Start(offset)).map_err(|e| {
+                    error!("Seek back failed for verification: {}", e);
+                    FileshareError::FileOperation(format!("Seek back failed: {}", e))
+                })?;
+
+                let mut verify_buffer = vec![0u8; chunk.data.len()];
+                file.read_exact(&mut verify_buffer).map_err(|e| {
+                    error!("Read back failed for verification: {}", e);
+                    FileshareError::FileOperation(format!("Read back failed: {}", e))
+                })?;
+
+                let verify_preview = String::from_utf8_lossy(&verify_buffer).to_string();
+                info!(
+                    "Verification: chunk {} read back as: '{}'",
+                    chunk.index, verify_preview
+                );
+                info!(
+                    "Verification: raw bytes: {:?}",
+                    &verify_buffer[..std::cmp::min(20, verify_buffer.len())]
+                );
+
+                // Restore file position to end of written data
+                file.seek(SeekFrom::Start(current_pos)).map_err(|e| {
+                    error!("Failed to restore position: {}", e);
+                    FileshareError::FileOperation(format!("Position restore failed: {}", e))
+                })?;
 
                 // Mark chunk as received
                 if chunk.index < transfer.chunks_received.len() as u64 {
