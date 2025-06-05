@@ -464,6 +464,40 @@ impl FileTransferManager {
         Ok(())
     }
 
+    pub async fn start_outgoing_transfer(
+        &mut self,
+        peer_id: Uuid,
+        transfer_id: Uuid,
+        file_path: PathBuf,
+    ) -> Result<()> {
+        info!(
+            "Starting outgoing transfer {} to peer {}: {:?}",
+            transfer_id, peer_id, file_path
+        );
+
+        let metadata = FileMetadata::from_path(&file_path)?;
+
+        let transfer = FileTransfer {
+            id: transfer_id,
+            peer_id,
+            metadata: metadata.clone(),
+            file_path: file_path.clone(),
+            direction: TransferDirection::Outgoing,
+            status: TransferStatus::Pending,
+            bytes_transferred: 0,
+            chunks_received: Vec::new(),
+            file_handle: None,
+        };
+
+        self.active_transfers.insert(transfer_id, transfer);
+        info!(
+            "Outgoing transfer {} registered and waiting for acceptance",
+            transfer_id
+        );
+
+        Ok(())
+    }
+
     pub async fn handle_transfer_complete(
         &mut self,
         _peer_id: Uuid,
