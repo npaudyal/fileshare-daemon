@@ -475,6 +475,29 @@ impl PeerManager {
         message: Message,
         clipboard: &crate::clipboard::ClipboardManager,
     ) -> Result<()> {
+        // Only debug incoming messages, not our own outgoing ones being processed
+        match message.message_type {
+            MessageType::FileOffer {
+                ref transfer_id, ..
+            } => {
+                // Check if this is our own outgoing transfer BEFORE logging
+                let ft = self.file_transfer.write().await;
+                if let Some(direction) = ft.get_transfer_direction(*transfer_id) {
+                    if matches!(direction, TransferDirection::Outgoing) {
+                        info!(
+                            "🔄 IGNORING our own outgoing FileOffer {} (no processing needed)",
+                            transfer_id
+                        );
+                        return Ok(());
+                    }
+                }
+                // If we get here, it's a legitimate incoming FileOffer
+                drop(ft); // Release the lock before debug_message_flow
+            }
+            _ => {}
+        }
+
+        // Now log legitimate incoming messages
         self.debug_message_flow(peer_id, &format!("{:?}", message.message_type), "INCOMING")
             .await;
 
@@ -552,37 +575,12 @@ impl PeerManager {
                 transfer_id,
                 metadata,
             } => {
-                info!(
-                    "📥 Received FileOffer from peer {}: {} (transfer: {})",
-                    peer_id, metadata.name, transfer_id
-                );
-
-                // Add extra debugging
-                let mut ft = self.file_transfer.write().await;
-                ft.debug_active_transfers();
-
-                // Check if we have this as an outgoing transfer using the public method
-                if let Some(direction) = ft.get_transfer_direction(transfer_id) {
-                    info!(
-                        "🔍 Found existing transfer {} with direction: {:?}",
-                        transfer_id, direction
-                    );
-                    if matches!(direction, TransferDirection::Outgoing) {
-                        info!(
-                            "🔄 Ignoring FileOffer {} - this is our outgoing transfer",
-                            transfer_id
-                        );
-                        return Ok(());
-                    }
-                } else {
-                    info!("🔍 No existing transfer found for {}", transfer_id);
-                }
-
-                // This is a legitimate incoming file offer from another peer
+                // We already handled this above - this should only be legitimate incoming offers
                 info!(
                     "✅ Processing incoming FileOffer from {}: {}",
                     peer_id, metadata.name
                 );
+                let mut ft = self.file_transfer.write().await;
                 ft.handle_file_offer(peer_id, transfer_id, metadata).await?;
             }
 
