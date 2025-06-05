@@ -181,18 +181,52 @@ impl FileTransferManager {
         chunk_size: usize,
     ) -> Result<()> {
         use sha2::{Digest, Sha256};
+        use std::io::Read;
 
-        info!("Starting to send file chunks for transfer {}", transfer_id);
+        info!(
+            "Starting to send file chunks for transfer {} to peer {}",
+            transfer_id, peer_id
+        );
+        info!("Reading file: {:?}", file_path);
 
-        let mut file = File::open(&file_path)?;
+        // Verify file exists and is readable
+        if !file_path.exists() {
+            let error_msg = Message::new(MessageType::TransferError {
+                transfer_id,
+                error: "Source file does not exist".to_string(),
+            });
+            let _ = message_sender.send((peer_id, error_msg));
+            return Err(FileshareError::FileOperation(
+                "Source file does not exist".to_string(),
+            ));
+        }
+
+        let mut file = std::fs::File::open(&file_path).map_err(|e| {
+            error!("Failed to open file {:?}: {}", file_path, e);
+            FileshareError::FileOperation(format!("Failed to open file: {}", e))
+        })?;
+
+        // Get file size for validation
+        let file_metadata = file.metadata().map_err(|e| {
+            FileshareError::FileOperation(format!("Failed to get file metadata: {}", e))
+        })?;
+
+        info!("File size: {} bytes", file_metadata.len());
+
         let mut buffer = vec![0u8; chunk_size];
         let mut chunk_index = 0u64;
         let mut hasher = Sha256::new();
+        let mut total_bytes_sent = 0u64;
 
         loop {
             match file.read(&mut buffer) {
                 Ok(0) => {
+                    // End of file
                     let checksum = format!("{:x}", hasher.finalize());
+                    info!(
+                        "File read complete. Total bytes sent: {}, Checksum: {}",
+                        total_bytes_sent, checksum
+                    );
 
                     let complete_msg = Message::new(MessageType::TransferComplete {
                         transfer_id,
@@ -209,6 +243,15 @@ impl FileTransferManager {
                 Ok(bytes_read) => {
                     let chunk_data = buffer[..bytes_read].to_vec();
                     let is_last = bytes_read < chunk_size;
+                    total_bytes_sent += bytes_read as u64;
+
+                    info!(
+                        "Read chunk {}: {} bytes (total: {}/{})",
+                        chunk_index,
+                        bytes_read,
+                        total_bytes_sent,
+                        file_metadata.len()
+                    );
 
                     hasher.update(&chunk_data);
 
@@ -231,12 +274,13 @@ impl FileTransferManager {
                         break;
                     }
 
-                    debug!(
+                    info!(
                         "Sent chunk {} for transfer {} ({} bytes)",
                         chunk_index, transfer_id, bytes_read
                     );
                     chunk_index += 1;
 
+                    // Small delay to prevent overwhelming the network
                     tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
                 }
                 Err(e) => {
@@ -500,17 +544,18 @@ impl FileTransferManager {
     }
 
     fn get_save_path(&self, filename: &str) -> Result<PathBuf> {
-        // Try to use current working directory first (where the app was launched from)
         let save_dir = if let Some(ref temp_dir) = self.settings.transfer.temp_dir {
             temp_dir.clone()
         } else {
-            // Try current directory first
-            std::env::current_dir().unwrap_or_else(|_| {
-                // Fallback to Downloads
-                directories::UserDirs::new()
-                    .and_then(|dirs| dirs.download_dir().map(|d| d.to_path_buf()))
-                    .unwrap_or_else(|| PathBuf::from("."))
-            })
+            // Use Downloads directory by default
+            directories::UserDirs::new()
+                .and_then(|dirs| dirs.download_dir().map(|d| d.to_path_buf()))
+                .unwrap_or_else(|| {
+                    // Fallback to Documents if Downloads doesn't exist
+                    directories::UserDirs::new()
+                        .and_then(|dirs| dirs.document_dir().map(|d| d.to_path_buf()))
+                        .unwrap_or_else(|| PathBuf::from("."))
+                })
         };
 
         if !save_dir.exists() {
@@ -540,6 +585,7 @@ impl FileTransferManager {
             counter += 1;
         }
 
+        info!("File will be saved to: {:?}", save_path);
         Ok(save_path)
     }
 
@@ -600,5 +646,11 @@ impl FileTransferManager {
                 transfer.bytes_transferred as f32 / transfer.metadata.size as f32
             }
         })
+    }
+
+    pub fn get_transfer_direction(&self, transfer_id: Uuid) -> Option<TransferDirection> {
+        self.active_transfers
+            .get(&transfer_id)
+            .map(|t| t.direction.clone())
     }
 }

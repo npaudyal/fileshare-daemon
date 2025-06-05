@@ -469,7 +469,6 @@ impl PeerManager {
                 }
             }
 
-            // Handle clipboard sync messages
             MessageType::ClipboardUpdate {
                 file_path,
                 source_device,
@@ -478,7 +477,7 @@ impl PeerManager {
             } => {
                 info!("Received clipboard update from {}: {}", peer_id, file_path);
 
-                let clipboard_item = NetworkClipboardItem {
+                let clipboard_item = crate::clipboard::NetworkClipboardItem {
                     file_path: PathBuf::from(file_path),
                     source_device,
                     timestamp,
@@ -493,7 +492,6 @@ impl PeerManager {
                 clipboard.clear().await;
             }
 
-            // Handle file requests (when someone wants to paste)
             MessageType::FileRequest {
                 request_id,
                 file_path,
@@ -527,13 +525,40 @@ impl PeerManager {
                 }
             }
 
-            // Existing file transfer messages
+            // CRITICAL FIX: Only handle file offers that are actually FROM other peers
             MessageType::FileOffer {
                 transfer_id,
                 metadata,
             } => {
-                info!("Received file offer from {}: {}", peer_id, metadata.name);
+                // Make sure this file offer is actually FROM the peer, not a loopback
+                info!(
+                    "Received file offer from {}: {} (checking if this is a valid incoming offer)",
+                    peer_id, metadata.name
+                );
+
+                // Only process incoming file offers (when we're the receiver)
+                // Don't process our own outgoing file offers
                 let mut ft = self.file_transfer.write().await;
+
+                // Check if we already have this transfer ID as an outgoing transfer
+                if let Some(direction) = ft.get_transfer_direction(transfer_id) {
+                    if matches!(
+                        direction,
+                        crate::service::file_transfer::TransferDirection::Outgoing
+                    ) {
+                        info!(
+                            "Ignoring file offer {} - this is our outgoing transfer",
+                            transfer_id
+                        );
+                        return Ok(());
+                    }
+                }
+
+                // This is a legitimate incoming file offer
+                info!(
+                    "Processing incoming file offer from {}: {}",
+                    peer_id, metadata.name
+                );
                 ft.handle_file_offer(peer_id, transfer_id, metadata).await?;
             }
 
