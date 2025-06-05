@@ -2,6 +2,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use tracing::info;
+use tracing::warn;
 use uuid::Uuid;
 
 #[derive(Debug, Clone)]
@@ -284,7 +285,8 @@ impl ClipboardManager {
                 crate::FileshareError::Unknown(format!("PowerShell execution failed: {}", e))
             })?;
 
-        let path_str = String::from_utf8_lossy(&output.stdout).trim();
+        let path_str = String::from_utf8_lossy(&output.stdout);
+        let path_str = path_str.trim();
 
         if !path_str.is_empty() && output.status.success() {
             let path = PathBuf::from(path_str);
@@ -359,8 +361,8 @@ impl ClipboardManager {
                 crate::FileshareError::Unknown(format!("PowerShell execution failed: {}", e))
             })?;
 
-        let path_str = String::from_utf8_lossy(&output.stdout).trim();
-
+        let path_str = String::from_utf8_lossy(&output.stdout);
+        let path_str = path_str.trim();
         if !path_str.is_empty() {
             let path = PathBuf::from(path_str);
             if path.exists() && path.is_dir() {
