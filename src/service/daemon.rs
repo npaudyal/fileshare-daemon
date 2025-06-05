@@ -270,20 +270,33 @@ impl FileshareDaemon {
                 source_device, target_path
             );
 
+            // Get the source file path from clipboard
+            let source_file_path = {
+                let clipboard_state = clipboard.network_clipboard.read().await;
+                clipboard_state
+                    .as_ref()
+                    .unwrap()
+                    .file_path
+                    .to_string_lossy()
+                    .to_string()
+            };
+
+            // DEBUG: Log what we're about to send
+            info!(
+                "DEBUG: Source file path for FileRequest: {}",
+                source_file_path
+            );
+            info!(
+                "DEBUG: Target file path for FileRequest: {}",
+                target_path.to_string_lossy()
+            );
+
             // Send file request to source device
             let request_id = uuid::Uuid::new_v4();
             let message = crate::network::protocol::Message::new(
                 crate::network::protocol::MessageType::FileRequest {
                     request_id,
-                    file_path: {
-                        let clipboard_state = clipboard.network_clipboard.read().await;
-                        clipboard_state
-                            .as_ref()
-                            .unwrap()
-                            .file_path
-                            .to_string_lossy()
-                            .to_string()
-                    },
+                    file_path: source_file_path,
                     target_path: target_path.to_string_lossy().to_string(),
                 },
             );

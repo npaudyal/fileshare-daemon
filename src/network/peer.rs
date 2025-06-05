@@ -776,7 +776,14 @@ impl PeerManager {
         file_path: PathBuf,
         _target_path: PathBuf,
     ) -> Result<()> {
-        info!("Processing file request {} for {:?}", request_id, file_path);
+        info!(
+            "Processing file request {} for {:?} (target: {:?})",
+            request_id, file_path, _target_path
+        );
+
+        // DEBUG: Log what paths we're working with
+        info!("Source file path: {:?}", file_path);
+        info!("Target file path: {:?}", _target_path);
 
         // Check if the requested file exists
         if !file_path.exists() {
@@ -793,6 +800,17 @@ impl PeerManager {
             return Ok(());
         }
 
+        // DEBUG: Verify file content before sending
+        if let Ok(content) = std::fs::read_to_string(&file_path) {
+            info!("DEBUG: About to send file with content: '{}'", content);
+        }
+        if let Ok(bytes) = std::fs::read(&file_path) {
+            info!(
+                "DEBUG: File raw bytes (first 20): {:?}",
+                &bytes[..std::cmp::min(20, bytes.len())]
+            );
+        }
+
         // Accept the request
         let response = Message::new(MessageType::FileRequestResponse {
             request_id,
@@ -805,11 +823,11 @@ impl PeerManager {
         }
 
         info!(
-            "File request accepted, starting file transfer to peer {}",
-            peer_id
+            "File request accepted, starting file transfer to peer {} for file: {:?}",
+            peer_id, file_path
         );
 
-        // Use the existing send_file_to_peer method which works correctly
+        // CRITICAL: Make sure we're sending the correct file path
         self.send_file_to_peer(peer_id, file_path).await?;
 
         Ok(())

@@ -81,6 +81,13 @@ impl ClipboardManager {
         };
 
         if let Some(item) = clipboard_item {
+            // DEBUG: Log what's in the clipboard
+            info!("DEBUG: Clipboard item file_path: {:?}", item.file_path);
+            info!(
+                "DEBUG: Clipboard item source_device: {}",
+                item.source_device
+            );
+
             // Don't paste on the same device that copied
             if item.source_device == self.device_id {
                 info!("Ignoring paste on same device that copied");
@@ -103,6 +110,11 @@ impl ClipboardManager {
 
             // Return the file info and source device for the daemon to handle transfer
             let target_path = target_dir.join(item.file_path.file_name().unwrap_or_default());
+
+            // DEBUG: Log the final paths
+            info!("DEBUG: Final source path for request: {:?}", item.file_path);
+            info!("DEBUG: Final target path for request: {:?}", target_path);
+
             Ok(Some((target_path, item.source_device)))
         } else {
             info!("Network clipboard is empty");
