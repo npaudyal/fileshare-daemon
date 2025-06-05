@@ -148,6 +148,31 @@ impl FileTransferManager {
         accepted: bool,
         reason: Option<String>,
     ) -> Result<()> {
+        // CRITICAL FIX: Only start transfer if this is an OUTGOING transfer
+        let transfer_direction = {
+            let transfer = self.active_transfers.get(&transfer_id);
+            transfer.map(|t| t.direction.clone())
+        };
+
+        if let Some(TransferDirection::Outgoing) = transfer_direction {
+            info!(
+                "Received file offer response for OUTGOING transfer {} from peer {}: accepted={}",
+                transfer_id, peer_id, accepted
+            );
+        } else if let Some(TransferDirection::Incoming) = transfer_direction {
+            info!(
+                "Ignoring file offer response for INCOMING transfer {} - this should not happen",
+                transfer_id
+            );
+            return Ok(());
+        } else {
+            info!(
+                "Received file offer response for unknown transfer {}",
+                transfer_id
+            );
+            return Ok(());
+        }
+
         if !accepted {
             info!(
                 "File offer {} was rejected by peer {}: {:?}",
@@ -159,7 +184,10 @@ impl FileTransferManager {
             return Ok(());
         }
 
-        info!("File offer {} accepted by peer {}", transfer_id, peer_id);
+        info!(
+            "File offer {} accepted by peer {}, starting file transfer",
+            transfer_id, peer_id
+        );
         self.start_file_transfer(transfer_id).await?;
         Ok(())
     }
