@@ -65,7 +65,7 @@ impl Default for Settings {
                 temp_dir: None,
             },
             security: SecuritySettings {
-                require_pairing: true,
+                require_pairing: false,
                 encryption_enabled: true,
                 allowed_devices: Vec::new(),
             },
