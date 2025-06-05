@@ -561,29 +561,33 @@ impl PeerManager {
         message: Message,
         clipboard: &crate::clipboard::ClipboardManager,
     ) -> Result<()> {
-        // Only debug incoming messages, not our own outgoing ones being processed
-        match message.message_type {
-            MessageType::FileOffer {
-                ref transfer_id, ..
-            } => {
-                // Check if this is our own outgoing transfer BEFORE logging
-                let ft = self.file_transfer.write().await;
-                if let Some(direction) = ft.get_transfer_direction(*transfer_id) {
-                    if matches!(direction, TransferDirection::Outgoing) {
-                        info!(
-                            "🔄 IGNORING our own outgoing FileOffer {} (no processing needed)",
-                            transfer_id
-                        );
-                        return Ok(());
-                    }
+        // Check for FileOffer early but with better logic
+        if let MessageType::FileOffer {
+            ref transfer_id, ..
+        } = message.message_type
+        {
+            let mut ft = self.file_transfer.write().await;
+
+            // Check if this is our own outgoing transfer that just got sent
+            if let Some(direction) = ft.get_transfer_direction(*transfer_id) {
+                if matches!(direction, TransferDirection::Outgoing) {
+                    info!(
+                        "🔄 IGNORING our own outgoing FileOffer {} (this is a loopback)",
+                        transfer_id
+                    );
+                    return Ok(());
                 }
-                // If we get here, it's a legitimate incoming FileOffer
-                drop(ft); // Release the lock before debug_message_flow
             }
-            _ => {}
+            drop(ft); // Release lock
+
+            // If we get here, it's a legitimate incoming FileOffer, so continue processing
+            info!(
+                "✅ LEGITIMATE incoming FileOffer {} from peer {}",
+                transfer_id, peer_id
+            );
         }
 
-        // Now log legitimate incoming messages
+        // Log all legitimate incoming messages
         self.debug_message_flow(peer_id, &format!("{:?}", message.message_type), "INCOMING")
             .await;
 
@@ -661,7 +665,7 @@ impl PeerManager {
                 transfer_id,
                 metadata,
             } => {
-                // We already handled this above - this should only be legitimate incoming offers
+                // We already validated this is a legitimate incoming offer above
                 info!(
                     "✅ Processing incoming FileOffer from {}: {}",
                     peer_id, metadata.name

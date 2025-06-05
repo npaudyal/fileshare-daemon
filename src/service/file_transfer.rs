@@ -60,7 +60,10 @@ impl FileTransferManager {
     }
 
     pub async fn send_file(&mut self, peer_id: Uuid, file_path: PathBuf) -> Result<()> {
-        info!("Starting file transfer to {}: {:?}", peer_id, file_path);
+        info!(
+            "🚀 SEND_FILE: Starting file transfer to {}: {:?}",
+            peer_id, file_path
+        );
 
         if !file_path.exists() {
             return Err(FileshareError::FileOperation(
@@ -77,6 +80,12 @@ impl FileTransferManager {
         let metadata = FileMetadata::from_path(&file_path)?;
         let transfer_id = Uuid::new_v4();
 
+        info!(
+            "🚀 SEND_FILE: Created transfer {} for peer {}",
+            transfer_id, peer_id
+        );
+
+        // Create and store the transfer BEFORE sending the offer
         let transfer = FileTransfer {
             id: transfer_id,
             peer_id,
@@ -89,7 +98,12 @@ impl FileTransferManager {
             file_handle: None,
         };
 
+        // Store the transfer first
         self.active_transfers.insert(transfer_id, transfer);
+        info!(
+            "🚀 SEND_FILE: Registered outgoing transfer {} for peer {}",
+            transfer_id, peer_id
+        );
 
         if let Some(ref sender) = self.message_sender {
             let file_offer = Message::new(MessageType::FileOffer {
@@ -97,8 +111,15 @@ impl FileTransferManager {
                 metadata: metadata.clone(),
             });
 
+            info!(
+                "🚀 SEND_FILE: About to send FileOffer {} to peer {}",
+                transfer_id, peer_id
+            );
+
             if let Err(e) = sender.send((peer_id, file_offer)) {
                 error!("Failed to send file offer: {}", e);
+                // Remove the failed transfer
+                self.active_transfers.remove(&transfer_id);
                 return Err(FileshareError::Transfer(format!(
                     "Failed to send file offer: {}",
                     e
@@ -106,10 +127,12 @@ impl FileTransferManager {
             }
 
             info!(
-                "File offer sent for transfer {} to peer {}",
+                "🚀 SEND_FILE: FileOffer {} sent to message channel for peer {}",
                 transfer_id, peer_id
             );
         } else {
+            // Remove the transfer if we can't send
+            self.active_transfers.remove(&transfer_id);
             return Err(FileshareError::Transfer(
                 "Message sender not configured".to_string(),
             ));
