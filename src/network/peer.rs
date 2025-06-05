@@ -1,5 +1,4 @@
 use crate::{
-    clipboard::NetworkClipboardItem,
     config::Settings,
     network::{discovery::DeviceInfo, protocol::*},
     service::file_transfer::{FileTransferManager, TransferDirection},
@@ -103,19 +102,51 @@ impl PeerManager {
         info!("=== END CONNECTION STATUS ===");
     }
 
+    // Update the send_message_to_peer method to add FileOffer-specific debugging
     pub async fn send_message_to_peer(&mut self, peer_id: Uuid, message: Message) -> Result<()> {
-        self.debug_message_flow(peer_id, &format!("{:?}", message.message_type), "OUTGOING")
-            .await;
+        // Clone message type for logging
+        let message_type_for_logging = message.message_type.clone();
+
+        self.debug_message_flow(
+            peer_id,
+            &format!("{:?}", message_type_for_logging),
+            "OUTGOING",
+        )
+        .await;
+
+        // Special logging for FileOffer
+        if let MessageType::FileOffer {
+            ref transfer_id, ..
+        } = message_type_for_logging
+        {
+            info!(
+                "🚀 CRITICAL: Sending FileOffer {} to peer {}",
+                transfer_id, peer_id
+            );
+            info!(
+                "🚀 Available connections: {:?}",
+                self.connections.keys().collect::<Vec<_>>()
+            );
+        }
 
         info!(
             "Attempting to send message to peer {}: {:?}",
-            peer_id, message.message_type
+            peer_id, message_type_for_logging
         );
 
         if let Some(conn) = self.connections.get(&peer_id) {
             match conn.send(message) {
                 Ok(()) => {
                     info!("✅ Successfully sent message to peer {}", peer_id);
+                    if let MessageType::FileOffer {
+                        ref transfer_id, ..
+                    } = message_type_for_logging
+                    {
+                        info!(
+                            "🚀 FileOffer {} successfully queued for transmission to {}",
+                            transfer_id, peer_id
+                        );
+                    }
                     Ok(())
                 }
                 Err(e) => {
@@ -384,46 +415,101 @@ impl PeerManager {
         // Split the connection into read and write halves
         let (mut read_half, mut write_half) = connection.split();
 
-        // Spawn task to handle reading messages
+        // Spawn task to handle reading messages FROM the peer
         let read_message_tx = message_tx.clone();
+        let read_peer_id = peer_id; // Capture peer_id for the read task
         let read_task = tokio::spawn(async move {
             loop {
                 match read_half.read_message().await {
                     Ok(message) => {
-                        debug!(
-                            "Received message from {}: {:?}",
-                            peer_id, message.message_type
+                        // Special logging for FileOffer
+                        if let MessageType::FileOffer {
+                            ref transfer_id, ..
+                        } = message.message_type
+                        {
+                            info!(
+                                "🚀 READ TASK: Received FileOffer {} from peer {}",
+                                transfer_id, read_peer_id
+                            );
+                        }
+
+                        info!(
+                            "📥 READ from peer {}: {:?}",
+                            read_peer_id, message.message_type
                         );
-                        if let Err(e) = read_message_tx.send((peer_id, message)) {
-                            error!("Failed to forward message: {}", e);
+                        if let Err(e) = read_message_tx.send((read_peer_id, message)) {
+                            error!(
+                                "Failed to forward message from peer {}: {}",
+                                read_peer_id, e
+                            );
                             break;
                         }
                     }
                     Err(e) => {
-                        warn!("Connection read error with peer {}: {}", peer_id, e);
+                        warn!("Connection read error with peer {}: {}", read_peer_id, e);
                         break;
                     }
                 }
             }
+            info!("Read task ended for peer {}", read_peer_id);
         });
 
-        // Spawn task to handle writing messages
+        // Spawn task to handle writing messages TO the peer
+        // Spawn task to handle writing messages TO the peer
+        let write_peer_id = peer_id; // Capture peer_id for the write task
         let write_task = tokio::spawn(async move {
             while let Some(message) = conn_rx.recv().await {
+                // Clone the message for logging to avoid borrow issues
+                let message_type_for_logging = message.message_type.clone();
+
+                // Special logging for FileOffer
+                if let MessageType::FileOffer {
+                    ref transfer_id, ..
+                } = message_type_for_logging
+                {
+                    info!(
+                        "🚀 WRITE TASK: About to transmit FileOffer {} to peer {}",
+                        transfer_id, write_peer_id
+                    );
+                }
+
+                info!(
+                    "📤 WRITE to peer {}: {:?}",
+                    write_peer_id, message_type_for_logging
+                );
+
+                // Send the original message
                 if let Err(e) = write_half.write_message(&message).await {
-                    error!("Failed to write message to peer {}: {}", peer_id, e);
+                    error!("Failed to write message to peer {}: {}", write_peer_id, e);
                     break;
                 }
+
+                // Confirm FileOffer was sent
+                if let MessageType::FileOffer {
+                    ref transfer_id, ..
+                } = message_type_for_logging
+                {
+                    info!(
+                        "🚀 WRITE TASK: FileOffer {} transmitted to peer {}",
+                        transfer_id, write_peer_id
+                    );
+                }
             }
+            info!("Write task ended for peer {}", write_peer_id);
         });
 
         // Clean up when connection ends
+        let cleanup_peer_id = peer_id;
         tokio::spawn(async move {
             tokio::select! {
-                _ = read_task => {},
-                _ = write_task => {},
+                _ = read_task => {
+                    info!("Read task completed for peer {}", cleanup_peer_id);
+                },
+                _ = write_task => {
+                    info!("Write task completed for peer {}", cleanup_peer_id);
+                },
             }
-            info!("Connection handler for peer {} ended", peer_id);
+            info!("Connection handler for peer {} ended", cleanup_peer_id);
         });
 
         Ok(())
