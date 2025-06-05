@@ -401,6 +401,8 @@ impl FileTransferManager {
         Ok(())
     }
 
+    // In file_transfer.rs, replace the handle_file_chunk method:
+
     pub async fn handle_file_chunk(
         &mut self,
         peer_id: Uuid,
@@ -415,6 +417,22 @@ impl FileTransferManager {
             chunk.is_last
         );
 
+        // Check if transfer exists and is incoming
+        let transfer = self.active_transfers.get(&transfer_id);
+        if let Some(transfer) = transfer {
+            // Only process chunks for INCOMING transfers
+            if !matches!(transfer.direction, TransferDirection::Incoming) {
+                warn!(
+                "Ignoring chunk {} for outgoing transfer {} - chunks should only be processed for incoming transfers",
+                chunk.index, transfer_id
+            );
+                return Ok(());
+            }
+        } else {
+            warn!("Received chunk for unknown transfer {}", transfer_id);
+            return Ok(());
+        }
+
         // DEBUG: Show what we're receiving
         let content_preview = String::from_utf8_lossy(&chunk.data);
         info!(
@@ -428,10 +446,7 @@ impl FileTransferManager {
         );
 
         let is_complete = {
-            let transfer = self
-                .active_transfers
-                .get_mut(&transfer_id)
-                .ok_or_else(|| FileshareError::Transfer("Transfer not found".to_string()))?;
+            let transfer = self.active_transfers.get_mut(&transfer_id).unwrap();
 
             if transfer.peer_id != peer_id {
                 return Err(FileshareError::Transfer(
@@ -449,7 +464,12 @@ impl FileTransferManager {
             let end_offset = offset + chunk.data.len() as u64;
 
             if end_offset > transfer.received_data.len() as u64 {
-                error!("Chunk {} extends beyond expected file size", chunk.index);
+                error!(
+                    "Chunk {} extends beyond expected file size. Expected: {}, Got end_offset: {}",
+                    chunk.index,
+                    transfer.received_data.len(),
+                    end_offset
+                );
                 return Err(FileshareError::Transfer("Chunk too large".to_string()));
             }
 

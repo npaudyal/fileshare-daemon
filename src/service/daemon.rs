@@ -352,7 +352,7 @@ impl FileshareDaemon {
             }
         });
 
-        // FIXED: Remove problematic message routing that causes loops
+        // FIXED: Simplified message processing without problematic routing
         let message_pm = peer_manager.clone();
         let message_clipboard = clipboard.clone();
         let message_handle = tokio::spawn(async move {
@@ -362,42 +362,8 @@ impl FileshareDaemon {
 
                 let mut pm = message_pm.write().await;
 
+                // Process all messages normally - NO special routing that causes loops
                 while let Ok((peer_id, message)) = pm.message_rx.try_recv() {
-                    match &message.message_type {
-                        MessageType::FileOffer { transfer_id, .. } => {
-                            // Only route outgoing FileOffers directly
-                            let is_outgoing = {
-                                let ft = pm.file_transfer.read().await;
-                                ft.get_transfer_direction(*transfer_id)
-                                    .map(|d| matches!(d, TransferDirection::Outgoing))
-                                    .unwrap_or(false)
-                            };
-
-                            if is_outgoing {
-                                info!(
-                                    "🚀 ROUTING: Sending outgoing FileOffer {} directly to peer {}",
-                                    transfer_id, peer_id
-                                );
-                                if let Err(e) = pm.send_direct_to_connection(peer_id, message).await
-                                {
-                                    error!(
-                                        "❌ Failed to send FileOffer to peer {}: {}",
-                                        peer_id, e
-                                    );
-                                }
-                                continue; // Skip normal processing
-                            }
-                            // For incoming FileOffers, process normally
-                        }
-
-                        // ✅ REMOVE ALL special routing for FileChunk, TransferComplete, etc.
-                        // Let them process normally to avoid routing loops
-                        _ => {
-                            // All other messages get processed normally
-                        }
-                    }
-
-                    // Normal message processing for all messages
                     if let Err(e) = pm
                         .handle_message(peer_id, message, &message_clipboard)
                         .await
