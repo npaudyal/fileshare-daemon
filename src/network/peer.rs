@@ -719,9 +719,11 @@ impl PeerManager {
                 reason,
             } => {
                 info!(
-                    "Received file offer response from {}: {}",
-                    peer_id, accepted
+                    "Received file offer response from {}: {} (transfer: {})",
+                    peer_id, accepted, transfer_id
                 );
+
+                // CRITICAL: Forward to file transfer manager
                 let mut ft = self.file_transfer.write().await;
                 ft.handle_file_offer_response(peer_id, transfer_id, accepted, reason)
                     .await?;
