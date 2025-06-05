@@ -352,6 +352,8 @@ impl FileshareDaemon {
             }
         });
 
+        // In daemon.rs, replace the message handling task in run_peer_manager:
+
         let message_pm = peer_manager.clone();
         let message_clipboard = clipboard.clone();
         let message_handle = tokio::spawn(async move {
@@ -361,33 +363,110 @@ impl FileshareDaemon {
 
                 let mut pm = message_pm.write().await;
 
-                // Process all messages normally
                 while let Ok((peer_id, message)) = pm.message_rx.try_recv() {
-                    // CRITICAL: Don't process our own outgoing FileOffers
-                    if let MessageType::FileOffer { transfer_id, .. } = &message.message_type {
-                        let is_our_outgoing = {
-                            let ft = pm.file_transfer.read().await;
-                            ft.has_transfer(*transfer_id)
-                                && matches!(
-                                    ft.get_transfer_direction(*transfer_id),
-                                    Some(TransferDirection::Outgoing)
-                                )
-                        };
+                    // CRITICAL: Route ALL outgoing transfer messages directly to avoid loops
+                    match &message.message_type {
+                        MessageType::FileOffer { transfer_id, .. } => {
+                            let is_our_outgoing = {
+                                let ft = pm.file_transfer.read().await;
+                                ft.has_transfer(*transfer_id)
+                                    && matches!(
+                                        ft.get_transfer_direction(*transfer_id),
+                                        Some(TransferDirection::Outgoing)
+                                    )
+                            };
 
-                        if is_our_outgoing {
-                            // This is our own outgoing FileOffer - send it directly to peer, don't process locally
-                            info!(
-                                "🚀 Sending outgoing FileOffer {} directly to peer {}",
-                                transfer_id, peer_id
-                            );
-                            if let Err(e) = pm.send_direct_to_connection(peer_id, message).await {
-                                error!("❌ Failed to send FileOffer to peer {}: {}", peer_id, e);
+                            if is_our_outgoing {
+                                info!(
+                                    "🚀 Sending outgoing FileOffer {} directly to peer {}",
+                                    transfer_id, peer_id
+                                );
+                                if let Err(e) = pm.send_direct_to_connection(peer_id, message).await
+                                {
+                                    error!(
+                                        "❌ Failed to send FileOffer to peer {}: {}",
+                                        peer_id, e
+                                    );
+                                }
+                                continue; // Don't process locally
                             }
-                            continue; // Don't process locally
+                        }
+
+                        MessageType::FileChunk { transfer_id, .. } => {
+                            let is_our_outgoing = {
+                                let ft = pm.file_transfer.read().await;
+                                ft.has_transfer(*transfer_id)
+                                    && matches!(
+                                        ft.get_transfer_direction(*transfer_id),
+                                        Some(TransferDirection::Outgoing)
+                                    )
+                            };
+
+                            if is_our_outgoing {
+                                info!("🚀 Sending outgoing FileChunk for transfer {} directly to peer {}", transfer_id, peer_id);
+                                if let Err(e) = pm.send_direct_to_connection(peer_id, message).await
+                                {
+                                    error!(
+                                        "❌ Failed to send FileChunk to peer {}: {}",
+                                        peer_id, e
+                                    );
+                                }
+                                continue; // Don't process locally
+                            }
+                        }
+
+                        MessageType::TransferComplete { transfer_id, .. } => {
+                            let is_our_outgoing = {
+                                let ft = pm.file_transfer.read().await;
+                                ft.has_transfer(*transfer_id)
+                                    && matches!(
+                                        ft.get_transfer_direction(*transfer_id),
+                                        Some(TransferDirection::Outgoing)
+                                    )
+                            };
+
+                            if is_our_outgoing {
+                                info!("🚀 Sending outgoing TransferComplete for transfer {} directly to peer {}", transfer_id, peer_id);
+                                if let Err(e) = pm.send_direct_to_connection(peer_id, message).await
+                                {
+                                    error!(
+                                        "❌ Failed to send TransferComplete to peer {}: {}",
+                                        peer_id, e
+                                    );
+                                }
+                                continue; // Don't process locally
+                            }
+                        }
+
+                        MessageType::TransferError { transfer_id, .. } => {
+                            let is_our_outgoing = {
+                                let ft = pm.file_transfer.read().await;
+                                ft.has_transfer(*transfer_id)
+                                    && matches!(
+                                        ft.get_transfer_direction(*transfer_id),
+                                        Some(TransferDirection::Outgoing)
+                                    )
+                            };
+
+                            if is_our_outgoing {
+                                info!("🚀 Sending outgoing TransferError for transfer {} directly to peer {}", transfer_id, peer_id);
+                                if let Err(e) = pm.send_direct_to_connection(peer_id, message).await
+                                {
+                                    error!(
+                                        "❌ Failed to send TransferError to peer {}: {}",
+                                        peer_id, e
+                                    );
+                                }
+                                continue; // Don't process locally
+                            }
+                        }
+
+                        _ => {
+                            // All non-transfer messages process normally
                         }
                     }
 
-                    // Process all other messages normally
+                    // Process all other messages normally (including incoming transfer messages)
                     if let Err(e) = pm
                         .handle_message(peer_id, message, &message_clipboard)
                         .await
