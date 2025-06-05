@@ -352,10 +352,22 @@ impl FileshareDaemon {
             }
         });
 
-        // Wait for either task to complete
+        // Add periodic status logging
+        let status_pm = peer_manager.clone();
+        let status_handle = tokio::spawn(async move {
+            let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(30));
+            loop {
+                interval.tick().await;
+                let pm = status_pm.read().await;
+                pm.debug_connection_status();
+            }
+        });
+
+        // Wait for any task to complete
         tokio::select! {
             _ = connection_handle => {},
             _ = message_handle => {},
+            _ = status_handle => {},
         }
 
         Ok(())

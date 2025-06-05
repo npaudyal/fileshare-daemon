@@ -172,20 +172,26 @@ impl ClipboardManager {
     async fn get_selected_file_macos(&self) -> crate::Result<Option<PathBuf>> {
         use std::process::Command;
 
+        info!("Attempting to get selected file from Finder");
+
+        // Try multiple approaches for better reliability
+
+        // Approach 1: Direct Finder selection
+        let script1 = r#"
+        tell application "Finder"
+            if (count of selection) > 0 then
+                set selectedItem to item 1 of selection
+                if kind of selectedItem is not "Folder" then
+                    return POSIX path of (selectedItem as alias)
+                end if
+            end if
+            return ""
+        end tell
+    "#;
+
         let output = Command::new("osascript")
             .arg("-e")
-            .arg(
-                r#"
-                tell application "Finder"
-                    if (count of selection) > 0 then
-                        set selectedItem to item 1 of selection
-                        return POSIX path of (selectedItem as alias)
-                    else
-                        return ""
-                    end if
-                end tell
-            "#,
-            )
+            .arg(script1)
             .output()
             .map_err(|e| {
                 crate::FileshareError::Unknown(format!("Failed to run AppleScript: {}", e))
@@ -193,27 +199,87 @@ impl ClipboardManager {
 
         let path_str = String::from_utf8_lossy(&output.stdout);
         let path_str = path_str.trim();
+        info!("AppleScript output: '{}'", path_str);
+        info!(
+            "AppleScript stderr: '{}'",
+            String::from_utf8_lossy(&output.stderr)
+        );
 
-        if path_str.is_empty() {
-            Ok(None)
-        } else {
-            Ok(Some(PathBuf::from(path_str)))
+        if !path_str.is_empty() && output.status.success() {
+            let path = PathBuf::from(path_str);
+            if path.exists() && path.is_file() {
+                info!("Successfully detected selected file: {:?}", path);
+                return Ok(Some(path));
+            }
         }
+
+        // Approach 2: Check if Finder is frontmost and try again
+        let script2 = r#"
+        tell application "System Events"
+            set frontApp to name of first application process whose frontmost is true
+        end tell
+        
+        if frontApp is "Finder" then
+            tell application "Finder"
+                if (count of selection) > 0 then
+                    set selectedItem to item 1 of selection
+                    return POSIX path of (selectedItem as alias)
+                end if
+            end tell
+        end if
+        return ""
+    "#;
+
+        let output2 = Command::new("osascript")
+            .arg("-e")
+            .arg(script2)
+            .output()
+            .map_err(|e| {
+                crate::FileshareError::Unknown(format!(
+                    "Failed to run AppleScript approach 2: {}",
+                    e
+                ))
+            })?;
+
+        let path_str2 = String::from_utf8_lossy(&output2.stdout);
+        let path_str2 = path_str2.trim();
+        info!("AppleScript approach 2 output: '{}'", path_str2);
+
+        if !path_str2.is_empty() && output2.status.success() {
+            let path = PathBuf::from(path_str2);
+            if path.exists() && path.is_file() {
+                info!(
+                    "Successfully detected selected file (approach 2): {:?}",
+                    path
+                );
+                return Ok(Some(path));
+            }
+        }
+
+        info!("No file selected or Finder not active");
+        Ok(None)
     }
 
     #[cfg(target_os = "macos")]
     async fn get_current_directory_macos(&self) -> crate::Result<PathBuf> {
         use std::process::Command;
 
+        info!("Attempting to get current Finder directory");
+
+        let script = r#"
+        tell application "Finder"
+            if (count of Finder windows) > 0 then
+                set currentFolder to target of front Finder window
+                return POSIX path of (currentFolder as alias)
+            else
+                return POSIX path of (desktop as alias)
+            end if
+        end tell
+    "#;
+
         let output = Command::new("osascript")
             .arg("-e")
-            .arg(
-                r#"
-                tell application "Finder"
-                    return POSIX path of (target of front Finder window as alias)
-                end tell
-            "#,
-            )
+            .arg(script)
             .output()
             .map_err(|e| {
                 crate::FileshareError::Unknown(format!("Failed to run AppleScript: {}", e))
@@ -221,13 +287,20 @@ impl ClipboardManager {
 
         let path_str = String::from_utf8_lossy(&output.stdout);
         let path_str = path_str.trim();
+        info!("Current directory AppleScript output: '{}'", path_str);
 
-        if path_str.is_empty() {
-            // Fallback to Desktop
-            Ok(dirs::desktop_dir().unwrap_or_else(|| PathBuf::from(".")))
-        } else {
-            Ok(PathBuf::from(path_str))
+        if !path_str.is_empty() && output.status.success() {
+            let path = PathBuf::from(path_str);
+            if path.exists() && path.is_dir() {
+                info!("Current Finder directory: {:?}", path);
+                return Ok(path);
+            }
         }
+
+        // Fallback to Desktop
+        let desktop = dirs::desktop_dir().unwrap_or_else(|| PathBuf::from("/Users/Shared/Desktop"));
+        info!("Using fallback directory: {:?}", desktop);
+        Ok(desktop)
     }
 
     #[cfg(target_os = "windows")]

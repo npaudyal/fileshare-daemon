@@ -68,13 +68,47 @@ impl PeerManager {
         ft.set_message_sender(self.message_tx.clone());
     }
 
+    pub fn debug_connection_status(&self) {
+        info!("=== CONNECTION STATUS DEBUG ===");
+        info!("Total discovered peers: {}", self.peers.len());
+        info!("Active connections: {}", self.connections.len());
+
+        for (peer_id, peer) in &self.peers {
+            info!(
+                "Peer {}: {} - Status: {:?}",
+                peer_id, peer.device_info.name, peer.connection_status
+            );
+        }
+
+        for (peer_id, _) in &self.connections {
+            info!("Active connection to: {}", peer_id);
+        }
+        info!("=== END CONNECTION STATUS ===");
+    }
+
     pub async fn send_message_to_peer(&mut self, peer_id: Uuid, message: Message) -> Result<()> {
+        info!(
+            "Attempting to send message to peer {}: {:?}",
+            peer_id, message.message_type
+        );
+
         if let Some(conn) = self.connections.get(&peer_id) {
-            conn.send(message).map_err(|e| {
-                FileshareError::Transfer(format!("Failed to send message to peer: {}", e))
-            })?;
-            Ok(())
+            match conn.send(message) {
+                Ok(()) => {
+                    info!("Successfully sent message to peer {}", peer_id);
+                    Ok(())
+                }
+                Err(e) => {
+                    error!("Failed to send message to peer {}: {}", peer_id, e);
+                    Err(FileshareError::Transfer(format!(
+                        "Failed to send message to peer: {}",
+                        e
+                    )))
+                }
+            }
         } else {
+            error!("No active connection to peer {}", peer_id);
+            self.debug_connection_status(); // Debug when this happens
             Err(FileshareError::Transfer(format!(
                 "No active connection to peer {}",
                 peer_id
