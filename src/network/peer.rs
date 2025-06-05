@@ -594,41 +594,19 @@ impl PeerManager {
         Ok(())
     }
 
+    // In peer.rs, replace the handle_message method with this simplified version:
+
     pub async fn handle_message(
         &mut self,
         peer_id: Uuid,
         message: Message,
         clipboard: &crate::clipboard::ClipboardManager,
     ) -> Result<()> {
-        // Check for FileOffer early but with better logic
-        if let MessageType::FileOffer {
-            ref transfer_id, ..
-        } = message.message_type
-        {
-            let mut ft = self.file_transfer.write().await;
-
-            // Check if this is our own outgoing transfer that just got sent
-            if let Some(direction) = ft.get_transfer_direction(*transfer_id) {
-                if matches!(direction, TransferDirection::Outgoing) {
-                    info!(
-                        "🔄 IGNORING our own outgoing FileOffer {} (this is a loopback)",
-                        transfer_id
-                    );
-                    return Ok(());
-                }
-            }
-            drop(ft); // Release lock
-
-            // If we get here, it's a legitimate incoming FileOffer, so continue processing
-            info!(
-                "✅ LEGITIMATE incoming FileOffer {} from peer {}",
-                transfer_id, peer_id
-            );
-        }
-
-        // Log all legitimate incoming messages
-        self.debug_message_flow(peer_id, &format!("{:?}", message.message_type), "INCOMING")
-            .await;
+        // Log incoming messages
+        info!(
+            "📥 Processing message from {}: {:?}",
+            peer_id, message.message_type
+        );
 
         match message.message_type {
             MessageType::Ping => {
@@ -704,7 +682,6 @@ impl PeerManager {
                 transfer_id,
                 metadata,
             } => {
-                // We already validated this is a legitimate incoming offer above
                 info!(
                     "✅ Processing incoming FileOffer from {}: {}",
                     peer_id, metadata.name

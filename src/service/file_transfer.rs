@@ -141,6 +141,8 @@ impl FileTransferManager {
         Ok(())
     }
 
+    // In file_transfer.rs, replace handle_file_offer_response with this:
+
     pub async fn handle_file_offer_response(
         &mut self,
         peer_id: Uuid,
@@ -148,26 +150,26 @@ impl FileTransferManager {
         accepted: bool,
         reason: Option<String>,
     ) -> Result<()> {
-        // CRITICAL FIX: Only start transfer if this is an OUTGOING transfer
-        let transfer_direction = {
-            let transfer = self.active_transfers.get(&transfer_id);
-            transfer.map(|t| t.direction.clone())
-        };
+        info!(
+            "🚀 RECEIVED FileOfferResponse for transfer {} from peer {}: accepted={}",
+            transfer_id, peer_id, accepted
+        );
 
-        if let Some(TransferDirection::Outgoing) = transfer_direction {
-            info!(
-                "Received file offer response for OUTGOING transfer {} from peer {}: accepted={}",
-                transfer_id, peer_id, accepted
-            );
-        } else if let Some(TransferDirection::Incoming) = transfer_direction {
-            info!(
-                "Ignoring file offer response for INCOMING transfer {} - this should not happen",
+        // Find the transfer
+        let transfer = self.active_transfers.get(&transfer_id);
+        if transfer.is_none() {
+            warn!(
+                "Received FileOfferResponse for unknown transfer {}",
                 transfer_id
             );
             return Ok(());
-        } else {
+        }
+
+        let is_outgoing = matches!(transfer.unwrap().direction, TransferDirection::Outgoing);
+
+        if !is_outgoing {
             info!(
-                "Received file offer response for unknown transfer {}",
+                "Ignoring FileOfferResponse for incoming transfer {}",
                 transfer_id
             );
             return Ok(());
@@ -185,9 +187,10 @@ impl FileTransferManager {
         }
 
         info!(
-            "File offer {} accepted by peer {}, starting file transfer",
+            "✅ File offer {} accepted by peer {}, starting file transfer",
             transfer_id, peer_id
         );
+
         self.start_file_transfer(transfer_id).await?;
         Ok(())
     }
