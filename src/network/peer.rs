@@ -107,27 +107,57 @@ impl PeerManager {
         // Clone message type for logging
         let message_type_for_logging = message.message_type.clone();
 
-        self.debug_message_flow(
-            peer_id,
-            &format!("{:?}", message_type_for_logging),
-            "OUTGOING",
-        )
-        .await;
-
-        // Special logging for FileOffer
+        // Special handling for FileOffers - send directly to peer connection
         if let MessageType::FileOffer {
             ref transfer_id, ..
         } = message_type_for_logging
         {
             info!(
-                "🚀 CRITICAL: Sending FileOffer {} to peer {}",
+                "🚀 CRITICAL: Sending FileOffer {} DIRECTLY to peer {}",
                 transfer_id, peer_id
             );
             info!(
                 "🚀 Available connections: {:?}",
                 self.connections.keys().collect::<Vec<_>>()
             );
+
+            // Send FileOffer directly to peer's connection channel (bypass message processing)
+            if let Some(conn) = self.connections.get(&peer_id) {
+                match conn.send(message) {
+                    Ok(()) => {
+                        info!(
+                            "🚀 FileOffer {} successfully sent DIRECTLY to peer {}",
+                            transfer_id, peer_id
+                        );
+                        return Ok(());
+                    }
+                    Err(e) => {
+                        error!(
+                            "❌ Failed to send FileOffer directly to peer {}: {}",
+                            peer_id, e
+                        );
+                        return Err(FileshareError::Transfer(format!(
+                            "Failed to send FileOffer to peer: {}",
+                            e
+                        )));
+                    }
+                }
+            } else {
+                error!("❌ No active connection to peer {} for FileOffer", peer_id);
+                return Err(FileshareError::Transfer(format!(
+                    "No active connection to peer {}",
+                    peer_id
+                )));
+            }
         }
+
+        // For all other message types, use the normal flow with debug logging
+        self.debug_message_flow(
+            peer_id,
+            &format!("{:?}", message_type_for_logging),
+            "OUTGOING",
+        )
+        .await;
 
         info!(
             "Attempting to send message to peer {}: {:?}",
@@ -138,15 +168,6 @@ impl PeerManager {
             match conn.send(message) {
                 Ok(()) => {
                     info!("✅ Successfully sent message to peer {}", peer_id);
-                    if let MessageType::FileOffer {
-                        ref transfer_id, ..
-                    } = message_type_for_logging
-                    {
-                        info!(
-                            "🚀 FileOffer {} successfully queued for transmission to {}",
-                            transfer_id, peer_id
-                        );
-                    }
                     Ok(())
                 }
                 Err(e) => {
