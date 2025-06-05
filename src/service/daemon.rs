@@ -320,6 +320,8 @@ impl FileshareDaemon {
         Ok(())
     }
 
+    // In daemon.rs, update the message processing to let FileOfferResponse flow normally:
+
     async fn run_peer_manager(
         peer_manager: Arc<RwLock<PeerManager>>,
         settings: Arc<Settings>,
@@ -352,7 +354,7 @@ impl FileshareDaemon {
             }
         });
 
-        // CORRECTED: Proper message processing without infinite loops
+        // CORRECTED: Simple message processing without interfering with FileOfferResponse
         let message_pm = peer_manager.clone();
         let message_clipboard = clipboard.clone();
         let message_handle = tokio::spawn(async move {
@@ -387,52 +389,16 @@ impl FileshareDaemon {
                                 }
                                 continue; // Skip normal processing
                             }
-                            // For incoming FileOffers, process normally
+                            // For incoming FileOffers, process normally (this will send the response)
                         }
 
-                        MessageType::FileChunk { transfer_id, .. } => {
-                            // File chunks should always be sent directly to avoid processing loops
-                            if let Err(e) = pm.send_direct_to_connection(peer_id, message).await {
-                                error!("❌ Failed to send FileChunk to peer {}: {}", peer_id, e);
-                            }
-                            continue;
-                        }
-
-                        MessageType::TransferComplete { transfer_id, .. } => {
-                            // Transfer complete should always be sent directly
-                            if let Err(e) = pm.send_direct_to_connection(peer_id, message).await {
-                                error!(
-                                    "❌ Failed to send TransferComplete to peer {}: {}",
-                                    peer_id, e
-                                );
-                            }
-                            continue;
-                        }
-
-                        MessageType::TransferError { transfer_id, .. } => {
-                            // Transfer errors should always be sent directly
-                            if let Err(e) = pm.send_direct_to_connection(peer_id, message).await {
-                                error!(
-                                    "❌ Failed to send TransferError to peer {}: {}",
-                                    peer_id, e
-                                );
-                            }
-                            continue;
-                        }
-
-                        // ✅ CRITICAL FIX: FileOfferResponse should ALWAYS be processed locally, NEVER forwarded
-                        MessageType::FileOfferResponse { .. } => {
-                            // FileOfferResponse messages should always be processed locally
-                            // They are responses to our outgoing FileOffers
-                            // Do NOT forward them to peers - this creates infinite loops!
-                        }
-
+                        // ✅ REMOVE all special handling for FileOfferResponse - let it process normally
                         _ => {
                             // All other messages get processed normally
                         }
                     }
 
-                    // Normal message processing for all messages (including FileOfferResponse)
+                    // Normal message processing for all messages
                     if let Err(e) = pm
                         .handle_message(peer_id, message, &message_clipboard)
                         .await

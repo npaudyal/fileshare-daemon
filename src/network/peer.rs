@@ -686,8 +686,31 @@ impl PeerManager {
                     "✅ Processing incoming FileOffer from {}: {}",
                     peer_id, metadata.name
                 );
+
+                // Handle the file offer
                 let mut ft = self.file_transfer.write().await;
                 ft.handle_file_offer(peer_id, transfer_id, metadata).await?;
+
+                // Create and send the response directly to the peer connection
+                let response = ft.create_file_offer_response(transfer_id, true, None);
+                drop(ft); // Release the lock
+
+                // Send the response directly to the peer connection
+                if let Some(conn) = self.connections.get(&peer_id) {
+                    if let Err(e) = conn.send(response) {
+                        error!(
+                            "Failed to send FileOfferResponse directly to peer {}: {}",
+                            peer_id, e
+                        );
+                    } else {
+                        info!("✅ Sent FileOfferResponse directly to peer {}", peer_id);
+                    }
+                } else {
+                    error!(
+                        "No connection found for peer {} to send FileOfferResponse",
+                        peer_id
+                    );
+                }
             }
 
             MessageType::FileOfferResponse {

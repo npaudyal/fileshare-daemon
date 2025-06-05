@@ -408,6 +408,8 @@ impl FileTransferManager {
         Ok(())
     }
 
+    // In file_transfer.rs, replace the handle_file_offer method:
+
     pub async fn handle_file_offer(
         &mut self,
         peer_id: Uuid,
@@ -442,26 +444,25 @@ impl FileTransferManager {
 
         self.active_transfers.insert(transfer_id, transfer);
 
-        if let Some(ref sender) = self.message_sender {
-            let response = Message::new(MessageType::FileOfferResponse {
-                transfer_id,
-                accepted: true,
-                reason: None,
-            });
-
-            if let Err(e) = sender.send((peer_id, response)) {
-                error!("Failed to send file offer response: {}", e);
-                return Err(FileshareError::Transfer(format!(
-                    "Failed to send response: {}",
-                    e
-                )));
-            }
-
-            info!("Sent file offer acceptance for transfer {}", transfer_id);
-        }
-
+        // ✅ CRITICAL FIX: Return the response instead of sending it through message loop
         self.accept_file_transfer(transfer_id).await?;
+
+        info!("File offer accepted for transfer {}", transfer_id);
         Ok(())
+    }
+
+    // Add a new method to get the response that should be sent
+    pub fn create_file_offer_response(
+        &self,
+        transfer_id: Uuid,
+        accepted: bool,
+        reason: Option<String>,
+    ) -> Message {
+        Message::new(MessageType::FileOfferResponse {
+            transfer_id,
+            accepted,
+            reason,
+        })
     }
 
     async fn accept_file_transfer(&mut self, transfer_id: Uuid) -> Result<()> {
