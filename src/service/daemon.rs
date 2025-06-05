@@ -320,7 +320,6 @@ impl FileshareDaemon {
         Ok(())
     }
 
-    // In src/service/daemon.rs, update the message processing loop:
     async fn run_peer_manager(
         peer_manager: Arc<RwLock<PeerManager>>,
         settings: Arc<Settings>,
@@ -353,7 +352,7 @@ impl FileshareDaemon {
             }
         });
 
-        // CRITICAL FIX: Modify message processing to handle FileOffers specially
+        // CRITICAL FIX: Modify message processing to handle different message types correctly
         let message_pm = peer_manager.clone();
         let message_clipboard = clipboard.clone();
         let message_handle = tokio::spawn(async move {
@@ -361,41 +360,78 @@ impl FileshareDaemon {
             loop {
                 interval.tick().await;
 
-                // Process messages but handle FileOffers specially
+                // Process messages but handle different types specially
                 let mut pm = message_pm.write().await;
 
                 // Check for pending messages
                 while let Ok((peer_id, message)) = pm.message_rx.try_recv() {
-                    // SPECIAL HANDLING FOR OUTGOING FILE OFFERS
-                    if let MessageType::FileOffer {
-                        ref transfer_id, ..
-                    } = message.message_type
-                    {
-                        // Check if this is our own outgoing transfer
-                        let ft = pm.file_transfer.read().await;
-                        if let Some(direction) = ft.get_transfer_direction(*transfer_id) {
-                            if matches!(direction, TransferDirection::Outgoing) {
-                                info!("🚀 ROUTING: Detected outgoing FileOffer {}, sending DIRECTLY to peer {}", transfer_id, peer_id);
-                                drop(ft); // Release the lock
+                    // Get the message type for processing decisions
+                    let message_type = message.message_type.clone();
 
-                                // Send directly to peer connection, bypass message processing
-                                if let Err(e) =
-                                    pm.send_direct_to_connection(peer_id, message.clone()).await
-                                {
-                                    error!(
-                                        "❌ Failed to send FileOffer directly to peer {}: {}",
-                                        peer_id, e
-                                    );
-                                } else {
-                                    info!(
-                                        "✅ FileOffer {} sent DIRECTLY to peer {}",
-                                        transfer_id, peer_id
-                                    );
+                    match &message_type {
+                        MessageType::FileOffer { transfer_id, .. } => {
+                            // Check if this is our own outgoing transfer
+                            let ft = pm.file_transfer.read().await;
+                            if let Some(direction) = ft.get_transfer_direction(*transfer_id) {
+                                if matches!(direction, TransferDirection::Outgoing) {
+                                    info!("🚀 ROUTING: Detected outgoing FileOffer {}, sending DIRECTLY to peer {}", transfer_id, peer_id);
+                                    drop(ft); // Release the lock
+
+                                    // Send directly to peer connection, bypass message processing
+                                    if let Err(e) =
+                                        pm.send_direct_to_connection(peer_id, message.clone()).await
+                                    {
+                                        error!(
+                                            "❌ Failed to send FileOffer directly to peer {}: {}",
+                                            peer_id, e
+                                        );
+                                    } else {
+                                        info!(
+                                            "✅ FileOffer {} sent DIRECTLY to peer {}",
+                                            transfer_id, peer_id
+                                        );
+                                    }
+                                    continue; // Skip normal message processing for this FileOffer
                                 }
-                                continue; // Skip normal message processing for this FileOffer
                             }
+                            drop(ft); // Release the lock if we didn't continue
                         }
-                        drop(ft); // Release the lock if we didn't continue
+
+                        MessageType::FileOfferResponse { transfer_id, .. } => {
+                            // CRITICAL: Only process FileOfferResponse if we have an OUTGOING transfer
+                            let ft = pm.file_transfer.read().await;
+                            if let Some(direction) = ft.get_transfer_direction(*transfer_id) {
+                                if matches!(direction, TransferDirection::Outgoing) {
+                                    info!("🚀 ROUTING: Processing FileOfferResponse {} for our outgoing transfer", transfer_id);
+                                    drop(ft); // Release the lock
+
+                                    // Process this response normally
+                                    if let Err(e) = pm
+                                        .handle_message(peer_id, message, &message_clipboard)
+                                        .await
+                                    {
+                                        error!("Error processing FileOfferResponse: {}", e);
+                                    }
+                                    continue;
+                                } else {
+                                    info!("🚀 ROUTING: Ignoring FileOfferResponse {} for incoming transfer", transfer_id);
+                                    drop(ft); // Release the lock
+                                    continue; // Skip processing this response
+                                }
+                            }
+                            drop(ft); // Release the lock if transfer not found
+
+                            // If transfer not found, skip this message
+                            warn!(
+                                "Received FileOfferResponse for unknown transfer {}",
+                                transfer_id
+                            );
+                            continue;
+                        }
+
+                        _ => {
+                            // For all other message types, use normal processing
+                        }
                     }
 
                     // Normal message processing for everything else
