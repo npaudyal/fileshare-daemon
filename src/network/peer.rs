@@ -2,7 +2,7 @@ use crate::{
     clipboard::NetworkClipboardItem,
     config::Settings,
     network::{discovery::DeviceInfo, protocol::*},
-    service::file_transfer::FileTransferManager,
+    service::file_transfer::{FileTransferManager, TransferDirection},
     FileshareError, Result,
 };
 use std::collections::HashMap;
@@ -41,6 +41,23 @@ pub struct PeerManager {
 }
 
 impl PeerManager {
+    pub async fn debug_message_flow(&self, peer_id: Uuid, message_type: &str, direction: &str) {
+        info!("🔍 MESSAGE FLOW DEBUG:");
+        info!("  Peer: {}", peer_id);
+        info!("  Message: {}", message_type);
+        info!("  Direction: {}", direction);
+        info!("  Active connections: {}", self.connections.len());
+
+        if let Some(peer) = self.peers.get(&peer_id) {
+            info!("  Peer status: {:?}", peer.connection_status);
+            info!("  Peer address: {}", peer.device_info.addr);
+        }
+
+        for (conn_peer_id, _) in &self.connections {
+            info!("  Connected to: {}", conn_peer_id);
+        }
+    }
+
     pub async fn new(settings: Arc<Settings>) -> Result<Self> {
         let (message_tx, message_rx) = mpsc::unbounded_channel();
         let file_transfer = Arc::new(RwLock::new(
@@ -87,6 +104,9 @@ impl PeerManager {
     }
 
     pub async fn send_message_to_peer(&mut self, peer_id: Uuid, message: Message) -> Result<()> {
+        self.debug_message_flow(peer_id, &format!("{:?}", message.message_type), "OUTGOING")
+            .await;
+
         info!(
             "Attempting to send message to peer {}: {:?}",
             peer_id, message.message_type
@@ -95,11 +115,11 @@ impl PeerManager {
         if let Some(conn) = self.connections.get(&peer_id) {
             match conn.send(message) {
                 Ok(()) => {
-                    info!("Successfully sent message to peer {}", peer_id);
+                    info!("✅ Successfully sent message to peer {}", peer_id);
                     Ok(())
                 }
                 Err(e) => {
-                    error!("Failed to send message to peer {}: {}", peer_id, e);
+                    error!("❌ Failed to send message to peer {}: {}", peer_id, e);
                     Err(FileshareError::Transfer(format!(
                         "Failed to send message to peer: {}",
                         e
@@ -107,8 +127,8 @@ impl PeerManager {
                 }
             }
         } else {
-            error!("No active connection to peer {}", peer_id);
-            self.debug_connection_status(); // Debug when this happens
+            error!("❌ No active connection to peer {}", peer_id);
+            self.debug_connection_status();
             Err(FileshareError::Transfer(format!(
                 "No active connection to peer {}",
                 peer_id
@@ -455,6 +475,9 @@ impl PeerManager {
         message: Message,
         clipboard: &crate::clipboard::ClipboardManager,
     ) -> Result<()> {
+        self.debug_message_flow(peer_id, &format!("{:?}", message.message_type), "INCOMING")
+            .await;
+
         match message.message_type {
             MessageType::Ping => {
                 debug!("Received ping from {}", peer_id);
@@ -525,7 +548,6 @@ impl PeerManager {
                 }
             }
 
-            // CRITICAL FIX: Only handle file offers that are actually FROM other peers
             MessageType::FileOffer {
                 transfer_id,
                 metadata,
@@ -535,21 +557,25 @@ impl PeerManager {
                     peer_id, metadata.name, transfer_id
                 );
 
-                // Only process file offers that are legitimate incoming offers
+                // Add extra debugging
                 let mut ft = self.file_transfer.write().await;
+                ft.debug_active_transfers();
 
                 // Check if we have this as an outgoing transfer using the public method
                 if let Some(direction) = ft.get_transfer_direction(transfer_id) {
-                    if matches!(
-                        direction,
-                        crate::service::file_transfer::TransferDirection::Outgoing
-                    ) {
+                    info!(
+                        "🔍 Found existing transfer {} with direction: {:?}",
+                        transfer_id, direction
+                    );
+                    if matches!(direction, TransferDirection::Outgoing) {
                         info!(
                             "🔄 Ignoring FileOffer {} - this is our outgoing transfer",
                             transfer_id
                         );
                         return Ok(());
                     }
+                } else {
+                    info!("🔍 No existing transfer found for {}", transfer_id);
                 }
 
                 // This is a legitimate incoming file offer from another peer
