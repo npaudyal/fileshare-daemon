@@ -204,6 +204,7 @@ impl FileTransferManager {
         chunk_size: usize,
     ) -> Result<()> {
         use sha2::{Digest, Sha256};
+        use std::fs::OpenOptions;
 
         info!(
             "Starting to send file chunks for transfer {} to peer {}",
@@ -223,10 +224,43 @@ impl FileTransferManager {
             ));
         }
 
-        let mut file = std::fs::File::open(&file_path).map_err(|e| {
-            error!("Failed to open file {:?}: {}", file_path, e);
-            FileshareError::FileOperation(format!("Failed to open file: {}", e))
-        })?;
+        // DEBUG: First, let's try to read the file content directly to see what's in it
+        let debug_content = std::fs::read_to_string(&file_path);
+        match debug_content {
+            Ok(content) => {
+                info!("DEBUG: File content as string: '{}'", content);
+            }
+            Err(e) => {
+                info!("DEBUG: Could not read file as string: {}", e);
+            }
+        }
+
+        // Also read as raw bytes for comparison
+        let debug_bytes = std::fs::read(&file_path);
+        match debug_bytes {
+            Ok(bytes) => {
+                info!(
+                    "DEBUG: File raw bytes: {:?}",
+                    &bytes[..std::cmp::min(30, bytes.len())]
+                );
+                info!(
+                    "DEBUG: File bytes as string: '{}'",
+                    String::from_utf8_lossy(&bytes)
+                );
+            }
+            Err(e) => {
+                info!("DEBUG: Could not read file as bytes: {}", e);
+            }
+        }
+
+        // Use OpenOptions to ensure we have proper read access
+        let mut file = OpenOptions::new()
+            .read(true)
+            .open(&file_path)
+            .map_err(|e| {
+                error!("Failed to open file {:?}: {}", file_path, e);
+                FileshareError::FileOperation(format!("Failed to open file: {}", e))
+            })?;
 
         // Get file size for validation
         let file_metadata = file.metadata().map_err(|e| {
@@ -241,6 +275,9 @@ impl FileTransferManager {
         let mut total_bytes_sent = 0u64;
 
         loop {
+            // Clear the buffer before reading
+            buffer.fill(0);
+
             match file.read(&mut buffer) {
                 Ok(0) => {
                     // End of file
@@ -410,10 +447,11 @@ impl FileTransferManager {
             transfer_id, file_path, file_size
         );
 
-        // Create the file with proper permissions and pre-allocate space
+        // Create the file with proper permissions for both read and write
         let file = OpenOptions::new()
             .create(true)
             .write(true)
+            .read(true) // Add read access for verification
             .truncate(true)
             .open(&file_path)
             .map_err(|e| {
