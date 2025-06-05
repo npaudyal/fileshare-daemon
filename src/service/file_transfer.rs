@@ -148,52 +148,47 @@ impl FileTransferManager {
         accepted: bool,
         reason: Option<String>,
     ) -> Result<()> {
-        info!(
-            "Processing file offer response from {}: accepted={}, transfer={}",
-            peer_id, accepted, transfer_id
-        );
+        // CRITICAL FIX: Only start transfer if this is an OUTGOING transfer
+        let transfer_direction = {
+            let transfer = self.active_transfers.get(&transfer_id);
+            transfer.map(|t| t.direction.clone())
+        };
 
-        // Get the transfer and verify it's outgoing
-        let transfer = self.active_transfers.get_mut(&transfer_id);
-
-        if let Some(transfer) = transfer {
-            if !matches!(transfer.direction, TransferDirection::Outgoing) {
-                info!(
-                    "Ignoring FileOfferResponse for non-outgoing transfer {}",
-                    transfer_id
-                );
-                return Ok(());
-            }
-
-            if transfer.peer_id != peer_id {
-                warn!(
-                    "FileOfferResponse from wrong peer {} for transfer {}",
-                    peer_id, transfer_id
-                );
-                return Ok(());
-            }
-
-            if !accepted {
-                info!("File offer {} was rejected: {:?}", transfer_id, reason);
-                transfer.status = TransferStatus::Cancelled;
-                return Ok(());
-            }
-
+        if let Some(TransferDirection::Outgoing) = transfer_direction {
             info!(
-                "File offer {} accepted, starting chunk transfer",
+                "Received file offer response for OUTGOING transfer {} from peer {}: accepted={}",
+                transfer_id, peer_id, accepted
+            );
+        } else if let Some(TransferDirection::Incoming) = transfer_direction {
+            info!(
+                "Ignoring file offer response for INCOMING transfer {} - this should not happen",
                 transfer_id
             );
-            transfer.status = TransferStatus::Active;
-
-            // Start sending chunks immediately
-            self.start_file_transfer(transfer_id).await?;
+            return Ok(());
         } else {
-            warn!(
-                "Received FileOfferResponse for unknown transfer {}",
+            info!(
+                "Received file offer response for unknown transfer {}",
                 transfer_id
             );
+            return Ok(());
         }
 
+        if !accepted {
+            info!(
+                "File offer {} was rejected by peer {}: {:?}",
+                transfer_id, peer_id, reason
+            );
+            if let Some(transfer) = self.active_transfers.get_mut(&transfer_id) {
+                transfer.status = TransferStatus::Cancelled;
+            }
+            return Ok(());
+        }
+
+        info!(
+            "File offer {} accepted by peer {}, starting file transfer",
+            transfer_id, peer_id
+        );
+        self.start_file_transfer(transfer_id).await?;
         Ok(())
     }
 
@@ -237,16 +232,15 @@ impl FileTransferManager {
         chunk_size: usize,
     ) -> Result<()> {
         use sha2::{Digest, Sha256};
-        use std::fs::File;
-        use std::io::Read;
+        use std::fs::OpenOptions;
 
         info!(
-            "🚀 Starting chunk transmission for transfer {} to peer {}",
+            "Starting to send file chunks for transfer {} to peer {}",
             transfer_id, peer_id
         );
-        info!("📁 Reading file: {:?}", file_path);
+        info!("Reading file: {:?}", file_path);
 
-        // Verify file exists
+        // Verify file exists and is readable
         if !file_path.exists() {
             let error_msg = Message::new(MessageType::TransferError {
                 transfer_id,
@@ -258,109 +252,156 @@ impl FileTransferManager {
             ));
         }
 
-        // Open file for reading
-        let mut file = File::open(&file_path).map_err(|e| {
-            error!("Failed to open file {:?}: {}", file_path, e);
-            FileshareError::FileOperation(format!("Failed to open file: {}", e))
-        })?;
-
-        // Read entire file content first (for small files this is more reliable)
-        let mut file_content = Vec::new();
-        file.read_to_end(&mut file_content).map_err(|e| {
-            error!("Failed to read file {:?}: {}", file_path, e);
-            FileshareError::FileOperation(format!("Failed to read file: {}", e))
-        })?;
-
-        info!("📊 File size: {} bytes", file_content.len());
-        info!(
-            "📝 File content preview: {:?}",
-            String::from_utf8_lossy(&file_content[..std::cmp::min(50, file_content.len())])
-        );
-
-        let mut hasher = Sha256::new();
-        hasher.update(&file_content);
-
-        // Send chunks
-        let total_chunks = if file_content.is_empty() {
-            1
-        } else {
-            (file_content.len() + chunk_size - 1) / chunk_size
-        };
-
-        info!(
-            "📦 Sending {} chunks of max {} bytes each",
-            total_chunks, chunk_size
-        );
-
-        for chunk_index in 0..total_chunks {
-            let start_offset = chunk_index * chunk_size;
-            let end_offset = std::cmp::min(start_offset + chunk_size, file_content.len());
-            let chunk_data = file_content[start_offset..end_offset].to_vec();
-            let is_last = chunk_index == total_chunks - 1;
-
-            info!(
-                "📤 Sending chunk {}/{}: {} bytes (offset {}-{})",
-                chunk_index + 1,
-                total_chunks,
-                chunk_data.len(),
-                start_offset,
-                end_offset
-            );
-
-            info!(
-                "📝 Chunk {} content: {:?}",
-                chunk_index,
-                String::from_utf8_lossy(&chunk_data)
-            );
-
-            let chunk = TransferChunk {
-                index: chunk_index as u64,
-                data: chunk_data,
-                is_last,
-            };
-
-            let message = Message::new(MessageType::FileChunk { transfer_id, chunk });
-
-            if let Err(e) = message_sender.send((peer_id, message)) {
-                error!("❌ Failed to send chunk {}: {}", chunk_index, e);
-                let error_msg = Message::new(MessageType::TransferError {
-                    transfer_id,
-                    error: format!("Failed to send chunk: {}", e),
-                });
-                let _ = message_sender.send((peer_id, error_msg));
-                return Err(FileshareError::Transfer(format!(
-                    "Failed to send chunk: {}",
-                    e
-                )));
+        // DEBUG: First, let's try to read the file content directly to see what's in it
+        let debug_content = std::fs::read_to_string(&file_path);
+        match debug_content {
+            Ok(content) => {
+                info!("DEBUG: File content as string: '{}'", content);
             }
-
-            info!("✅ Chunk {} sent successfully", chunk_index);
-
-            // Small delay between chunks
-            tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+            Err(e) => {
+                info!("DEBUG: Could not read file as string: {}", e);
+            }
         }
 
-        // Send completion message
-        let checksum = format!("{:x}", hasher.finalize());
-        info!(
-            "🏁 All chunks sent, sending completion (checksum: {})",
-            checksum
-        );
-
-        let complete_msg = Message::new(MessageType::TransferComplete {
-            transfer_id,
-            checksum,
-        });
-
-        if let Err(e) = message_sender.send((peer_id, complete_msg)) {
-            error!("❌ Failed to send completion message: {}", e);
-            return Err(FileshareError::Transfer(format!(
-                "Failed to send completion: {}",
-                e
-            )));
+        // Also read as raw bytes for comparison
+        let debug_bytes = std::fs::read(&file_path);
+        match debug_bytes {
+            Ok(bytes) => {
+                info!(
+                    "DEBUG: File raw bytes: {:?}",
+                    &bytes[..std::cmp::min(30, bytes.len())]
+                );
+                info!(
+                    "DEBUG: File bytes as string: '{}'",
+                    String::from_utf8_lossy(&bytes)
+                );
+            }
+            Err(e) => {
+                info!("DEBUG: Could not read file as bytes: {}", e);
+            }
         }
 
-        info!("🎉 File transfer {} completed successfully", transfer_id);
+        // Use OpenOptions to ensure we have proper read access
+        let mut file = OpenOptions::new()
+            .read(true)
+            .open(&file_path)
+            .map_err(|e| {
+                error!("Failed to open file {:?}: {}", file_path, e);
+                FileshareError::FileOperation(format!("Failed to open file: {}", e))
+            })?;
+
+        // Get file size for validation
+        let file_metadata = file.metadata().map_err(|e| {
+            FileshareError::FileOperation(format!("Failed to get file metadata: {}", e))
+        })?;
+
+        info!("File size: {} bytes", file_metadata.len());
+
+        let mut buffer = vec![0u8; chunk_size];
+        let mut chunk_index = 0u64;
+        let mut hasher = Sha256::new();
+        let mut total_bytes_sent = 0u64;
+
+        loop {
+            // Clear the buffer before reading
+            buffer.fill(0);
+
+            match file.read(&mut buffer) {
+                Ok(0) => {
+                    // End of file
+                    let checksum = format!("{:x}", hasher.finalize());
+                    info!(
+                        "File read complete. Total bytes sent: {}, Checksum: {}",
+                        total_bytes_sent, checksum
+                    );
+
+                    let complete_msg = Message::new(MessageType::TransferComplete {
+                        transfer_id,
+                        checksum,
+                    });
+
+                    if let Err(e) = message_sender.send((peer_id, complete_msg)) {
+                        error!("Failed to send transfer complete: {}", e);
+                    } else {
+                        info!("File transfer {} completed successfully", transfer_id);
+                    }
+                    break;
+                }
+                Ok(bytes_read) => {
+                    let chunk_data = buffer[..bytes_read].to_vec();
+                    let is_last = bytes_read < chunk_size;
+                    total_bytes_sent += bytes_read as u64;
+
+                    // DEBUG: Log what we're actually reading
+                    info!(
+                        "Read chunk {}: {} bytes (total: {}/{})",
+                        chunk_index,
+                        bytes_read,
+                        total_bytes_sent,
+                        file_metadata.len()
+                    );
+
+                    // DEBUG: Show the actual content being read
+                    let content_preview = if chunk_data.len() <= 100 {
+                        String::from_utf8_lossy(&chunk_data).to_string()
+                    } else {
+                        format!("{}...", String::from_utf8_lossy(&chunk_data[..100]))
+                    };
+                    info!(
+                        "Chunk {} content preview: '{}'",
+                        chunk_index, content_preview
+                    );
+
+                    // DEBUG: Show raw bytes
+                    info!(
+                        "Chunk {} raw bytes: {:?}",
+                        chunk_index,
+                        &chunk_data[..std::cmp::min(20, chunk_data.len())]
+                    );
+
+                    hasher.update(&chunk_data);
+
+                    let chunk = TransferChunk {
+                        index: chunk_index,
+                        data: chunk_data,
+                        is_last,
+                    };
+
+                    let message = Message::new(MessageType::FileChunk { transfer_id, chunk });
+
+                    if let Err(e) = message_sender.send((peer_id, message)) {
+                        error!("Failed to send chunk {}: {}", chunk_index, e);
+
+                        let error_msg = Message::new(MessageType::TransferError {
+                            transfer_id,
+                            error: format!("Failed to send chunk: {}", e),
+                        });
+                        let _ = message_sender.send((peer_id, error_msg));
+                        break;
+                    }
+
+                    info!(
+                        "Sent chunk {} for transfer {} ({} bytes)",
+                        chunk_index, transfer_id, bytes_read
+                    );
+                    chunk_index += 1;
+
+                    // Small delay to prevent overwhelming the network
+                    tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+                }
+                Err(e) => {
+                    error!("Error reading file: {}", e);
+                    let error_msg = Message::new(MessageType::TransferError {
+                        transfer_id,
+                        error: format!("Read error: {}", e),
+                    });
+
+                    let _ = message_sender.send((peer_id, error_msg));
+                    break;
+                }
+            }
+        }
+
         Ok(())
     }
 
@@ -476,27 +517,36 @@ impl FileTransferManager {
         chunk: TransferChunk,
     ) -> Result<()> {
         info!(
-            "📥 Received chunk {} for transfer {} ({} bytes, is_last: {})",
+            "Received chunk {} for transfer {} ({} bytes, is_last: {})",
             chunk.index,
             transfer_id,
             chunk.data.len(),
             chunk.is_last
         );
 
+        // DEBUG: Show what we're receiving
+        let content_preview = if chunk.data.len() <= 100 {
+            String::from_utf8_lossy(&chunk.data).to_string()
+        } else {
+            format!("{}...", String::from_utf8_lossy(&chunk.data[..100]))
+        };
         info!(
-            "📝 Chunk {} content: {:?}",
+            "Received chunk {} content preview: '{}'",
+            chunk.index, content_preview
+        );
+
+        // DEBUG: Show raw bytes
+        info!(
+            "Received chunk {} raw bytes: {:?}",
             chunk.index,
-            String::from_utf8_lossy(&chunk.data)
+            &chunk.data[..std::cmp::min(20, chunk.data.len())]
         );
 
         // Extract necessary data without keeping mutable borrow
-        let chunk_size = self.settings.transfer.chunk_size as u64;
-
-        // Write the chunk
-        let is_complete = {
+        let (chunk_size, should_send_ack) = {
             let transfer = self
                 .active_transfers
-                .get_mut(&transfer_id)
+                .get(&transfer_id)
                 .ok_or_else(|| FileshareError::Transfer("Transfer not found".to_string()))?;
 
             if transfer.peer_id != peer_id {
@@ -509,59 +559,116 @@ impl FileTransferManager {
                 return Err(FileshareError::Transfer("Transfer not active".to_string()));
             }
 
+            (self.settings.transfer.chunk_size as u64, true)
+        };
+
+        // Now get mutable access for writing
+        let is_complete = {
+            let transfer = self.active_transfers.get_mut(&transfer_id).unwrap();
+
             if let Some(ref mut file) = transfer.file_handle {
                 let offset = chunk.index * chunk_size;
 
                 info!(
-                    "💾 Writing chunk {} at offset {} ({} bytes)",
-                    chunk.index,
-                    offset,
-                    chunk.data.len()
+                    "Writing chunk {} at offset {} for transfer {}",
+                    chunk.index, offset, transfer_id
                 );
 
-                // Seek and write
+                // Seek to the correct position
                 file.seek(SeekFrom::Start(offset)).map_err(|e| {
-                    error!("❌ Seek failed for chunk {}: {}", chunk.index, e);
+                    error!("Seek failed for chunk {}: {}", chunk.index, e);
                     FileshareError::FileOperation(format!("Seek failed: {}", e))
                 })?;
 
+                // Write the chunk data
                 file.write_all(&chunk.data).map_err(|e| {
-                    error!("❌ Write failed for chunk {}: {}", chunk.index, e);
+                    error!("Write failed for chunk {}: {}", chunk.index, e);
                     FileshareError::FileOperation(format!("Write failed: {}", e))
                 })?;
 
+                // CRITICAL: Flush immediately after each write
                 file.flush().map_err(|e| {
-                    error!("❌ Flush failed for chunk {}: {}", chunk.index, e);
+                    error!("Flush failed for chunk {}: {}", chunk.index, e);
                     FileshareError::FileOperation(format!("Flush failed: {}", e))
                 })?;
 
-                info!("✅ Chunk {} written and flushed successfully", chunk.index);
+                info!(
+                    "Successfully wrote and flushed chunk {} for transfer {} ({} bytes at offset {})",
+                    chunk.index, transfer_id, chunk.data.len(), offset
+                );
 
-                // Update progress
+                // DEBUG: Verify what was written by reading it back
+                let current_pos = file.stream_position().map_err(|e| {
+                    error!("Failed to get current position: {}", e);
+                    FileshareError::FileOperation(format!("Position check failed: {}", e))
+                })?;
+
+                file.seek(SeekFrom::Start(offset)).map_err(|e| {
+                    error!("Seek back failed for verification: {}", e);
+                    FileshareError::FileOperation(format!("Seek back failed: {}", e))
+                })?;
+
+                let mut verify_buffer = vec![0u8; chunk.data.len()];
+                file.read_exact(&mut verify_buffer).map_err(|e| {
+                    error!("Read back failed for verification: {}", e);
+                    FileshareError::FileOperation(format!("Read back failed: {}", e))
+                })?;
+
+                let verify_preview = String::from_utf8_lossy(&verify_buffer).to_string();
+                info!(
+                    "Verification: chunk {} read back as: '{}'",
+                    chunk.index, verify_preview
+                );
+                info!(
+                    "Verification: raw bytes: {:?}",
+                    &verify_buffer[..std::cmp::min(20, verify_buffer.len())]
+                );
+
+                // Restore file position to end of written data
+                file.seek(SeekFrom::Start(current_pos)).map_err(|e| {
+                    error!("Failed to restore position: {}", e);
+                    FileshareError::FileOperation(format!("Position restore failed: {}", e))
+                })?;
+
+                // Mark chunk as received
                 if chunk.index < transfer.chunks_received.len() as u64 {
                     transfer.chunks_received[chunk.index as usize] = true;
                     transfer.bytes_transferred += chunk.data.len() as u64;
 
                     let chunks_received_count =
                         transfer.chunks_received.iter().filter(|&&x| x).count();
+
                     info!(
-                        "📊 Progress: {}/{} chunks received",
+                        "Chunk {} marked as received for transfer {} ({}/{} chunks, {} bytes total)",
+                        chunk.index,
+                        transfer_id,
                         chunks_received_count,
-                        transfer.chunks_received.len()
+                        transfer.chunks_received.len(),
+                        transfer.bytes_transferred
                     );
                 }
 
-                // Check completion
+                // Check if transfer is complete
                 chunk.is_last || transfer.chunks_received.iter().all(|&received| received)
             } else {
-                error!("❌ No file handle for transfer {}", transfer_id);
+                error!("No file handle for transfer {}", transfer_id);
                 false
             }
         };
 
         if is_complete {
-            info!("🏁 Transfer {} complete, finalizing file", transfer_id);
+            info!("Transfer {} is complete, finalizing...", transfer_id);
             self.complete_file_transfer(transfer_id).await?;
+        } else if should_send_ack {
+            // Send acknowledgment
+            if let Some(ref sender) = self.message_sender {
+                let ack = Message::new(MessageType::FileChunkAck {
+                    transfer_id,
+                    chunk_index: chunk.index,
+                });
+
+                let _ = sender.send((peer_id, ack));
+            }
         }
 
         Ok(())
