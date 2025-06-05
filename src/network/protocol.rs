@@ -22,6 +22,26 @@ pub enum MessageType {
         reason: Option<String>,
     },
 
+    ClipboardUpdate {
+        file_path: String,
+        source_device: Uuid,
+        timestamp: u64,
+        file_size: u64,
+    },
+    ClipboardClear,
+
+    // File request for paste operation
+    FileRequest {
+        request_id: Uuid,
+        file_path: String,
+        target_path: String,
+    },
+    FileRequestResponse {
+        request_id: Uuid,
+        accepted: bool,
+        reason: Option<String>,
+    },
+
     // File transfer
     FileOffer {
         transfer_id: Uuid,

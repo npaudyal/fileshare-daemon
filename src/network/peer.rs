@@ -1,10 +1,12 @@
 use crate::{
+    clipboard::NetworkClipboardItem,
     config::Settings,
     network::{discovery::DeviceInfo, protocol::*},
     service::file_transfer::FileTransferManager,
     FileshareError, Result,
 };
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -64,6 +66,20 @@ impl PeerManager {
     async fn set_file_transfer_message_sender(&self) {
         let mut ft = self.file_transfer.write().await;
         ft.set_message_sender(self.message_tx.clone());
+    }
+
+    pub async fn send_message_to_peer(&mut self, peer_id: Uuid, message: Message) -> Result<()> {
+        if let Some(conn) = self.connections.get(&peer_id) {
+            conn.send(message).map_err(|e| {
+                FileshareError::Transfer(format!("Failed to send message to peer: {}", e))
+            })?;
+            Ok(())
+        } else {
+            Err(FileshareError::Transfer(format!(
+                "No active connection to peer {}",
+                peer_id
+            )))
+        }
     }
 
     pub async fn on_device_discovered(&mut self, device_info: DeviceInfo) -> Result<()> {
@@ -389,27 +405,25 @@ impl PeerManager {
             .collect()
     }
 
-    pub async fn process_messages(&mut self) -> Result<()> {
-        let mut message_count = 0;
+    pub async fn process_messages(
+        &mut self,
+        clipboard: &crate::clipboard::ClipboardManager,
+    ) -> Result<()> {
         while let Ok((peer_id, message)) = self.message_rx.try_recv() {
-            message_count += 1;
-            println!(
-                "🔧 WINDOWS DEBUG: Processing message {} from peer {}",
-                message_count, peer_id
-            );
-            self.handle_message(peer_id, message).await?;
-        }
-        if message_count > 0 {
-            println!("🔧 WINDOWS DEBUG: Processed {} messages", message_count);
+            self.handle_message(peer_id, message, clipboard).await?;
         }
         Ok(())
     }
 
-    async fn handle_message(&mut self, peer_id: Uuid, message: Message) -> Result<()> {
+    async fn handle_message(
+        &mut self,
+        peer_id: Uuid,
+        message: Message,
+        clipboard: &crate::clipboard::ClipboardManager,
+    ) -> Result<()> {
         match message.message_type {
             MessageType::Ping => {
                 debug!("Received ping from {}", peer_id);
-                // Send pong response
                 if let Some(conn) = self.connections.get(&peer_id) {
                     let _ = conn.send(Message::pong());
                 }
@@ -420,6 +434,66 @@ impl PeerManager {
                     peer.last_ping = Some(std::time::Instant::now());
                 }
             }
+
+            // Handle clipboard sync messages
+            MessageType::ClipboardUpdate {
+                file_path,
+                source_device,
+                timestamp,
+                file_size,
+            } => {
+                info!("Received clipboard update from {}: {}", peer_id, file_path);
+
+                let clipboard_item = NetworkClipboardItem {
+                    file_path: PathBuf::from(file_path),
+                    source_device,
+                    timestamp,
+                    file_size,
+                };
+
+                clipboard.update_from_network(clipboard_item).await;
+            }
+
+            MessageType::ClipboardClear => {
+                info!("Received clipboard clear from {}", peer_id);
+                clipboard.clear().await;
+            }
+
+            // Handle file requests (when someone wants to paste)
+            MessageType::FileRequest {
+                request_id,
+                file_path,
+                target_path,
+            } => {
+                info!(
+                    "Received file request from {}: {} -> {}",
+                    peer_id, file_path, target_path
+                );
+                self.handle_file_request(
+                    peer_id,
+                    request_id,
+                    PathBuf::from(file_path),
+                    PathBuf::from(target_path),
+                )
+                .await?;
+            }
+
+            MessageType::FileRequestResponse {
+                request_id,
+                accepted,
+                reason,
+            } => {
+                if accepted {
+                    info!("File request {} accepted by {}", request_id, peer_id);
+                } else {
+                    warn!(
+                        "File request {} rejected by {}: {:?}",
+                        request_id, peer_id, reason
+                    );
+                }
+            }
+
+            // Existing file transfer messages
             MessageType::FileOffer {
                 transfer_id,
                 metadata,
@@ -428,6 +502,7 @@ impl PeerManager {
                 let mut ft = self.file_transfer.write().await;
                 ft.handle_file_offer(peer_id, transfer_id, metadata).await?;
             }
+
             MessageType::FileOfferResponse {
                 transfer_id,
                 accepted,
@@ -441,10 +516,12 @@ impl PeerManager {
                 ft.handle_file_offer_response(peer_id, transfer_id, accepted, reason)
                     .await?;
             }
+
             MessageType::FileChunk { transfer_id, chunk } => {
                 let mut ft = self.file_transfer.write().await;
                 ft.handle_file_chunk(peer_id, transfer_id, chunk).await?;
             }
+
             MessageType::TransferComplete {
                 transfer_id,
                 checksum,
@@ -453,12 +530,14 @@ impl PeerManager {
                 ft.handle_transfer_complete(peer_id, transfer_id, checksum)
                     .await?;
             }
+
             MessageType::TransferError { transfer_id, error } => {
                 error!("Transfer error from {}: {}", peer_id, error);
                 let mut ft = self.file_transfer.write().await;
                 ft.handle_transfer_error(peer_id, transfer_id, error)
                     .await?;
             }
+
             MessageType::FileChunkAck {
                 transfer_id,
                 chunk_index,
@@ -467,8 +546,8 @@ impl PeerManager {
                     "Received chunk ack for transfer {} chunk {}",
                     transfer_id, chunk_index
                 );
-                // Could implement flow control here
             }
+
             _ => {
                 debug!(
                     "Unhandled message type from {}: {:?}",
@@ -476,6 +555,46 @@ impl PeerManager {
                 );
             }
         }
+        Ok(())
+    }
+
+    async fn handle_file_request(
+        &mut self,
+        peer_id: Uuid,
+        request_id: Uuid,
+        file_path: PathBuf,
+        _target_path: PathBuf,
+    ) -> Result<()> {
+        info!("Processing file request {} for {:?}", request_id, file_path);
+
+        // Check if the requested file exists
+        if !file_path.exists() {
+            let response = Message::new(MessageType::FileRequestResponse {
+                request_id,
+                accepted: false,
+                reason: Some("File not found".to_string()),
+            });
+
+            if let Some(conn) = self.connections.get(&peer_id) {
+                let _ = conn.send(response);
+            }
+            return Ok(());
+        }
+
+        // Accept the request and start file transfer
+        let response = Message::new(MessageType::FileRequestResponse {
+            request_id,
+            accepted: true,
+            reason: None,
+        });
+
+        if let Some(conn) = self.connections.get(&peer_id) {
+            let _ = conn.send(response);
+        }
+
+        // Start file transfer
+        self.send_file_to_peer(peer_id, file_path).await?;
+
         Ok(())
     }
 }

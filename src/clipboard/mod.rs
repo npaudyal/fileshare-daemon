@@ -1,2 +1,2 @@
 pub mod manager;
-pub use manager::{ClipboardManager, ClipboardState};
+pub use manager::{ClipboardManager, NetworkClipboardItem};
