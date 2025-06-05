@@ -592,12 +592,13 @@ impl PeerManager {
         Ok(())
     }
 
+    // Replace the handle_file_request method:
     async fn handle_file_request(
         &mut self,
         peer_id: Uuid,
         request_id: Uuid,
         file_path: PathBuf,
-        target_path: PathBuf,
+        _target_path: PathBuf,
     ) -> Result<()> {
         info!("Processing file request {} for {:?}", request_id, file_path);
 
@@ -628,60 +629,12 @@ impl PeerManager {
         }
 
         info!(
-            "File request accepted, starting direct file transfer to peer {}",
+            "File request accepted, starting file transfer to peer {}",
             peer_id
         );
 
-        // Start DIRECT file transfer to the requesting peer
-        // This should send the file TO the peer, not save it locally
-        self.send_file_directly_to_peer(peer_id, file_path, target_path)
-            .await?;
-
-        Ok(())
-    }
-
-    // Add this new method for direct file sending
-    async fn send_file_directly_to_peer(
-        &mut self,
-        peer_id: Uuid,
-        source_file_path: PathBuf,
-        _target_path: PathBuf, // We'll use this later for the target filename
-    ) -> Result<()> {
-        info!(
-            "Starting direct file send to peer {}: {:?}",
-            peer_id, source_file_path
-        );
-
-        // Create file metadata
-        let metadata = crate::network::protocol::FileMetadata::from_path(&source_file_path)?;
-        let transfer_id = Uuid::new_v4();
-
-        // Send file offer directly
-        let file_offer = Message::new(MessageType::FileOffer {
-            transfer_id,
-            metadata: metadata.clone(),
-        });
-
-        if let Some(conn) = self.connections.get(&peer_id) {
-            conn.send(file_offer).map_err(|e| {
-                FileshareError::Transfer(format!("Failed to send file offer: {}", e))
-            })?;
-
-            info!(
-                "Sent file offer {} to peer {} for file: {:?}",
-                transfer_id, peer_id, source_file_path
-            );
-
-            // Store this as an outgoing transfer in our file transfer manager
-            let mut ft = self.file_transfer.write().await;
-            ft.start_outgoing_transfer(peer_id, transfer_id, source_file_path)
-                .await?;
-        } else {
-            return Err(FileshareError::Transfer(format!(
-                "No connection to peer {}",
-                peer_id
-            )));
-        }
+        // Use the existing send_file_to_peer method which works correctly
+        self.send_file_to_peer(peer_id, file_path).await?;
 
         Ok(())
     }

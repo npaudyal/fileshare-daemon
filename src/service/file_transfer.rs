@@ -266,6 +266,8 @@ impl FileTransferManager {
             peer_id, metadata.name, metadata.size
         );
 
+        // Instead of using get_save_path, we should use the target path from the original request
+        // For now, let's improve get_save_path to use the current directory better
         let save_path = self.get_save_path(&metadata.name)?;
         let chunk_size = self.settings.transfer.chunk_size as u64;
         let num_chunks = if metadata.size == 0 {
@@ -464,40 +466,6 @@ impl FileTransferManager {
         Ok(())
     }
 
-    pub async fn start_outgoing_transfer(
-        &mut self,
-        peer_id: Uuid,
-        transfer_id: Uuid,
-        file_path: PathBuf,
-    ) -> Result<()> {
-        info!(
-            "Starting outgoing transfer {} to peer {}: {:?}",
-            transfer_id, peer_id, file_path
-        );
-
-        let metadata = FileMetadata::from_path(&file_path)?;
-
-        let transfer = FileTransfer {
-            id: transfer_id,
-            peer_id,
-            metadata: metadata.clone(),
-            file_path: file_path.clone(),
-            direction: TransferDirection::Outgoing,
-            status: TransferStatus::Pending,
-            bytes_transferred: 0,
-            chunks_received: Vec::new(),
-            file_handle: None,
-        };
-
-        self.active_transfers.insert(transfer_id, transfer);
-        info!(
-            "Outgoing transfer {} registered and waiting for acceptance",
-            transfer_id
-        );
-
-        Ok(())
-    }
-
     pub async fn handle_transfer_complete(
         &mut self,
         _peer_id: Uuid,
@@ -532,25 +500,28 @@ impl FileTransferManager {
     }
 
     fn get_save_path(&self, filename: &str) -> Result<PathBuf> {
-        let downloads_dir = if let Some(ref temp_dir) = self.settings.transfer.temp_dir {
+        // Try to use current working directory first (where the app was launched from)
+        let save_dir = if let Some(ref temp_dir) = self.settings.transfer.temp_dir {
             temp_dir.clone()
         } else {
-            directories::UserDirs::new()
-                .and_then(|dirs| dirs.download_dir().map(|d| d.to_path_buf()))
-                .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")))
+            // Try current directory first
+            std::env::current_dir().unwrap_or_else(|_| {
+                // Fallback to Downloads
+                directories::UserDirs::new()
+                    .and_then(|dirs| dirs.download_dir().map(|d| d.to_path_buf()))
+                    .unwrap_or_else(|| PathBuf::from("."))
+            })
         };
 
-        if !downloads_dir.exists() {
-            std::fs::create_dir_all(&downloads_dir).map_err(|e| {
-                FileshareError::FileOperation(format!(
-                    "Failed to create downloads directory: {}",
-                    e
-                ))
+        if !save_dir.exists() {
+            std::fs::create_dir_all(&save_dir).map_err(|e| {
+                FileshareError::FileOperation(format!("Failed to create save directory: {}", e))
             })?;
         }
 
-        let mut save_path = downloads_dir.join(filename);
+        let mut save_path = save_dir.join(filename);
 
+        // Handle duplicate files
         let mut counter = 1;
         while save_path.exists() {
             let stem = std::path::Path::new(filename)
@@ -565,7 +536,7 @@ impl FileTransferManager {
                 .unwrap_or_default();
 
             let new_filename = format!("{} ({}){}", stem, counter, extension);
-            save_path = downloads_dir.join(new_filename);
+            save_path = save_dir.join(new_filename);
             counter += 1;
         }
 

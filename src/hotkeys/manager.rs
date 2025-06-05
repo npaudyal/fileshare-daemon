@@ -96,33 +96,35 @@ impl HotkeyManager {
     ) {
         info!("Listening for hotkey events");
 
-        // Get the receiver from global-hotkey
         let receiver = GlobalHotKeyEvent::receiver();
 
         loop {
-            // Use the crossbeam channel receiver directly
             match receiver.try_recv() {
                 Ok(event) => {
-                    debug!("Hotkey event received: {:?}", event);
+                    // Only respond to key press events, not release
+                    if event.state == global_hotkey::HotKeyState::Pressed {
+                        debug!("Hotkey pressed event received: {:?}", event);
 
-                    let hotkey_event = if event.id == copy_hotkey.id() {
-                        Some(HotkeyEvent::CopyFiles)
-                    } else if event.id == paste_hotkey.id() {
-                        Some(HotkeyEvent::PasteFiles)
-                    } else {
-                        None
-                    };
+                        let hotkey_event = if event.id == copy_hotkey.id() {
+                            Some(HotkeyEvent::CopyFiles)
+                        } else if event.id == paste_hotkey.id() {
+                            Some(HotkeyEvent::PasteFiles)
+                        } else {
+                            None
+                        };
 
-                    if let Some(hotkey_event) = hotkey_event {
-                        info!("Hotkey triggered: {:?}", hotkey_event);
-                        if let Err(e) = event_tx.send(hotkey_event) {
-                            error!("Failed to send hotkey event: {}", e);
-                            break;
+                        if let Some(hotkey_event) = hotkey_event {
+                            info!("Hotkey triggered: {:?}", hotkey_event);
+                            if let Err(e) = event_tx.send(hotkey_event) {
+                                error!("Failed to send hotkey event: {}", e);
+                                break;
+                            }
                         }
+                    } else {
+                        debug!("Ignoring hotkey release event: {:?}", event);
                     }
                 }
                 Err(crossbeam_channel::TryRecvError::Empty) => {
-                    // No events, wait a bit
                     tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
                 }
                 Err(crossbeam_channel::TryRecvError::Disconnected) => {

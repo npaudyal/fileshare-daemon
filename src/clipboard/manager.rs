@@ -354,15 +354,95 @@ impl ClipboardManager {
 
     #[cfg(target_os = "windows")]
     async fn get_current_directory_windows(&self) -> crate::Result<PathBuf> {
-        // Try to get active Explorer window location
-        match self.get_current_directory_windows_powershell().await {
-            Ok(path) => Ok(path),
-            Err(e) => {
-                warn!("Could not detect Explorer directory: {}, using Desktop", e);
-                Ok(dirs::desktop_dir()
-                    .unwrap_or_else(|| PathBuf::from("C:\\Users\\Public\\Desktop")))
+        // Try multiple approaches to get the active Explorer directory
+
+        // Approach 1: PowerShell with better Explorer detection
+        let script = r#"
+        try {
+            Add-Type -AssemblyName System.Windows.Forms
+            $explorer = New-Object -ComObject Shell.Application
+            $windows = $explorer.Windows()
+            
+            # Get the foreground window handle
+            Add-Type @"
+                using System;
+                using System.Runtime.InteropServices;
+                public class Win32 {
+                    [DllImport("user32.dll")]
+                    public static extern IntPtr GetForegroundWindow();
+                }
+"@
+            $foregroundWindow = [Win32]::GetForegroundWindow()
+            
+            # Find the Explorer window that matches the foreground window
+            foreach ($window in $windows) {
+                try {
+                    if ($window.HWND -eq $foregroundWindow.ToInt64()) {
+                        $path = $window.Document.Folder.Self.Path
+                        if ($path -and (Test-Path $path)) {
+                            Write-Output $path
+                            exit 0
+                        }
+                    }
+                } catch {
+                    # Skip this window if there's an error
+                    continue
+                }
+            }
+            
+            # Fallback: get any open Explorer window
+            foreach ($window in $windows) {
+                try {
+                    if ($window.Name -like "*Explorer*") {
+                        $path = $window.Document.Folder.Self.Path
+                        if ($path -and (Test-Path $path)) {
+                            Write-Output $path
+                            exit 0
+                        }
+                    }
+                } catch {
+                    continue
+                }
+            }
+            
+            # Final fallback: Documents folder
+            Write-Output ([Environment]::GetFolderPath("MyDocuments"))
+        } catch {
+            # Ultimate fallback
+            Write-Output ([Environment]::GetFolderPath("MyDocuments"))
+        }
+    "#;
+
+        let output = tokio::process::Command::new("powershell")
+            .arg("-WindowStyle")
+            .arg("Hidden")
+            .arg("-ExecutionPolicy")
+            .arg("Bypass")
+            .arg("-Command")
+            .arg(script)
+            .output()
+            .await
+            .map_err(|e| {
+                crate::FileshareError::Unknown(format!("PowerShell execution failed: {}", e))
+            })?;
+
+        let path_str = String::from_utf8_lossy(&output.stdout);
+        let path_str = path_str.trim();
+        info!("Windows directory detection output: '{}'", path_str);
+
+        if !path_str.is_empty() && output.status.success() {
+            let path = PathBuf::from(path_str);
+            if path.exists() && path.is_dir() {
+                info!("Detected Windows directory: {:?}", path);
+                return Ok(path);
             }
         }
+
+        // Final fallback to Documents
+        let documents =
+            dirs::document_dir().unwrap_or_else(|| PathBuf::from("C:\\Users\\Public\\Documents"));
+        warn!("Using fallback directory: {:?}", documents);
+        Ok(documents)
     }
 
     #[cfg(target_os = "windows")]
