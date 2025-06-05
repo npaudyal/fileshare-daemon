@@ -596,6 +596,8 @@ impl PeerManager {
 
     // In peer.rs, replace the handle_message method with this simplified version:
 
+    // In peer.rs, replace the handle_message method with this fixed version:
+
     pub async fn handle_message(
         &mut self,
         peer_id: Uuid,
@@ -682,6 +684,24 @@ impl PeerManager {
                 transfer_id,
                 metadata,
             } => {
+                // CRITICAL FIX: Check if this is our own outgoing transfer
+                let is_our_outgoing_transfer = {
+                    let ft = self.file_transfer.read().await;
+                    ft.has_transfer(transfer_id)
+                        && matches!(
+                            ft.get_transfer_direction(transfer_id),
+                            Some(crate::service::file_transfer::TransferDirection::Outgoing)
+                        )
+                };
+
+                if is_our_outgoing_transfer {
+                    warn!(
+                    "Ignoring FileOffer for our own outgoing transfer {} - this should not happen!",
+                    transfer_id
+                );
+                    return Ok(());
+                }
+
                 info!(
                     "✅ Processing incoming FileOffer from {}: {}",
                     peer_id, metadata.name
