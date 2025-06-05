@@ -530,33 +530,31 @@ impl PeerManager {
                 transfer_id,
                 metadata,
             } => {
-                // Make sure this file offer is actually FROM the peer, not a loopback
                 info!(
-                    "Received file offer from {}: {} (checking if this is a valid incoming offer)",
-                    peer_id, metadata.name
+                    "📥 Received FileOffer from peer {}: {} (transfer: {})",
+                    peer_id, metadata.name, transfer_id
                 );
 
-                // Only process incoming file offers (when we're the receiver)
-                // Don't process our own outgoing file offers
+                // Only process file offers that are legitimate incoming offers
                 let mut ft = self.file_transfer.write().await;
 
-                // Check if we already have this transfer ID as an outgoing transfer
+                // Check if we have this as an outgoing transfer using the public method
                 if let Some(direction) = ft.get_transfer_direction(transfer_id) {
                     if matches!(
                         direction,
                         crate::service::file_transfer::TransferDirection::Outgoing
                     ) {
                         info!(
-                            "Ignoring file offer {} - this is our outgoing transfer",
+                            "🔄 Ignoring FileOffer {} - this is our outgoing transfer",
                             transfer_id
                         );
                         return Ok(());
                     }
                 }
 
-                // This is a legitimate incoming file offer
+                // This is a legitimate incoming file offer from another peer
                 info!(
-                    "Processing incoming file offer from {}: {}",
+                    "✅ Processing incoming FileOffer from {}: {}",
                     peer_id, metadata.name
                 );
                 ft.handle_file_offer(peer_id, transfer_id, metadata).await?;
@@ -691,28 +689,10 @@ impl PeerConnection {
         )
     }
 
-    async fn read_message(&mut self) -> Result<Message> {
-        // Read message length first (4 bytes)
-        let mut len_bytes = [0u8; 4];
-        self.stream.read_exact(&mut len_bytes).await?;
-        let message_len = u32::from_be_bytes(len_bytes) as usize;
-
-        // Validate message length to prevent memory attacks
-        if message_len > 100_000_000 {
-            // 100MB max message size
-            return Err(FileshareError::Transfer("Message too large".to_string()));
-        }
-
-        // Read the message data
-        let mut message_data = vec![0u8; message_len];
-        self.stream.read_exact(&mut message_data).await?;
-
-        // Deserialize the message
-        let message: Message = bincode::deserialize(&message_data)?;
-        Ok(message)
-    }
-
     async fn write_message(&mut self, message: &Message) -> Result<()> {
+        // Add logging to track message direction
+        info!("📤 SENDING message: {:?} to peer", message.message_type);
+
         // Serialize the message
         let message_data = bincode::serialize(message)?;
         let message_len = message_data.len() as u32;
@@ -723,6 +703,30 @@ impl PeerConnection {
         self.stream.flush().await?;
 
         Ok(())
+    }
+
+    async fn read_message(&mut self) -> Result<Message> {
+        // Read message length first (4 bytes)
+        let mut len_bytes = [0u8; 4];
+        self.stream.read_exact(&mut len_bytes).await?;
+        let message_len = u32::from_be_bytes(len_bytes) as usize;
+
+        // Validate message length to prevent memory attacks
+        if message_len > 100_000_000 {
+            return Err(FileshareError::Transfer("Message too large".to_string()));
+        }
+
+        // Read the message data
+        let mut message_data = vec![0u8; message_len];
+        self.stream.read_exact(&mut message_data).await?;
+
+        // Deserialize the message
+        let message: Message = bincode::deserialize(&message_data)?;
+
+        // Add logging to track message direction
+        info!("📥 RECEIVED message: {:?} from peer", message.message_type);
+
+        Ok(message)
     }
 }
 
@@ -735,7 +739,6 @@ impl PeerConnectionReadHalf {
 
         // Validate message length to prevent memory attacks
         if message_len > 100_000_000 {
-            // 100MB max message size
             return Err(FileshareError::Transfer("Message too large".to_string()));
         }
 
@@ -745,12 +748,17 @@ impl PeerConnectionReadHalf {
 
         // Deserialize the message
         let message: Message = bincode::deserialize(&message_data)?;
+
+        info!("📥 RECEIVED message: {:?}", message.message_type);
+
         Ok(message)
     }
 }
 
 impl PeerConnectionWriteHalf {
     async fn write_message(&mut self, message: &Message) -> Result<()> {
+        info!("📤 SENDING message: {:?}", message.message_type);
+
         // Serialize the message
         let message_data = bincode::serialize(message)?;
         let message_len = message_data.len() as u32;

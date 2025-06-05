@@ -653,4 +653,23 @@ impl FileTransferManager {
             .get(&transfer_id)
             .map(|t| t.direction.clone())
     }
+
+    // Add this public method to check if transfer exists
+    pub fn has_transfer(&self, transfer_id: Uuid) -> bool {
+        self.active_transfers.contains_key(&transfer_id)
+    }
+
+    pub fn debug_active_transfers(&self) {
+        info!("=== ACTIVE TRANSFERS DEBUG ===");
+        for (transfer_id, transfer) in &self.active_transfers {
+            info!(
+                "Transfer {}: {:?} -> {:?} (Status: {:?})",
+                transfer_id,
+                transfer.direction,
+                transfer.file_path.file_name().unwrap_or_default(),
+                transfer.status
+            );
+        }
+        info!("=== END TRANSFERS DEBUG ===");
+    }
 }
