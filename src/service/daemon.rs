@@ -320,8 +320,6 @@ impl FileshareDaemon {
         Ok(())
     }
 
-    // In daemon.rs, update the message processing to let FileOfferResponse flow normally:
-
     async fn run_peer_manager(
         peer_manager: Arc<RwLock<PeerManager>>,
         settings: Arc<Settings>,
@@ -354,7 +352,7 @@ impl FileshareDaemon {
             }
         });
 
-        // CORRECTED: Simple message processing without interfering with FileOfferResponse
+        // FIXED: Remove problematic message routing that causes loops
         let message_pm = peer_manager.clone();
         let message_clipboard = clipboard.clone();
         let message_handle = tokio::spawn(async move {
@@ -367,7 +365,7 @@ impl FileshareDaemon {
                 while let Ok((peer_id, message)) = pm.message_rx.try_recv() {
                     match &message.message_type {
                         MessageType::FileOffer { transfer_id, .. } => {
-                            // Check if this is our own outgoing transfer
+                            // Only route outgoing FileOffers directly
                             let is_outgoing = {
                                 let ft = pm.file_transfer.read().await;
                                 ft.get_transfer_direction(*transfer_id)
@@ -389,10 +387,11 @@ impl FileshareDaemon {
                                 }
                                 continue; // Skip normal processing
                             }
-                            // For incoming FileOffers, process normally (this will send the response)
+                            // For incoming FileOffers, process normally
                         }
 
-                        // ✅ REMOVE all special handling for FileOfferResponse - let it process normally
+                        // ✅ REMOVE ALL special routing for FileChunk, TransferComplete, etc.
+                        // Let them process normally to avoid routing loops
                         _ => {
                             // All other messages get processed normally
                         }
