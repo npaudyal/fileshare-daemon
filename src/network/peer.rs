@@ -558,6 +558,7 @@ impl PeerManager {
         &mut self,
         peer_id: Uuid,
         file_path: std::path::PathBuf,
+        target_dir: Option<PathBuf>, // NEW: Accept target directory
     ) -> Result<()> {
         // Check if peer is connected and authenticated
         let peer = self
@@ -571,9 +572,9 @@ impl PeerManager {
             ));
         }
 
-        // Start file transfer
+        // Start file transfer with target directory
         let mut ft = self.file_transfer.write().await;
-        ft.send_file(peer_id, file_path).await
+        ft.send_file(peer_id, file_path, target_dir).await
     }
 
     pub fn get_connected_peers(&self) -> Vec<Peer> {
@@ -683,6 +684,7 @@ impl PeerManager {
             MessageType::FileOffer {
                 transfer_id,
                 metadata,
+                target_dir,
             } => {
                 // CRITICAL FIX: Check if this is our own outgoing transfer
                 let is_our_outgoing_transfer = {
@@ -703,13 +705,14 @@ impl PeerManager {
                 }
 
                 info!(
-                    "✅ Processing incoming FileOffer from {}: {}",
-                    peer_id, metadata.name
+                    "✅ Processing incoming FileOffer from {}: {} (target_dir: {:?})",
+                    peer_id, metadata.name, target_dir
                 );
 
-                // Handle the file offer
+                // Handle the file offer with target directory
                 let mut ft = self.file_transfer.write().await;
-                ft.handle_file_offer(peer_id, transfer_id, metadata).await?;
+                ft.handle_file_offer(peer_id, transfer_id, metadata, target_dir)
+                    .await?; // Pass target_dir
 
                 // Create and send the response directly to the peer connection
                 let response = ft.create_file_offer_response(transfer_id, true, None);
@@ -819,39 +822,6 @@ impl PeerManager {
             }
             return Ok(());
         }
-
-        // DEBUG: Verify file content before sending
-        if let Ok(content) = std::fs::read_to_string(&file_path) {
-            info!("DEBUG: About to send file with content: '{}'", content);
-        }
-        if let Ok(bytes) = std::fs::read(&file_path) {
-            info!(
-                "DEBUG: File raw bytes (first 20): {:?}",
-                &bytes[..std::cmp::min(20, bytes.len())]
-            );
-        }
-
-        // Accept the request
-        let response = Message::new(MessageType::FileRequestResponse {
-            request_id,
-            accepted: true,
-            reason: None,
-        });
-
-        if let Some(conn) = self.connections.get(&peer_id) {
-            let _ = conn.send(response);
-        }
-
-        info!(
-            "File request accepted, starting file transfer to peer {} for file: {:?}",
-            peer_id, file_path
-        );
-
-        // CRITICAL: Make sure we're sending the correct file path
-        self.send_file_to_peer(peer_id, file_path).await?;
-
-        Ok(())
-    }
 }
 
 // Split PeerConnection into read and write halves

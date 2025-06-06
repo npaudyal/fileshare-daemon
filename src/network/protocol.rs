@@ -46,6 +46,7 @@ pub enum MessageType {
     FileOffer {
         transfer_id: Uuid,
         metadata: FileMetadata,
+        target_dir: Option<String>,
     },
     FileOfferResponse {
         transfer_id: Uuid,

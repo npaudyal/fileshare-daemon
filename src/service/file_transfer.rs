@@ -60,10 +60,15 @@ impl FileTransferManager {
         self.message_sender = Some(sender);
     }
 
-    pub async fn send_file(&mut self, peer_id: Uuid, file_path: PathBuf) -> Result<()> {
+    pub async fn send_file(
+        &mut self,
+        peer_id: Uuid,
+        file_path: PathBuf,
+        target_dir: Option<PathBuf>,
+    ) -> Result<()> {
         info!(
-            "🚀 SEND_FILE: Starting file transfer to {}: {:?}",
-            peer_id, file_path
+            "🚀 SEND_FILE: Starting file transfer to {}: {:?} (target_dir: {:?})",
+            peer_id, file_path, target_dir
         );
 
         if !file_path.exists() {
@@ -97,7 +102,7 @@ impl FileTransferManager {
             bytes_transferred: 0,
             chunks_received: Vec::new(),
             file_handle: None,
-            received_data: Vec::new(), // NEW
+            received_data: Vec::new(),
         };
 
         // Store the transfer first
@@ -111,11 +116,12 @@ impl FileTransferManager {
             let file_offer = Message::new(MessageType::FileOffer {
                 transfer_id,
                 metadata: metadata.clone(),
+                target_dir: target_dir.map(|p| p.to_string_lossy().to_string()), // NEW: Include target directory
             });
 
             info!(
-                "🚀 SEND_FILE: About to send FileOffer {} to peer {}",
-                transfer_id, peer_id
+                "🚀 SEND_FILE: About to send FileOffer {} to peer {} with target_dir: {:?}",
+                transfer_id, peer_id, target_dir
             );
 
             if let Err(e) = sender.send((peer_id, file_offer)) {
@@ -336,13 +342,14 @@ impl FileTransferManager {
         peer_id: Uuid,
         transfer_id: Uuid,
         metadata: FileMetadata,
+        target_dir: Option<String>,
     ) -> Result<()> {
         info!(
-            "Received file offer from {}: {} ({} bytes)",
-            peer_id, metadata.name, metadata.size
+            "Received file offer from {}: {} ({} bytes) with target_dir: {:?}",
+            peer_id, metadata.name, metadata.size, target_dir
         );
 
-        let save_path = self.get_save_path(&metadata.name)?;
+        let save_path = self.get_save_path(&metadata.name, target_dir.as_deref())?; // Pass target_dir to get_save_path
 
         // FIXED: Initialize received_data buffer with the expected size
         let received_data = vec![0u8; metadata.size as usize];
@@ -362,7 +369,7 @@ impl FileTransferManager {
                     as usize
             ],
             file_handle: None,
-            received_data, // NEW: Pre-allocate buffer
+            received_data,
         };
 
         self.active_transfers.insert(transfer_id, transfer);
@@ -370,6 +377,67 @@ impl FileTransferManager {
 
         info!("File offer accepted for transfer {}", transfer_id);
         Ok(())
+    }
+
+    fn get_save_path(&self, filename: &str, target_dir: Option<&str>) -> Result<PathBuf> {
+        let save_dir = if let Some(target_dir_str) = target_dir {
+            let target_path = PathBuf::from(target_dir_str);
+            if target_path.exists() && target_path.is_dir() {
+                info!("Using specified target directory: {:?}", target_path);
+                target_path
+            } else {
+                warn!("Target directory {:?} doesn't exist or isn't a directory, falling back to default", target_path);
+                self.get_default_save_dir()
+            }
+        } else {
+            info!("No target directory specified, using default");
+            self.get_default_save_dir()
+        };
+
+        if !save_dir.exists() {
+            std::fs::create_dir_all(&save_dir).map_err(|e| {
+                FileshareError::FileOperation(format!("Failed to create save directory: {}", e))
+            })?;
+        }
+
+        let mut save_path = save_dir.join(filename);
+
+        // Handle duplicate files
+        let mut counter = 1;
+        while save_path.exists() {
+            let stem = std::path::Path::new(filename)
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("file");
+
+            let extension = std::path::Path::new(filename)
+                .extension()
+                .and_then(|s| s.to_str())
+                .map(|s| format!(".{}", s))
+                .unwrap_or_default();
+
+            let new_filename = format!("{} ({}){}", stem, counter, extension);
+            save_path = save_dir.join(new_filename);
+            counter += 1;
+        }
+
+        info!("File will be saved to: {:?}", save_path);
+        Ok(save_path)
+    }
+
+    // NEW: Helper method to get default save directory
+    fn get_default_save_dir(&self) -> PathBuf {
+        if let Some(ref temp_dir) = self.settings.transfer.temp_dir {
+            temp_dir.clone()
+        } else {
+            directories::UserDirs::new()
+                .and_then(|dirs| dirs.download_dir().map(|d| d.to_path_buf()))
+                .unwrap_or_else(|| {
+                    directories::UserDirs::new()
+                        .and_then(|dirs| dirs.document_dir().map(|d| d.to_path_buf()))
+                        .unwrap_or_else(|| PathBuf::from("."))
+                })
+        }
     }
 
     pub fn create_file_offer_response(
