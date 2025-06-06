@@ -595,10 +595,6 @@ impl PeerManager {
         Ok(())
     }
 
-    // In peer.rs, replace the handle_message method with this simplified version:
-
-    // In peer.rs, replace the handle_message method with this fixed version:
-
     pub async fn handle_message(
         &mut self,
         peer_id: Uuid,
@@ -797,16 +793,16 @@ impl PeerManager {
         peer_id: Uuid,
         request_id: Uuid,
         file_path: PathBuf,
-        _target_path: PathBuf,
+        target_path: PathBuf, // This contains the full target path including filename
     ) -> Result<()> {
         info!(
             "Processing file request {} for {:?} (target: {:?})",
-            request_id, file_path, _target_path
+            request_id, file_path, target_path
         );
 
         // DEBUG: Log what paths we're working with
         info!("Source file path: {:?}", file_path);
-        info!("Target file path: {:?}", _target_path);
+        info!("Target file path: {:?}", target_path);
 
         // Check if the requested file exists
         if !file_path.exists() {
@@ -822,6 +818,45 @@ impl PeerManager {
             }
             return Ok(());
         }
+
+        // DEBUG: Verify file content before sending
+        if let Ok(content) = std::fs::read_to_string(&file_path) {
+            info!("DEBUG: About to send file with content: '{}'", content);
+        }
+        if let Ok(bytes) = std::fs::read(&file_path) {
+            info!(
+                "DEBUG: File raw bytes (first 20): {:?}",
+                &bytes[..std::cmp::min(20, bytes.len())]
+            );
+        }
+
+        // Accept the request
+        let response = Message::new(MessageType::FileRequestResponse {
+            request_id,
+            accepted: true,
+            reason: None,
+        });
+
+        if let Some(conn) = self.connections.get(&peer_id) {
+            let _ = conn.send(response);
+        }
+
+        info!(
+            "File request accepted, starting file transfer to peer {} for file: {:?}",
+            peer_id, file_path
+        );
+
+        // Extract target directory from target_path
+        let target_dir = target_path.parent().map(|p| p.to_path_buf());
+
+        info!("Extracted target directory: {:?}", target_dir);
+
+        // CRITICAL: Make sure we're sending the correct file path with target directory
+        self.send_file_to_peer(peer_id, file_path, target_dir)
+            .await?;
+
+        Ok(())
+    }
 }
 
 // Split PeerConnection into read and write halves

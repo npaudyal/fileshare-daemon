@@ -1,7 +1,6 @@
 use crate::{config::Settings, network::protocol::*, FileshareError, Result};
 use std::collections::HashMap;
-use std::fs::{File, OpenOptions};
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::fs::File;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::mpsc;
@@ -68,7 +67,9 @@ impl FileTransferManager {
     ) -> Result<()> {
         info!(
             "🚀 SEND_FILE: Starting file transfer to {}: {:?} (target_dir: {:?})",
-            peer_id, file_path, target_dir
+            peer_id,
+            file_path,
+            &target_dir // Add & here to borrow instead of move
         );
 
         if !file_path.exists() {
@@ -116,12 +117,14 @@ impl FileTransferManager {
             let file_offer = Message::new(MessageType::FileOffer {
                 transfer_id,
                 metadata: metadata.clone(),
-                target_dir: target_dir.map(|p| p.to_string_lossy().to_string()), // NEW: Include target directory
+                target_dir: target_dir.as_ref().map(|p| p.to_string_lossy().to_string()), // Use as_ref() to avoid moving
             });
 
             info!(
                 "🚀 SEND_FILE: About to send FileOffer {} to peer {} with target_dir: {:?}",
-                transfer_id, peer_id, target_dir
+                transfer_id,
+                peer_id,
+                &target_dir // Add & here too
             );
 
             if let Err(e) = sender.send((peer_id, file_offer)) {
@@ -379,67 +382,6 @@ impl FileTransferManager {
         Ok(())
     }
 
-    fn get_save_path(&self, filename: &str, target_dir: Option<&str>) -> Result<PathBuf> {
-        let save_dir = if let Some(target_dir_str) = target_dir {
-            let target_path = PathBuf::from(target_dir_str);
-            if target_path.exists() && target_path.is_dir() {
-                info!("Using specified target directory: {:?}", target_path);
-                target_path
-            } else {
-                warn!("Target directory {:?} doesn't exist or isn't a directory, falling back to default", target_path);
-                self.get_default_save_dir()
-            }
-        } else {
-            info!("No target directory specified, using default");
-            self.get_default_save_dir()
-        };
-
-        if !save_dir.exists() {
-            std::fs::create_dir_all(&save_dir).map_err(|e| {
-                FileshareError::FileOperation(format!("Failed to create save directory: {}", e))
-            })?;
-        }
-
-        let mut save_path = save_dir.join(filename);
-
-        // Handle duplicate files
-        let mut counter = 1;
-        while save_path.exists() {
-            let stem = std::path::Path::new(filename)
-                .file_stem()
-                .and_then(|s| s.to_str())
-                .unwrap_or("file");
-
-            let extension = std::path::Path::new(filename)
-                .extension()
-                .and_then(|s| s.to_str())
-                .map(|s| format!(".{}", s))
-                .unwrap_or_default();
-
-            let new_filename = format!("{} ({}){}", stem, counter, extension);
-            save_path = save_dir.join(new_filename);
-            counter += 1;
-        }
-
-        info!("File will be saved to: {:?}", save_path);
-        Ok(save_path)
-    }
-
-    // NEW: Helper method to get default save directory
-    fn get_default_save_dir(&self) -> PathBuf {
-        if let Some(ref temp_dir) = self.settings.transfer.temp_dir {
-            temp_dir.clone()
-        } else {
-            directories::UserDirs::new()
-                .and_then(|dirs| dirs.download_dir().map(|d| d.to_path_buf()))
-                .unwrap_or_else(|| {
-                    directories::UserDirs::new()
-                        .and_then(|dirs| dirs.document_dir().map(|d| d.to_path_buf()))
-                        .unwrap_or_else(|| PathBuf::from("."))
-                })
-        }
-    }
-
     pub fn create_file_offer_response(
         &self,
         transfer_id: Uuid,
@@ -468,8 +410,6 @@ impl FileTransferManager {
 
         Ok(())
     }
-
-    // In file_transfer.rs, replace the handle_file_chunk method:
 
     pub async fn handle_file_chunk(
         &mut self,
@@ -710,17 +650,20 @@ impl FileTransferManager {
         Ok(())
     }
 
-    fn get_save_path(&self, filename: &str) -> Result<PathBuf> {
-        let save_dir = if let Some(ref temp_dir) = self.settings.transfer.temp_dir {
-            temp_dir.clone()
+    // FIXED: Single get_save_path method that handles target directory
+    fn get_save_path(&self, filename: &str, target_dir: Option<&str>) -> Result<PathBuf> {
+        let save_dir = if let Some(target_dir_str) = target_dir {
+            let target_path = PathBuf::from(target_dir_str);
+            if target_path.exists() && target_path.is_dir() {
+                info!("Using specified target directory: {:?}", target_path);
+                target_path
+            } else {
+                warn!("Target directory {:?} doesn't exist or isn't a directory, falling back to default", target_path);
+                self.get_default_save_dir()
+            }
         } else {
-            directories::UserDirs::new()
-                .and_then(|dirs| dirs.download_dir().map(|d| d.to_path_buf()))
-                .unwrap_or_else(|| {
-                    directories::UserDirs::new()
-                        .and_then(|dirs| dirs.document_dir().map(|d| d.to_path_buf()))
-                        .unwrap_or_else(|| PathBuf::from("."))
-                })
+            info!("No target directory specified, using default");
+            self.get_default_save_dir()
         };
 
         if !save_dir.exists() {
@@ -752,6 +695,21 @@ impl FileTransferManager {
 
         info!("File will be saved to: {:?}", save_path);
         Ok(save_path)
+    }
+
+    // NEW: Helper method to get default save directory
+    fn get_default_save_dir(&self) -> PathBuf {
+        if let Some(ref temp_dir) = self.settings.transfer.temp_dir {
+            temp_dir.clone()
+        } else {
+            directories::UserDirs::new()
+                .and_then(|dirs| dirs.download_dir().map(|d| d.to_path_buf()))
+                .unwrap_or_else(|| {
+                    directories::UserDirs::new()
+                        .and_then(|dirs| dirs.document_dir().map(|d| d.to_path_buf()))
+                        .unwrap_or_else(|| PathBuf::from("."))
+                })
+        }
     }
 
     fn calculate_file_checksum(&self, file_path: &PathBuf) -> Result<String> {
