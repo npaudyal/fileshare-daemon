@@ -15,6 +15,6 @@ max_concurrent_transfers = 5
 # temp_dir = "/path/to/temp"  # Optional custom temp directory
 
 [security]
-require_pairing = true
+require_pairing = false
 encryption_enabled = true
 allowed_devices = []  # UUIDs of allowed devices
