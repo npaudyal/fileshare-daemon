@@ -794,7 +794,7 @@ impl PeerManager {
         peer_id: Uuid,
         request_id: Uuid,
         file_path: PathBuf,
-        target_path: PathBuf, // This is the target directory from paste operation
+        target_path: PathBuf,
     ) -> Result<()> {
         info!(
             "Processing file request {} for {:?} (target: {:?})",
@@ -847,10 +847,8 @@ impl PeerManager {
             peer_id, file_path
         );
 
-        // EXTRACT target directory from target_path
-        let target_dir = target_path
-            .parent()
-            .map(|p| p.to_string_lossy().to_string());
+        // FIXED: Cross-platform target directory extraction
+        let target_dir = Self::extract_target_directory(&target_path);
 
         info!("Target directory extracted: {:?}", target_dir);
 
@@ -860,6 +858,28 @@ impl PeerManager {
             .await?;
 
         Ok(())
+    }
+    fn extract_target_directory(target_path: &PathBuf) -> Option<String> {
+        let target_str = target_path.to_string_lossy();
+        info!("Extracting directory from target path: '{}'", target_str);
+
+        // Handle both Windows and Unix paths manually for cross-platform compatibility
+        let path_separators = ['/', '\\'];
+
+        // Find the last path separator
+        if let Some(last_sep_pos) = target_str.rfind(&path_separators[..]) {
+            let dir_path = &target_str[..last_sep_pos];
+            info!("Extracted directory: '{}'", dir_path);
+
+            if dir_path.is_empty() {
+                None
+            } else {
+                Some(dir_path.to_string())
+            }
+        } else {
+            info!("No path separator found, no directory to extract");
+            None
+        }
     }
 }
 
