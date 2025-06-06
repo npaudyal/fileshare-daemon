@@ -794,16 +794,16 @@ impl PeerManager {
         peer_id: Uuid,
         request_id: Uuid,
         file_path: PathBuf,
-        _target_path: PathBuf,
+        target_path: PathBuf, // This is the target directory from paste operation
     ) -> Result<()> {
         info!(
             "Processing file request {} for {:?} (target: {:?})",
-            request_id, file_path, _target_path
+            request_id, file_path, target_path
         );
 
         // DEBUG: Log what paths we're working with
         info!("Source file path: {:?}", file_path);
-        info!("Target file path: {:?}", _target_path);
+        info!("Target file path: {:?}", target_path);
 
         // Check if the requested file exists
         if !file_path.exists() {
@@ -847,8 +847,17 @@ impl PeerManager {
             peer_id, file_path
         );
 
-        // CRITICAL: Make sure we're sending the correct file path
-        self.send_file_to_peer(peer_id, file_path).await?;
+        // EXTRACT target directory from target_path
+        let target_dir = target_path
+            .parent()
+            .map(|p| p.to_string_lossy().to_string());
+
+        info!("Target directory extracted: {:?}", target_dir);
+
+        // USE the new method with target directory
+        let mut ft = self.file_transfer.write().await;
+        ft.send_file_with_target_dir(peer_id, file_path, target_dir)
+            .await?;
 
         Ok(())
     }

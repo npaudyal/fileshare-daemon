@@ -83,6 +83,7 @@ pub struct FileMetadata {
     pub mime_type: Option<String>,
     pub created: Option<u64>,
     pub modified: Option<u64>,
+    pub target_dir: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -172,9 +173,17 @@ impl FileMetadata {
             mime_type,
             created,
             modified,
+            target_dir: None, // ADD THIS LINE - defaults to None for regular transfers
         })
     }
 
+    // ADD THIS NEW METHOD
+    pub fn with_target_dir(mut self, target_dir: Option<String>) -> Self {
+        self.target_dir = target_dir;
+        self
+    }
+
+    // Rest of the implementation stays the same...
     fn guess_mime_type(filename: &str) -> Option<String> {
         let extension = std::path::Path::new(filename)
             .extension()?
