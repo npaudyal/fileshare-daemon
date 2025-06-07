@@ -56,14 +56,15 @@ impl FileTransferManager {
         })
     }
 
-    pub fn set_message_sender(&mut self, sender: MessageSender) {
-        self.message_sender = Some(sender);
-    }
-
-    pub async fn send_file(&mut self, peer_id: Uuid, file_path: PathBuf) -> Result<()> {
+    pub async fn send_file_with_target_dir(
+        &mut self,
+        peer_id: Uuid,
+        file_path: PathBuf,
+        target_dir: Option<String>,
+    ) -> Result<()> {
         info!(
-            "🚀 SEND_FILE: Starting file transfer to {}: {:?}",
-            peer_id, file_path
+            "🚀 SEND_FILE: Starting file transfer to {}: {:?} (target_dir: {:?})",
+            peer_id, file_path, target_dir
         );
 
         if !file_path.exists() {
@@ -78,7 +79,7 @@ impl FileTransferManager {
             ));
         }
 
-        let metadata = FileMetadata::from_path(&file_path)?;
+        let metadata = FileMetadata::from_path(&file_path)?.with_target_dir(target_dir); // ADD target_dir here
         let transfer_id = Uuid::new_v4();
 
         info!(
@@ -97,7 +98,7 @@ impl FileTransferManager {
             bytes_transferred: 0,
             chunks_received: Vec::new(),
             file_handle: None,
-            received_data: Vec::new(), // NEW
+            received_data: Vec::new(),
         };
 
         // Store the transfer first
@@ -139,6 +140,15 @@ impl FileTransferManager {
         }
 
         Ok(())
+    }
+
+    pub fn set_message_sender(&mut self, sender: MessageSender) {
+        self.message_sender = Some(sender);
+    }
+
+    pub async fn send_file(&mut self, peer_id: Uuid, file_path: PathBuf) -> Result<()> {
+        self.send_file_with_target_dir(peer_id, file_path, None)
+            .await
     }
 
     pub async fn handle_file_offer_response(
@@ -342,7 +352,8 @@ impl FileTransferManager {
             peer_id, metadata.name, metadata.size
         );
 
-        let save_path = self.get_save_path(&metadata.name)?;
+        // USE target directory from metadata
+        let save_path = self.get_save_path(&metadata.name, metadata.target_dir.as_deref())?;
 
         // FIXED: Initialize received_data buffer with the expected size
         let received_data = vec![0u8; metadata.size as usize];
@@ -362,7 +373,7 @@ impl FileTransferManager {
                     as usize
             ],
             file_handle: None,
-            received_data, // NEW: Pre-allocate buffer
+            received_data,
         };
 
         self.active_transfers.insert(transfer_id, transfer);
@@ -642,17 +653,21 @@ impl FileTransferManager {
         Ok(())
     }
 
-    fn get_save_path(&self, filename: &str) -> Result<PathBuf> {
-        let save_dir = if let Some(ref temp_dir) = self.settings.transfer.temp_dir {
-            temp_dir.clone()
+    fn get_save_path(&self, filename: &str, target_dir: Option<&str>) -> Result<PathBuf> {
+        let save_dir = if let Some(target_dir_str) = target_dir {
+            let target_path = PathBuf::from(target_dir_str);
+            if target_path.exists() && target_path.is_dir() {
+                info!("Using specified target directory: {:?}", target_path);
+                target_path
+            } else {
+                warn!(
+                    "Specified target directory {:?} doesn't exist, using default",
+                    target_path
+                );
+                self.get_default_save_dir()
+            }
         } else {
-            directories::UserDirs::new()
-                .and_then(|dirs| dirs.download_dir().map(|d| d.to_path_buf()))
-                .unwrap_or_else(|| {
-                    directories::UserDirs::new()
-                        .and_then(|dirs| dirs.document_dir().map(|d| d.to_path_buf()))
-                        .unwrap_or_else(|| PathBuf::from("."))
-                })
+            self.get_default_save_dir()
         };
 
         if !save_dir.exists() {
@@ -684,6 +699,21 @@ impl FileTransferManager {
 
         info!("File will be saved to: {:?}", save_path);
         Ok(save_path)
+    }
+
+    // ADD helper method for default save directory
+    fn get_default_save_dir(&self) -> PathBuf {
+        if let Some(ref temp_dir) = self.settings.transfer.temp_dir {
+            temp_dir.clone()
+        } else {
+            directories::UserDirs::new()
+                .and_then(|dirs| dirs.download_dir().map(|d| d.to_path_buf()))
+                .unwrap_or_else(|| {
+                    directories::UserDirs::new()
+                        .and_then(|dirs| dirs.document_dir().map(|d| d.to_path_buf()))
+                        .unwrap_or_else(|| PathBuf::from("."))
+                })
+        }
     }
 
     fn calculate_file_checksum(&self, file_path: &PathBuf) -> Result<String> {

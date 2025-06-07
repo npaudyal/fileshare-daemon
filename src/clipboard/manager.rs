@@ -27,6 +27,28 @@ impl ClipboardManager {
         }
     }
 
+    fn extract_filename_cross_platform(file_path: &PathBuf) -> String {
+        let path_str = file_path.to_string_lossy();
+        info!("Extracting filename from path: '{}'", path_str);
+
+        // Handle both Windows and Unix paths manually for cross-platform compatibility
+        let path_separators = ['/', '\\'];
+
+        // Find the last path separator
+        if let Some(last_sep_pos) = path_str.rfind(&path_separators[..]) {
+            let filename = &path_str[last_sep_pos + 1..];
+            info!("Extracted filename: '{}'", filename);
+            filename.to_string()
+        } else {
+            // No separators found, the whole string is the filename
+            info!(
+                "No path separator found, using whole string as filename: '{}'",
+                path_str
+            );
+            path_str.to_string()
+        }
+    }
+
     // Called when user hits copy hotkey - detect selected file and store in network clipboard
     pub async fn copy_selected_file(&self) -> crate::Result<()> {
         info!("Attempting to copy currently selected file");
@@ -108,13 +130,15 @@ impl ClipboardManager {
                 item.file_path, item.source_device
             );
 
-            // Return the file info and source device for the daemon to handle transfer
-            let target_path = target_dir.join(item.file_path.file_name().unwrap_or_default());
+            // FIXED: Extract filename in a cross-platform way
+            let filename = Self::extract_filename_cross_platform(&item.file_path);
+            let target_path = target_dir.join(&filename);
 
             // DEBUG: Log the final paths
             info!("DEBUG: Final source path for request: {:?}", item.file_path);
             info!("DEBUG: Final target path for request: {:?}", target_path);
 
+            // Return the file info and source device for the daemon to handle transfer
             Ok(Some((target_path, item.source_device)))
         } else {
             info!("Network clipboard is empty");

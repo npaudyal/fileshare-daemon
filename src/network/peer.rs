@@ -794,16 +794,16 @@ impl PeerManager {
         peer_id: Uuid,
         request_id: Uuid,
         file_path: PathBuf,
-        _target_path: PathBuf,
+        target_path: PathBuf,
     ) -> Result<()> {
         info!(
             "Processing file request {} for {:?} (target: {:?})",
-            request_id, file_path, _target_path
+            request_id, file_path, target_path
         );
 
         // DEBUG: Log what paths we're working with
         info!("Source file path: {:?}", file_path);
-        info!("Target file path: {:?}", _target_path);
+        info!("Target file path: {:?}", target_path);
 
         // Check if the requested file exists
         if !file_path.exists() {
@@ -847,10 +847,39 @@ impl PeerManager {
             peer_id, file_path
         );
 
-        // CRITICAL: Make sure we're sending the correct file path
-        self.send_file_to_peer(peer_id, file_path).await?;
+        // FIXED: Cross-platform target directory extraction
+        let target_dir = Self::extract_target_directory(&target_path);
+
+        info!("Target directory extracted: {:?}", target_dir);
+
+        // USE the new method with target directory
+        let mut ft = self.file_transfer.write().await;
+        ft.send_file_with_target_dir(peer_id, file_path, target_dir)
+            .await?;
 
         Ok(())
+    }
+    fn extract_target_directory(target_path: &PathBuf) -> Option<String> {
+        let target_str = target_path.to_string_lossy();
+        info!("Extracting directory from target path: '{}'", target_str);
+
+        // Handle both Windows and Unix paths manually for cross-platform compatibility
+        let path_separators = ['/', '\\'];
+
+        // Find the last path separator
+        if let Some(last_sep_pos) = target_str.rfind(&path_separators[..]) {
+            let dir_path = &target_str[..last_sep_pos];
+            info!("Extracted directory: '{}'", dir_path);
+
+            if dir_path.is_empty() {
+                None
+            } else {
+                Some(dir_path.to_string())
+            }
+        } else {
+            info!("No path separator found, no directory to extract");
+            None
+        }
     }
 }
 
