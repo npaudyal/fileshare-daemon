@@ -198,10 +198,10 @@ function App() {
 
     const DeviceCard = ({ device }: { device: DeviceInfo }) => (
         <div className={`bg-white/10 backdrop-blur-sm rounded-lg p-4 border transition-all duration-200 hover:bg-white/15 ${device.is_connected
-                ? 'border-green-500/50 shadow-green-500/20'
-                : device.is_paired
-                    ? 'border-blue-500/50'
-                    : 'border-white/20'
+            ? 'border-green-500/50 shadow-green-500/20'
+            : device.is_paired
+                ? 'border-blue-500/50'
+                : 'border-white/20'
             }`}>
             <div className="flex items-center justify-between mb-3">
                 <div className="flex items-center space-x-3">
@@ -355,8 +355,8 @@ function App() {
                         key={id}
                         onClick={() => setActiveTab(id as typeof activeTab)}
                         className={`flex-1 px-4 py-3 text-sm font-medium transition-colors flex items-center justify-center space-x-2 ${activeTab === id
-                                ? 'text-blue-400 border-b-2 border-blue-400 bg-blue-500/10'
-                                : 'text-gray-400 hover:text-white hover:bg-white/5'
+                            ? 'text-blue-400 border-b-2 border-blue-400 bg-blue-500/10'
+                            : 'text-gray-400 hover:text-white hover:bg-white/5'
                             }`}
                     >
                         <Icon className="w-4 h-4" />
@@ -470,11 +470,26 @@ function App() {
                             <div className="space-y-2 text-sm">
                                 <div className="flex justify-between text-gray-300">
                                     <span>Copy file:</span>
-                                    <kbd className="bg-black/30 px-2 py-1 rounded text-xs">⌘⇧Y</kbd>
+                                    <kbd className="bg-black/30 px-2 py-1 rounded text-xs">
+                                        {/* Platform-specific hotkey display */}
+                                        {navigator.platform.toLowerCase().includes('mac')
+                                            ? '⌘⇧Y'
+                                            : navigator.platform.toLowerCase().includes('win')
+                                                ? 'Ctrl+Alt+Y'
+                                                : 'Ctrl+Shift+Y'
+                                        }
+                                    </kbd>
                                 </div>
                                 <div className="flex justify-between text-gray-300">
                                     <span>Paste file:</span>
-                                    <kbd className="bg-black/30 px-2 py-1 rounded text-xs">⌘⇧I</kbd>
+                                    <kbd className="bg-black/30 px-2 py-1 rounded text-xs">
+                                        {navigator.platform.toLowerCase().includes('mac')
+                                            ? '⌘⇧I'
+                                            : navigator.platform.toLowerCase().includes('win')
+                                                ? 'Ctrl+Alt+I'
+                                                : 'Ctrl+Shift+I'
+                                        }
+                                    </kbd>
                                 </div>
                             </div>
                         </div>

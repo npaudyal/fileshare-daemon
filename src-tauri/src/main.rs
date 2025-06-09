@@ -86,6 +86,34 @@ async fn get_discovered_devices(
 }
 
 #[tauri::command]
+async fn test_hotkeys() -> Result<String, String> {
+    #[cfg(target_os = "windows")]
+    {
+        use global_hotkey::{
+            hotkey::{Code, HotKey, Modifiers},
+            GlobalHotKeyManager,
+        };
+
+        let manager =
+            GlobalHotKeyManager::new().map_err(|e| format!("Manager creation failed: {}", e))?;
+
+        // Test basic hotkey registration
+        let test_hotkey = HotKey::new(Some(Modifiers::CONTROL | Modifiers::ALT), Code::KeyY);
+
+        match manager.register(test_hotkey) {
+            Ok(()) => {
+                let _ = manager.unregister(test_hotkey);
+                Ok("✅ Windows hotkey system is working".to_string())
+            }
+            Err(e) => Err(format!("❌ Hotkey registration failed: {}", e)),
+        }
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    Ok("✅ Non-Windows platform".to_string())
+}
+
+#[tauri::command]
 async fn pair_device(device_id: String, state: tauri::State<'_, AppState>) -> Result<(), String> {
     info!("🔗 UI requested to pair device: {}", device_id);
 
@@ -243,6 +271,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             get_app_settings,
             get_connection_status,
             refresh_devices,
+            test_hotkeys,
             quit_app,
             hide_window
         ])
