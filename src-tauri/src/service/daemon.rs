@@ -13,8 +13,8 @@ use tracing::{error, info, warn};
 
 pub struct FileshareDaemon {
     settings: Arc<Settings>,
-    pub discovery: DiscoveryService,            // Make this public
-    pub peer_manager: Arc<RwLock<PeerManager>>, // Make this public
+    pub discovery: Option<DiscoveryService>, // Make optional since we'll move it
+    pub peer_manager: Arc<RwLock<PeerManager>>,
     hotkey_manager: HotkeyManager,
     clipboard: ClipboardManager,
     shutdown_tx: broadcast::Sender<()>,
@@ -45,7 +45,7 @@ impl FileshareDaemon {
 
         Ok(Self {
             settings,
-            discovery,
+            discovery: Some(discovery), // Store as Option
             peer_manager,
             hotkey_manager,
             clipboard,
@@ -54,7 +54,14 @@ impl FileshareDaemon {
         })
     }
 
-    // ... rest of the methods stay the same
+    // Add method to get discovered devices
+    pub async fn get_discovered_devices(&self) -> Vec<crate::network::discovery::DeviceInfo> {
+        // Since we can't access discovery after it's moved, we'll get devices from peer manager
+        // The peer manager should have the discovered devices
+        let pm = self.peer_manager.read().await;
+        pm.get_all_discovered_devices().await
+    }
+
     pub async fn run(mut self) -> Result<()> {
         info!("Starting Fileshare Daemon...");
         info!("Device ID: {}", self.settings.device.id);
@@ -64,16 +71,24 @@ impl FileshareDaemon {
         // Start hotkey manager
         self.hotkey_manager.start().await?;
 
-        // Start background services
-        let discovery_handle = {
-            let mut discovery = self.discovery.clone();
+        // Start discovery service (move it out of self)
+        let discovery_handle = if let Some(mut discovery) = self.discovery.take() {
             tokio::spawn(async move {
+                info!("🔍 Starting discovery service...");
                 if let Err(e) = discovery.run().await {
-                    error!("Discovery service error: {}", e);
+                    error!("❌ Discovery service error: {}", e);
+                } else {
+                    info!("✅ Discovery service started successfully");
                 }
             })
+        } else {
+            error!("❌ Discovery service not available");
+            return Err(crate::FileshareError::Unknown(
+                "Discovery service not available".to_string(),
+            ));
         };
 
+        // Start peer manager
         let peer_manager_handle = {
             let peer_manager = self.peer_manager.clone();
             let settings = self.settings.clone();
@@ -84,11 +99,11 @@ impl FileshareDaemon {
                 tokio::select! {
                     result = Self::run_peer_manager(peer_manager, settings, clipboard) => {
                         if let Err(e) = result {
-                            error!("Peer manager error: {}", e);
+                            error!("❌ Peer manager error: {}", e);
                         }
                     }
                     _ = shutdown_rx.recv() => {
-                        info!("Peer manager shutdown requested");
+                        info!("🛑 Peer manager shutdown requested");
                     }
                 }
             })
@@ -104,60 +119,63 @@ impl FileshareDaemon {
             tokio::spawn(async move {
                 tokio::select! {
                     _ = Self::handle_hotkey_events(&mut hotkey_manager, peer_manager, clipboard) => {
-                        info!("Hotkey handler stopped");
+                        info!("🎹 Hotkey handler stopped");
                     }
                     _ = shutdown_rx.recv() => {
-                        info!("Hotkey handler shutdown requested");
+                        info!("🛑 Hotkey handler shutdown requested");
                         if let Err(e) = hotkey_manager.stop() {
-                            error!("Failed to stop hotkey manager: {}", e);
+                            error!("❌ Failed to stop hotkey manager: {}", e);
                         }
                     }
                 }
             })
         };
 
-        info!("Background services started successfully");
+        info!("✅ All background services started successfully");
 
-        // Wait for shutdown
+        // Wait for shutdown signal
         let mut shutdown_rx = self.shutdown_rx;
         shutdown_rx.recv().await.ok();
 
         // Clean shutdown
+        info!("🛑 Shutting down services...");
         discovery_handle.abort();
         peer_manager_handle.abort();
         hotkey_handle.abort();
 
-        info!("Fileshare Daemon stopped");
+        info!("✅ Fileshare Daemon stopped");
         Ok(())
     }
 
-    // ... rest of your existing methods stay exactly the same
+    // Rest of your methods stay the same...
     async fn handle_hotkey_events(
         hotkey_manager: &mut HotkeyManager,
         peer_manager: Arc<RwLock<PeerManager>>,
         clipboard: ClipboardManager,
     ) {
-        info!("Starting hotkey event handler");
+        info!("🎹 Starting hotkey event handler");
 
         loop {
             if let Some(event) = hotkey_manager.get_event().await {
                 match event {
                     HotkeyEvent::CopyFiles => {
-                        info!("Copy hotkey triggered - copying selected file to network clipboard");
+                        info!(
+                            "📋 Copy hotkey triggered - copying selected file to network clipboard"
+                        );
                         if let Err(e) =
                             Self::handle_copy_operation(clipboard.clone(), peer_manager.clone())
                                 .await
                         {
-                            error!("Failed to handle copy operation: {}", e);
+                            error!("❌ Failed to handle copy operation: {}", e);
                         }
                     }
                     HotkeyEvent::PasteFiles => {
-                        info!("Paste hotkey triggered - pasting from network clipboard");
+                        info!("📋 Paste hotkey triggered - pasting from network clipboard");
                         if let Err(e) =
                             Self::handle_paste_operation(clipboard.clone(), peer_manager.clone())
                                 .await
                         {
-                            error!("Failed to handle paste operation: {}", e);
+                            error!("❌ Failed to handle paste operation: {}", e);
                         }
                     }
                 }
@@ -169,7 +187,7 @@ impl FileshareDaemon {
         clipboard: ClipboardManager,
         peer_manager: Arc<RwLock<PeerManager>>,
     ) -> Result<()> {
-        info!("Handling copy operation");
+        info!("📋 Handling copy operation");
 
         // Copy currently selected file to network clipboard
         clipboard.copy_selected_file().await?;
@@ -200,7 +218,7 @@ impl FileshareDaemon {
                 let mut pm = peer_manager.write().await;
                 if let Err(e) = pm.send_message_to_peer(peer.device_info.id, message).await {
                     warn!(
-                        "Failed to send clipboard update to {}: {}",
+                        "❌ Failed to send clipboard update to {}: {}",
                         peer.device_info.id, e
                     );
                 }
@@ -226,7 +244,7 @@ impl FileshareDaemon {
                     crate::FileshareError::Unknown(format!("Notification error: {}", e))
                 })?;
 
-            info!("Copy operation completed successfully");
+            info!("✅ Copy operation completed successfully");
         }
 
         Ok(())
@@ -236,12 +254,12 @@ impl FileshareDaemon {
         clipboard: ClipboardManager,
         peer_manager: Arc<RwLock<PeerManager>>,
     ) -> Result<()> {
-        info!("Handling paste operation");
+        info!("📋 Handling paste operation");
 
         // Try to paste from network clipboard
         if let Some((target_path, source_device)) = clipboard.paste_to_current_location().await? {
             info!(
-                "Requesting file transfer from device {} to {:?}",
+                "📁 Requesting file transfer from device {} to {:?}",
                 source_device, target_path
             );
 
@@ -255,16 +273,6 @@ impl FileshareDaemon {
                     .to_string_lossy()
                     .to_string()
             };
-
-            // DEBUG: Log what we're about to send
-            info!(
-                "DEBUG: Source file path for FileRequest: {}",
-                source_file_path
-            );
-            info!(
-                "DEBUG: Target file path for FileRequest: {}",
-                target_path.to_string_lossy()
-            );
 
             // Send file request to source device
             let request_id = uuid::Uuid::new_v4();
@@ -289,7 +297,7 @@ impl FileshareDaemon {
                     crate::FileshareError::Unknown(format!("Notification error: {}", e))
                 })?;
 
-            info!("File request sent to source device");
+            info!("✅ File request sent to source device");
         }
 
         Ok(())
@@ -301,7 +309,10 @@ impl FileshareDaemon {
         clipboard: ClipboardManager,
     ) -> Result<()> {
         let listener = tokio::net::TcpListener::bind(settings.get_bind_address()).await?;
-        info!("Peer manager listening on {}", settings.get_bind_address());
+        info!(
+            "🌐 Peer manager listening on {}",
+            settings.get_bind_address()
+        );
 
         // Spawn a task to handle incoming connections
         let connection_pm = peer_manager.clone();
@@ -309,18 +320,18 @@ impl FileshareDaemon {
             loop {
                 match listener.accept().await {
                     Ok((stream, addr)) => {
-                        info!("New connection from {}", addr);
+                        info!("🔗 New connection from {}", addr);
                         let pm = connection_pm.clone();
 
                         tokio::spawn(async move {
                             let mut pm = pm.write().await;
                             if let Err(e) = pm.handle_connection(stream).await {
-                                warn!("Failed to handle connection from {}: {}", addr, e);
+                                warn!("❌ Failed to handle connection from {}: {}", addr, e);
                             }
                         });
                     }
                     Err(e) => {
-                        error!("Failed to accept connection: {}", e);
+                        error!("❌ Failed to accept connection: {}", e);
                         tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
                     }
                 }
@@ -337,7 +348,7 @@ impl FileshareDaemon {
                 let mut pm = message_pm.write().await;
 
                 while let Ok((peer_id, message)) = pm.message_rx.try_recv() {
-                    // CRITICAL: Route ALL outgoing transfer messages directly to avoid loops
+                    // Route outgoing transfer messages directly
                     match &message.message_type {
                         MessageType::FileOffer { transfer_id, .. } => {
                             let is_our_outgoing = {
@@ -350,10 +361,6 @@ impl FileshareDaemon {
                             };
 
                             if is_our_outgoing {
-                                info!(
-                                    "🚀 Sending outgoing FileOffer {} directly to peer {}",
-                                    transfer_id, peer_id
-                                );
                                 if let Err(e) = pm.send_direct_to_connection(peer_id, message).await
                                 {
                                     error!(
@@ -361,7 +368,7 @@ impl FileshareDaemon {
                                         peer_id, e
                                     );
                                 }
-                                continue; // Don't process locally
+                                continue;
                             }
                         }
 
@@ -376,7 +383,6 @@ impl FileshareDaemon {
                             };
 
                             if is_our_outgoing {
-                                info!("🚀 Sending outgoing FileChunk for transfer {} directly to peer {}", transfer_id, peer_id);
                                 if let Err(e) = pm.send_direct_to_connection(peer_id, message).await
                                 {
                                     error!(
@@ -384,7 +390,7 @@ impl FileshareDaemon {
                                         peer_id, e
                                     );
                                 }
-                                continue; // Don't process locally
+                                continue;
                             }
                         }
 
@@ -399,7 +405,6 @@ impl FileshareDaemon {
                             };
 
                             if is_our_outgoing {
-                                info!("🚀 Sending outgoing TransferComplete for transfer {} directly to peer {}", transfer_id, peer_id);
                                 if let Err(e) = pm.send_direct_to_connection(peer_id, message).await
                                 {
                                     error!(
@@ -407,7 +412,7 @@ impl FileshareDaemon {
                                         peer_id, e
                                     );
                                 }
-                                continue; // Don't process locally
+                                continue;
                             }
                         }
 
@@ -422,7 +427,6 @@ impl FileshareDaemon {
                             };
 
                             if is_our_outgoing {
-                                info!("🚀 Sending outgoing TransferError for transfer {} directly to peer {}", transfer_id, peer_id);
                                 if let Err(e) = pm.send_direct_to_connection(peer_id, message).await
                                 {
                                     error!(
@@ -430,7 +434,7 @@ impl FileshareDaemon {
                                         peer_id, e
                                     );
                                 }
-                                continue; // Don't process locally
+                                continue;
                             }
                         }
 
@@ -439,12 +443,12 @@ impl FileshareDaemon {
                         }
                     }
 
-                    // Process all other messages normally (including incoming transfer messages)
+                    // Process all other messages normally
                     if let Err(e) = pm
                         .handle_message(peer_id, message, &message_clipboard)
                         .await
                     {
-                        error!("Error processing message: {}", e);
+                        error!("❌ Error processing message: {}", e);
                     }
                 }
             }

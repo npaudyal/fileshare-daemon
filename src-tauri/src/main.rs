@@ -8,7 +8,7 @@ use tauri::{
     tray::{MouseButton, TrayIconBuilder, TrayIconEvent},
     Manager, WebviewUrl, WebviewWindowBuilder,
 };
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex, RwLock};
 use tracing::{error, info, warn};
 use uuid::Uuid;
 
@@ -38,11 +38,13 @@ struct AppSettings {
 }
 
 struct AppState {
-    daemon: Arc<RwLock<Option<FileshareDaemon>>>,
+    // Store settings separately since daemon will be moved
     settings: Arc<RwLock<Settings>>,
+    // Store daemon reference for accessing peer manager
+    daemon_ref: Arc<Mutex<Option<Arc<RwLock<fileshare_daemon::network::PeerManager>>>>>,
 }
 
-// FIXED: Get real discovered devices from daemon
+// FIXED: Get real discovered devices through peer manager
 #[tauri::command]
 async fn get_discovered_devices(
     state: tauri::State<'_, AppState>,
@@ -51,10 +53,12 @@ async fn get_discovered_devices(
 
     let settings = state.settings.read().await;
 
-    // Get daemon and discovery service
-    if let Some(daemon) = state.daemon.read().await.as_ref() {
-        // Access the discovery service from daemon
-        let discovered = daemon.discovery.get_discovered_devices().await;
+    // Get peer manager reference
+    if let Some(peer_manager_ref) = state.daemon_ref.lock().await.as_ref() {
+        let pm = peer_manager_ref.read().await;
+
+        // Get discovered devices from peer manager
+        let discovered = pm.get_all_discovered_devices().await;
 
         let mut devices = Vec::new();
 
@@ -62,15 +66,13 @@ async fn get_discovered_devices(
             // Check if device is paired (in allowed list)
             let is_paired = settings.security.allowed_devices.contains(&device.id);
 
-            // Check if device is currently connected via peer manager
-            let is_connected = {
-                let pm = daemon.peer_manager.read().await;
-                pm.get_connected_peers()
-                    .iter()
-                    .any(|p| p.device_info.id == device.id)
-            };
+            // Check if device is currently connected
+            let is_connected = pm
+                .get_connected_peers()
+                .iter()
+                .any(|p| p.device_info.id == device.id);
 
-            // Determine device type based on name or other heuristics
+            // Determine device type based on name
             let device_type = determine_device_type(&device.name);
 
             devices.push(DeviceInfo {
@@ -88,7 +90,7 @@ async fn get_discovered_devices(
         info!("📱 Returning {} discovered devices to UI", devices.len());
         Ok(devices)
     } else {
-        warn!("❌ Daemon not ready yet");
+        warn!("❌ Peer manager not ready yet");
         Ok(Vec::new())
     }
 }
@@ -115,8 +117,8 @@ async fn pair_device(device_id: String, state: tauri::State<'_, AppState>) -> Re
     }
 
     // Try to connect to the device
-    if let Some(daemon) = state.daemon.read().await.as_ref() {
-        let mut pm = daemon.peer_manager.write().await;
+    if let Some(peer_manager_ref) = state.daemon_ref.lock().await.as_ref() {
+        let mut pm = peer_manager_ref.write().await;
         if let Err(e) = pm.connect_to_peer(device_uuid).await {
             warn!("Failed to connect to paired device {}: {}", device_id, e);
             // Don't return error - pairing succeeded, connection might happen later
@@ -164,7 +166,6 @@ async fn rename_device(
         device_id, new_name
     );
     // TODO: Implement device renaming in backend
-    // For now, just log the request
     Ok(())
 }
 
@@ -185,44 +186,21 @@ async fn get_app_settings(state: tauri::State<'_, AppState>) -> Result<AppSettin
 }
 
 #[tauri::command]
-async fn update_settings(
-    new_settings: AppSettings,
-    state: tauri::State<'_, AppState>,
-) -> Result<(), String> {
-    info!("⚙️ UI requested to update settings");
-
-    {
-        let mut settings = state.settings.write().await;
-
-        // Update settings
-        settings.device.name = new_settings.device_name;
-        settings.network.port = new_settings.network_port;
-        settings.network.discovery_port = new_settings.discovery_port;
-        settings.transfer.chunk_size = new_settings.chunk_size;
-        settings.transfer.max_concurrent_transfers = new_settings.max_concurrent_transfers;
-        settings.security.require_pairing = new_settings.require_pairing;
-        settings.security.encryption_enabled = new_settings.encryption_enabled;
-
-        // Save to file
-        if let Err(e) = settings.save(None) {
-            error!("Failed to save settings: {}", e);
-            return Err(format!("Failed to save settings: {}", e));
-        }
-    }
-
-    info!("✅ Settings updated successfully");
-    Ok(())
-}
-
-#[tauri::command]
 async fn get_connection_status(state: tauri::State<'_, AppState>) -> Result<bool, String> {
-    if let Some(daemon) = state.daemon.read().await.as_ref() {
-        let pm = daemon.peer_manager.read().await;
+    if let Some(peer_manager_ref) = state.daemon_ref.lock().await.as_ref() {
+        let pm = peer_manager_ref.read().await;
         let connected_count = pm.get_connected_peers().len();
         Ok(connected_count > 0)
     } else {
         Ok(false)
     }
+}
+
+#[tauri::command]
+async fn refresh_devices(_state: tauri::State<'_, AppState>) -> Result<(), String> {
+    info!("🔄 UI requested device refresh");
+    // Discovery runs continuously, so just return success
+    Ok(())
 }
 
 #[tauri::command]
@@ -237,14 +215,6 @@ async fn hide_window(app: tauri::AppHandle) -> Result<(), String> {
     if let Some(window) = app.get_webview_window("main") {
         window.hide().map_err(|e| e.to_string())?;
     }
-    Ok(())
-}
-
-#[tauri::command]
-async fn refresh_devices(state: tauri::State<'_, AppState>) -> Result<(), String> {
-    info!("🔄 UI requested device refresh");
-    // The discovery service runs continuously, so just return success
-    // Real refreshing happens automatically via the discovery service
     Ok(())
 }
 
@@ -276,8 +246,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     info!("📋 Configuration loaded: {:?}", settings.device.name);
 
     let app_state = AppState {
-        daemon: Arc::new(RwLock::new(None)),
         settings: Arc::new(RwLock::new(settings)),
+        daemon_ref: Arc::new(Mutex::new(None)),
     };
 
     tauri::Builder::default()
@@ -289,17 +259,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             unpair_device,
             rename_device,
             get_app_settings,
-            update_settings,
             get_connection_status,
             refresh_devices,
             quit_app,
             hide_window
         ])
         .setup(|app| {
-            // Create the main window immediately but keep it hidden
+            // Create the main window
             let _main_window = WebviewWindowBuilder::new(app, "main", WebviewUrl::default())
                 .title("Fileshare")
-                .inner_size(420.0, 580.0) // Slightly larger for better UX
+                .inner_size(420.0, 580.0)
                 .center()
                 .decorations(false)
                 .resizable(false)
@@ -309,18 +278,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             info!("🪟 Main window created and hidden");
 
-            // Create tray menu items
+            // Create tray
             let quit = MenuItem::with_id(app, "quit", "Quit", true, None::<&str>)?;
             let show_hide =
                 MenuItem::with_id(app, "show_hide", "Show/Hide Window", true, None::<&str>)?;
             let menu = Menu::with_items(app, &[&show_hide, &quit])?;
 
-            // Get app handle for use in closures
             let app_handle_for_tray = app.handle().clone();
             let app_handle_for_menu = app.handle().clone();
 
-            // Create system tray with menu
-            let tray_result = if let Some(icon) = app.default_window_icon() {
+            if let Some(icon) = app.default_window_icon() {
                 TrayIconBuilder::new()
                     .icon(icon.clone())
                     .menu(&menu)
@@ -332,57 +299,37 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         } => {
                             if let Some(window) = app_handle_for_tray.get_webview_window("main") {
                                 let is_visible = window.is_visible().unwrap_or(false);
-
                                 if is_visible {
                                     let _ = window.hide();
-                                    info!("🙈 Window hidden");
                                 } else {
                                     let _ = window.show();
                                     let _ = window.center();
                                     let _ = window.set_focus();
-                                    info!("👁️ Window shown and focused");
                                 }
                             }
                         }
                         _ => {}
                     })
                     .on_menu_event(move |_tray, event| match event.id.as_ref() {
-                        "quit" => {
-                            std::process::exit(0);
-                        }
+                        "quit" => std::process::exit(0),
                         "show_hide" => {
                             if let Some(window) = app_handle_for_menu.get_webview_window("main") {
                                 let is_visible = window.is_visible().unwrap_or(false);
                                 if is_visible {
                                     let _ = window.hide();
-                                    info!("🙈 Window hidden via menu");
                                 } else {
                                     let _ = window.show();
                                     let _ = window.center();
                                     let _ = window.set_focus();
-                                    info!("👁️ Window shown and focused via menu");
                                 }
                             }
                         }
                         _ => {}
                     })
-                    .build(app)
-            } else {
-                error!("❌ No default icon available for tray");
-                return Err("No tray icon available".into());
-            };
-
-            match tray_result {
-                Ok(_) => {
-                    info!("✅ System tray icon created successfully");
-                }
-                Err(e) => {
-                    error!("❌ Failed to create tray icon: {}", e);
-                    return Err(e.into());
-                }
+                    .build(app)?;
             }
 
-            // Start the daemon in background
+            // Start daemon in background
             let app_handle = app.handle().clone();
             tokio::spawn(async move {
                 if let Err(e) = start_daemon(app_handle).await {
@@ -402,6 +349,7 @@ async fn start_daemon(app_handle: tauri::AppHandle) -> Result<(), Box<dyn std::e
     info!("🔧 Starting background daemon...");
 
     let state: tauri::State<AppState> = app_handle.state();
+
     let settings = {
         let settings_lock = state.settings.read().await;
         settings_lock.clone()
@@ -411,11 +359,21 @@ async fn start_daemon(app_handle: tauri::AppHandle) -> Result<(), Box<dyn std::e
         .await
         .map_err(|e| format!("Failed to create daemon: {}", e))?;
 
-    // Store daemon in state
+    // Store reference to peer manager before starting daemon
+    let peer_manager_ref = daemon.peer_manager.clone();
     {
-        let mut daemon_lock = state.daemon.write().await;
-        *daemon_lock = Some(daemon);
+        let mut daemon_ref = state.daemon_ref.lock().await;
+        *daemon_ref = Some(peer_manager_ref);
     }
+
+    info!("✅ Daemon created, starting services...");
+
+    // Start daemon (this will move the daemon)
+    tokio::spawn(async move {
+        if let Err(e) = daemon.run().await {
+            error!("❌ Daemon run error: {}", e);
+        }
+    });
 
     info!("✅ Background daemon started successfully");
     Ok(())

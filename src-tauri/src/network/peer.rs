@@ -57,6 +57,24 @@ impl PeerManager {
         }
     }
 
+    pub async fn get_all_discovered_devices(&self) -> Vec<crate::network::discovery::DeviceInfo> {
+        // This is a workaround - we need to store discovered devices in peer manager
+        // For now, return peers as discovered devices
+        let mut discovered = Vec::new();
+
+        for (_, peer) in &self.peers {
+            discovered.push(crate::network::discovery::DeviceInfo {
+                id: peer.device_info.id,
+                name: peer.device_info.name.clone(),
+                addr: peer.device_info.addr,
+                last_seen: peer.device_info.last_seen,
+                version: peer.device_info.version.clone(),
+            });
+        }
+
+        discovered
+    }
+
     pub async fn new(settings: Arc<Settings>) -> Result<Self> {
         let (message_tx, message_rx) = mpsc::unbounded_channel();
         let file_transfer = Arc::new(RwLock::new(
