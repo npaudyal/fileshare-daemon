@@ -8,3 +8,7 @@
 .idea/
 *.log
 config/config.toml
+node_modules/
+/src-tauri/target/
+/src-tauri/gen/schemas/
+/src-tauri/gen/

@@ -3,8 +3,8 @@ use crate::{
     config::Settings,
     hotkeys::{HotkeyEvent, HotkeyManager},
     network::{DiscoveryService, MessageType, PeerManager},
-    service::file_transfer::TransferDirection, // Add this import too
-    tray::SystemTray,
+    service::file_transfer::TransferDirection,
+    // tray::SystemTray,  // REMOVE THIS LINE
     utils::format_file_size,
     Result,
 };
@@ -16,7 +16,7 @@ pub struct FileshareDaemon {
     settings: Arc<Settings>,
     discovery: DiscoveryService,
     peer_manager: Arc<RwLock<PeerManager>>,
-    tray: SystemTray,
+    // tray: SystemTray,  // REMOVE THIS LINE
     hotkey_manager: HotkeyManager,
     clipboard: ClipboardManager,
     shutdown_tx: broadcast::Sender<()>,
@@ -39,8 +39,8 @@ impl FileshareDaemon {
         )
         .await?;
 
-        // Initialize system tray
-        let tray = SystemTray::new(settings.clone(), shutdown_tx.clone())?;
+        // REMOVE: Initialize system tray
+        // let tray = SystemTray::new(settings.clone(), shutdown_tx.clone())?;
 
         // Initialize hotkey manager
         let hotkey_manager = HotkeyManager::new()?;
@@ -52,7 +52,7 @@ impl FileshareDaemon {
             settings,
             discovery,
             peer_manager,
-            tray,
+            // tray,  // REMOVE THIS LINE
             hotkey_manager,
             clipboard,
             shutdown_tx,
@@ -123,30 +123,10 @@ impl FileshareDaemon {
 
         info!("Background services started successfully");
 
-        // Run the system tray on the main thread
-        let tray_result = {
-            let mut tray = self.tray;
-            let mut shutdown_rx = self.shutdown_rx;
-
-            tokio::select! {
-                result = tray.run() => {
-                    match result {
-                        Ok(()) => {
-                            info!("System tray stopped normally");
-                            Ok(())
-                        }
-                        Err(e) => {
-                            error!("System tray error: {}", e);
-                            Err(e)
-                        }
-                    }
-                }
-                _ = shutdown_rx.recv() => {
-                    info!("Shutdown signal received");
-                    Ok(())
-                }
-            }
-        };
+        // REMOVE: Run the system tray on the main thread
+        // Since Tauri handles the tray now, we just wait for shutdown
+        let mut shutdown_rx = self.shutdown_rx;
+        shutdown_rx.recv().await.ok();
 
         // Clean shutdown
         discovery_handle.abort();
@@ -154,9 +134,10 @@ impl FileshareDaemon {
         hotkey_handle.abort();
 
         info!("Fileshare Daemon stopped");
-        tray_result
+        Ok(())
     }
 
+    // ... rest of your methods stay the same
     async fn handle_hotkey_events(
         hotkey_manager: &mut HotkeyManager,
         peer_manager: Arc<RwLock<PeerManager>>,
@@ -351,8 +332,6 @@ impl FileshareDaemon {
                 }
             }
         });
-
-        // In daemon.rs, replace the message handling task in run_peer_manager:
 
         let message_pm = peer_manager.clone();
         let message_clipboard = clipboard.clone();
