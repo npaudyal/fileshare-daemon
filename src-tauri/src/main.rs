@@ -38,13 +38,11 @@ struct AppSettings {
 }
 
 struct AppState {
-    // Store settings separately since daemon will be moved
     settings: Arc<RwLock<Settings>>,
-    // Store daemon reference for accessing peer manager
     daemon_ref: Arc<Mutex<Option<Arc<RwLock<fileshare_daemon::network::PeerManager>>>>>,
 }
 
-// FIXED: Get real discovered devices through peer manager
+// Get real discovered devices from daemon
 #[tauri::command]
 async fn get_discovered_devices(
     state: tauri::State<'_, AppState>,
@@ -53,26 +51,18 @@ async fn get_discovered_devices(
 
     let settings = state.settings.read().await;
 
-    // Get peer manager reference
     if let Some(peer_manager_ref) = state.daemon_ref.lock().await.as_ref() {
         let pm = peer_manager_ref.read().await;
-
-        // Get discovered devices from peer manager
         let discovered = pm.get_all_discovered_devices().await;
 
         let mut devices = Vec::new();
 
         for device in discovered {
-            // Check if device is paired (in allowed list)
             let is_paired = settings.security.allowed_devices.contains(&device.id);
-
-            // Check if device is currently connected
             let is_connected = pm
                 .get_connected_peers()
                 .iter()
                 .any(|p| p.device_info.id == device.id);
-
-            // Determine device type based on name
             let device_type = determine_device_type(&device.name);
 
             devices.push(DeviceInfo {
@@ -102,13 +92,11 @@ async fn pair_device(device_id: String, state: tauri::State<'_, AppState>) -> Re
     let device_uuid =
         Uuid::parse_str(&device_id).map_err(|e| format!("Invalid device ID: {}", e))?;
 
-    // Add device to allowed list
     {
         let mut settings = state.settings.write().await;
         if !settings.security.allowed_devices.contains(&device_uuid) {
             settings.security.allowed_devices.push(device_uuid);
 
-            // Save settings
             if let Err(e) = settings.save(None) {
                 error!("Failed to save settings: {}", e);
                 return Err(format!("Failed to save settings: {}", e));
@@ -116,12 +104,10 @@ async fn pair_device(device_id: String, state: tauri::State<'_, AppState>) -> Re
         }
     }
 
-    // Try to connect to the device
     if let Some(peer_manager_ref) = state.daemon_ref.lock().await.as_ref() {
         let mut pm = peer_manager_ref.write().await;
         if let Err(e) = pm.connect_to_peer(device_uuid).await {
             warn!("Failed to connect to paired device {}: {}", device_id, e);
-            // Don't return error - pairing succeeded, connection might happen later
         }
     }
 
@@ -136,7 +122,6 @@ async fn unpair_device(device_id: String, state: tauri::State<'_, AppState>) -> 
     let device_uuid =
         Uuid::parse_str(&device_id).map_err(|e| format!("Invalid device ID: {}", e))?;
 
-    // Remove device from allowed list
     {
         let mut settings = state.settings.write().await;
         settings
@@ -144,7 +129,6 @@ async fn unpair_device(device_id: String, state: tauri::State<'_, AppState>) -> 
             .allowed_devices
             .retain(|&id| id != device_uuid);
 
-        // Save settings
         if let Err(e) = settings.save(None) {
             error!("Failed to save settings: {}", e);
             return Err(format!("Failed to save settings: {}", e));
@@ -165,7 +149,6 @@ async fn rename_device(
         "📝 UI requested to rename device {} to {}",
         device_id, new_name
     );
-    // TODO: Implement device renaming in backend
     Ok(())
 }
 
@@ -199,7 +182,6 @@ async fn get_connection_status(state: tauri::State<'_, AppState>) -> Result<bool
 #[tauri::command]
 async fn refresh_devices(_state: tauri::State<'_, AppState>) -> Result<(), String> {
     info!("🔄 UI requested device refresh");
-    // Discovery runs continuously, so just return success
     Ok(())
 }
 
@@ -218,7 +200,6 @@ async fn hide_window(app: tauri::AppHandle) -> Result<(), String> {
     Ok(())
 }
 
-// Helper function to determine device type
 fn determine_device_type(device_name: &str) -> String {
     let name_lower = device_name.to_lowercase();
 
@@ -253,6 +234,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tauri::Builder::default()
         .manage(app_state)
         .plugin(tauri_plugin_shell::init())
+        // No global shortcut plugin - using native implementation
         .invoke_handler(tauri::generate_handler![
             get_discovered_devices,
             pair_device,
@@ -329,7 +311,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     .build(app)?;
             }
 
-            // Start daemon in background
+            // Start daemon
             let app_handle = app.handle().clone();
             tokio::spawn(async move {
                 if let Err(e) = start_daemon(app_handle).await {
@@ -359,7 +341,6 @@ async fn start_daemon(app_handle: tauri::AppHandle) -> Result<(), Box<dyn std::e
         .await
         .map_err(|e| format!("Failed to create daemon: {}", e))?;
 
-    // Store reference to peer manager before starting daemon
     let peer_manager_ref = daemon.peer_manager.clone();
     {
         let mut daemon_ref = state.daemon_ref.lock().await;
@@ -368,7 +349,6 @@ async fn start_daemon(app_handle: tauri::AppHandle) -> Result<(), Box<dyn std::e
 
     info!("✅ Daemon created, starting services...");
 
-    // Start daemon (this will move the daemon)
     tokio::spawn(async move {
         if let Err(e) = daemon.run().await {
             error!("❌ Daemon run error: {}", e);

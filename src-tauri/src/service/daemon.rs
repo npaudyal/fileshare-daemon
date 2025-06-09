@@ -8,12 +8,12 @@ use crate::{
     Result,
 };
 use std::sync::Arc;
-use tokio::sync::{broadcast, RwLock};
+use tokio::sync::{broadcast, mpsc, RwLock}; // Added mpsc import
 use tracing::{error, info, warn};
 
 pub struct FileshareDaemon {
     settings: Arc<Settings>,
-    pub discovery: Option<DiscoveryService>, // Make optional since we'll move it
+    pub discovery: Option<DiscoveryService>,
     pub peer_manager: Arc<RwLock<PeerManager>>,
     hotkey_manager: HotkeyManager,
     clipboard: ClipboardManager,
@@ -45,7 +45,7 @@ impl FileshareDaemon {
 
         Ok(Self {
             settings,
-            discovery: Some(discovery), // Store as Option
+            discovery: Some(discovery),
             peer_manager,
             hotkey_manager,
             clipboard,
@@ -54,24 +54,28 @@ impl FileshareDaemon {
         })
     }
 
-    // Add method to get discovered devices
+    // Add method to get the hotkey event sender
+    pub fn get_hotkey_event_sender(&self) -> mpsc::UnboundedSender<HotkeyEvent> {
+        self.hotkey_manager.get_event_sender()
+    }
+
+    // Method to get discovered devices
     pub async fn get_discovered_devices(&self) -> Vec<crate::network::discovery::DeviceInfo> {
-        // Since we can't access discovery after it's moved, we'll get devices from peer manager
-        // The peer manager should have the discovered devices
         let pm = self.peer_manager.read().await;
         pm.get_all_discovered_devices().await
     }
 
     pub async fn run(mut self) -> Result<()> {
-        info!("Starting Fileshare Daemon...");
-        info!("Device ID: {}", self.settings.device.id);
-        info!("Device Name: {}", self.settings.device.name);
-        info!("Listening on port: {}", self.settings.network.port);
+        info!("🚀 Starting Fileshare Daemon...");
+        info!("📱 Device ID: {}", self.settings.device.id);
+        info!("🏷️ Device Name: {}", self.settings.device.name);
+        info!("🌐 Listening on port: {}", self.settings.network.port);
 
-        // Start hotkey manager
+        // Start hotkey manager FIRST (this is crucial for Windows)
         self.hotkey_manager.start().await?;
+        info!("✅ Hotkey manager started");
 
-        // Start discovery service (move it out of self)
+        // Start discovery service
         let discovery_handle = if let Some(mut discovery) = self.discovery.take() {
             tokio::spawn(async move {
                 info!("🔍 Starting discovery service...");
@@ -147,7 +151,6 @@ impl FileshareDaemon {
         Ok(())
     }
 
-    // Rest of your methods stay the same...
     async fn handle_hotkey_events(
         hotkey_manager: &mut HotkeyManager,
         peer_manager: Arc<RwLock<PeerManager>>,
@@ -170,7 +173,7 @@ impl FileshareDaemon {
                         }
                     }
                     HotkeyEvent::PasteFiles => {
-                        info!("📋 Paste hotkey triggered - pasting from network clipboard");
+                        info!("📁 Paste hotkey triggered - pasting from network clipboard");
                         if let Err(e) =
                             Self::handle_paste_operation(clipboard.clone(), peer_manager.clone())
                                 .await
@@ -254,7 +257,7 @@ impl FileshareDaemon {
         clipboard: ClipboardManager,
         peer_manager: Arc<RwLock<PeerManager>>,
     ) -> Result<()> {
-        info!("📋 Handling paste operation");
+        info!("📁 Handling paste operation");
 
         // Try to paste from network clipboard
         if let Some((target_path, source_device)) = clipboard.paste_to_current_location().await? {
