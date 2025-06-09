@@ -4,7 +4,6 @@ use crate::{
     hotkeys::{HotkeyEvent, HotkeyManager},
     network::{DiscoveryService, MessageType, PeerManager},
     service::file_transfer::TransferDirection,
-    // tray::SystemTray,  // REMOVE THIS LINE
     utils::format_file_size,
     Result,
 };
@@ -14,9 +13,8 @@ use tracing::{error, info, warn};
 
 pub struct FileshareDaemon {
     settings: Arc<Settings>,
-    discovery: DiscoveryService,
-    peer_manager: Arc<RwLock<PeerManager>>,
-    // tray: SystemTray,  // REMOVE THIS LINE
+    pub discovery: DiscoveryService,            // Make this public
+    pub peer_manager: Arc<RwLock<PeerManager>>, // Make this public
     hotkey_manager: HotkeyManager,
     clipboard: ClipboardManager,
     shutdown_tx: broadcast::Sender<()>,
@@ -39,9 +37,6 @@ impl FileshareDaemon {
         )
         .await?;
 
-        // REMOVE: Initialize system tray
-        // let tray = SystemTray::new(settings.clone(), shutdown_tx.clone())?;
-
         // Initialize hotkey manager
         let hotkey_manager = HotkeyManager::new()?;
 
@@ -52,7 +47,6 @@ impl FileshareDaemon {
             settings,
             discovery,
             peer_manager,
-            // tray,  // REMOVE THIS LINE
             hotkey_manager,
             clipboard,
             shutdown_tx,
@@ -60,6 +54,7 @@ impl FileshareDaemon {
         })
     }
 
+    // ... rest of the methods stay the same
     pub async fn run(mut self) -> Result<()> {
         info!("Starting Fileshare Daemon...");
         info!("Device ID: {}", self.settings.device.id);
@@ -123,8 +118,7 @@ impl FileshareDaemon {
 
         info!("Background services started successfully");
 
-        // REMOVE: Run the system tray on the main thread
-        // Since Tauri handles the tray now, we just wait for shutdown
+        // Wait for shutdown
         let mut shutdown_rx = self.shutdown_rx;
         shutdown_rx.recv().await.ok();
 
@@ -137,7 +131,7 @@ impl FileshareDaemon {
         Ok(())
     }
 
-    // ... rest of your methods stay the same
+    // ... rest of your existing methods stay exactly the same
     async fn handle_hotkey_events(
         hotkey_manager: &mut HotkeyManager,
         peer_manager: Arc<RwLock<PeerManager>>,
