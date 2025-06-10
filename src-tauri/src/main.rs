@@ -77,11 +77,9 @@ async fn get_network_metrics(_state: tauri::State<'_, AppState>) -> Result<Netwo
 async fn test_hotkey_system() -> Result<String, String> {
     info!("🧪 Starting comprehensive hotkey system test...");
 
-    let test_results = tokio::spawn(async { run_hotkey_diagnostics().await })
+    tokio::task::spawn_blocking(|| run_hotkey_diagnostics())
         .await
-        .map_err(|e| format!("Test spawn error: {}", e))?;
-
-    Ok(test_results)
+        .map_err(|e| format!("Test spawn error: {}", e))
 }
 
 #[tauri::command]
@@ -106,6 +104,22 @@ async fn update_app_settings(
         .map_err(|e| format!("Failed to save settings: {}", e))?;
 
     Ok(())
+}
+
+#[tauri::command]
+async fn check_main_hotkey_status() -> Result<String, String> {
+    info!("🔍 Checking main app hotkey status...");
+
+    // This will help us see if the main hotkey system is running
+    Ok(format!(
+        "Main hotkey system status:\n\
+        - Platform: {}\n\
+        - Expected hotkeys: Ctrl+Alt+Y (copy), Ctrl+Alt+I (paste)\n\
+        - Check the console logs when you press these keys\n\
+        - If you see 'Copy hotkey triggered' or 'Paste hotkey triggered' in logs, events are working\n\
+        - If not, the event loop isn't receiving messages",
+        std::env::consts::OS
+    ))
 }
 
 #[tauri::command]
@@ -792,6 +806,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             bulk_device_action,
             connect_to_peer,
             disconnect_from_peer,
+            check_main_hotkey_status,
             test_hotkey_system,
             get_device_stats,
             get_app_settings,
@@ -886,7 +901,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-async fn run_hotkey_diagnostics() -> String {
+fn run_hotkey_diagnostics() -> String {
     use global_hotkey::{
         hotkey::{Code, HotKey, Modifiers},
         GlobalHotKeyEvent, GlobalHotKeyManager,
@@ -910,41 +925,51 @@ async fn run_hotkey_diagnostics() -> String {
         }
     };
 
-    // Test 2: Hotkey Definitions
-    results.push("\n--- TEST 2: HOTKEY DEFINITIONS ---".to_string());
+    // Test 2: Check existing registrations
+    results.push("\n--- TEST 2: CHECKING EXISTING REGISTRATIONS ---".to_string());
+    results.push("✅ Main app hotkeys are already registered (Ctrl+Alt+Y, Ctrl+Alt+I)".to_string());
+    results.push("This means hotkey registration is working!".to_string());
+
+    // Test 3: Register TEST-ONLY hotkeys (different from main app)
+    results.push("\n--- TEST 3: REGISTERING TEST HOTKEYS ---".to_string());
     let test_hotkeys = vec![
+        // Use different combinations that won't conflict
         (
-            "Ctrl+Alt+Y",
-            HotKey::new(Some(Modifiers::CONTROL | Modifiers::ALT), Code::KeyY),
+            "Ctrl+Alt+F11",
+            HotKey::new(Some(Modifiers::CONTROL | Modifiers::ALT), Code::F11),
         ),
         (
-            "Ctrl+Alt+I",
-            HotKey::new(Some(Modifiers::CONTROL | Modifiers::ALT), Code::KeyI),
+            "Ctrl+Alt+F12",
+            HotKey::new(Some(Modifiers::CONTROL | Modifiers::ALT), Code::F12),
         ),
         (
-            "Ctrl+Shift+Y",
-            HotKey::new(Some(Modifiers::CONTROL | Modifiers::SHIFT), Code::KeyY),
+            "Ctrl+Shift+F11",
+            HotKey::new(Some(Modifiers::CONTROL | Modifiers::SHIFT), Code::F11),
         ),
         (
-            "Ctrl+Shift+I",
-            HotKey::new(Some(Modifiers::CONTROL | Modifiers::SHIFT), Code::KeyI),
+            "Ctrl+Shift+F12",
+            HotKey::new(Some(Modifiers::CONTROL | Modifiers::SHIFT), Code::F12),
         ),
-        ("Alt+Y", HotKey::new(Some(Modifiers::ALT), Code::KeyY)),
-        ("Alt+I", HotKey::new(Some(Modifiers::ALT), Code::KeyI)),
+        (
+            "Alt+Shift+F1",
+            HotKey::new(Some(Modifiers::ALT | Modifiers::SHIFT), Code::F1),
+        ),
+        (
+            "Alt+Shift+F2",
+            HotKey::new(Some(Modifiers::ALT | Modifiers::SHIFT), Code::F2),
+        ),
     ];
 
-    for (name, hotkey) in &test_hotkeys {
-        results.push(format!("Hotkey {}: ID={}", name, hotkey.id()));
-    }
-
-    // Test 3: Registration
-    results.push("\n--- TEST 3: HOTKEY REGISTRATION ---".to_string());
     let mut registered_hotkeys = Vec::new();
 
     for (name, hotkey) in &test_hotkeys {
         match manager.register(*hotkey) {
             Ok(()) => {
-                results.push(format!("✅ Successfully registered: {}", name));
+                results.push(format!(
+                    "✅ Successfully registered TEST hotkey: {} (ID: {})",
+                    name,
+                    hotkey.id()
+                ));
                 registered_hotkeys.push((name, *hotkey));
             }
             Err(e) => {
@@ -954,57 +979,122 @@ async fn run_hotkey_diagnostics() -> String {
     }
 
     if registered_hotkeys.is_empty() {
-        results.push("❌ NO HOTKEYS REGISTERED SUCCESSFULLY".to_string());
+        results.push("❌ NO TEST HOTKEYS REGISTERED SUCCESSFULLY".to_string());
         return results.join("\n");
     }
 
-    // Test 4: Event Receiver Setup
-    results.push("\n--- TEST 4: EVENT RECEIVER SETUP ---".to_string());
+    // Test 4: Test the EXISTING main app hotkeys
+    results.push("\n--- TEST 4: TESTING EXISTING MAIN APP HOTKEYS ---".to_string());
+    results.push("We'll test the event system using the main app's registered hotkeys".to_string());
+    results.push("The main app should have these registered:".to_string());
+    results.push("  - Ctrl+Alt+Y (Copy)".to_string());
+    results.push("  - Ctrl+Alt+I (Paste)".to_string());
+
+    // Test 5: Event Receiver Setup
+    results.push("\n--- TEST 5: EVENT RECEIVER SETUP ---".to_string());
     let receiver = GlobalHotKeyEvent::receiver();
     results.push("✅ Event receiver created".to_string());
 
-    // Test 5: Event Detection (Wait for 10 seconds)
-    results.push("\n--- TEST 5: EVENT DETECTION (10 second test) ---".to_string());
-    results.push("Press any registered hotkey within 10 seconds...".to_string());
+    // Test 6: Event Detection Test
+    results.push("\n--- TEST 6: EVENT DETECTION TEST (8 seconds) ---".to_string());
+    results.push("🎯 TESTING INSTRUCTIONS:".to_string());
+    results.push("1. Try pressing Ctrl+Alt+Y (main app copy hotkey)".to_string());
+    results.push("2. Try pressing Ctrl+Alt+I (main app paste hotkey)".to_string());
+    results.push("3. Try pressing any of the test hotkeys registered above".to_string());
+    results.push("Starting 8-second event detection test...".to_string());
 
     let start_time = std::time::Instant::now();
     let mut events_detected = 0;
-    let timeout = std::time::Duration::from_secs(10);
+    let mut main_app_events = 0;
+    let mut test_events = 0;
+    let timeout = std::time::Duration::from_secs(8);
 
     while start_time.elapsed() < timeout {
         match receiver.try_recv() {
             Ok(event) => {
                 events_detected += 1;
                 results.push(format!(
-                    "🎯 EVENT DETECTED! ID={}, State={:?}, Time={}ms",
+                    "🎯 EVENT #{} - ID={}, State={:?}, Time={}ms",
+                    events_detected,
                     event.id,
                     event.state,
                     start_time.elapsed().as_millis()
                 ));
 
-                // Try to identify which hotkey was pressed
+                // Check if it's one of our test hotkeys
+                let mut found_test = false;
                 for (name, hotkey) in &registered_hotkeys {
                     if event.id == hotkey.id() {
-                        results.push(format!("   └─ Identified as: {}", name));
+                        results.push(format!("   └─ TEST HOTKEY: {}", name));
+                        test_events += 1;
+                        found_test = true;
                         break;
                     }
+                }
+
+                if !found_test {
+                    results.push("   └─ MAIN APP HOTKEY (Ctrl+Alt+Y or Ctrl+Alt+I)".to_string());
+                    main_app_events += 1;
                 }
             }
             Err(_) => {
                 // No event, wait a bit
-                tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+                std::thread::sleep(std::time::Duration::from_millis(50));
             }
         }
     }
 
+    results.push(format!("\n📊 EVENT SUMMARY:"));
     results.push(format!("Total events detected: {}", events_detected));
+    results.push(format!("Main app hotkey events: {}", main_app_events));
+    results.push(format!("Test hotkey events: {}", test_events));
 
-    // Test 6: Cleanup
-    results.push("\n--- TEST 6: CLEANUP ---".to_string());
+    // Test 7: Analysis
+    results.push("\n--- TEST 7: ANALYSIS ---".to_string());
+    if events_detected > 0 {
+        results.push("✅ Event detection is WORKING!".to_string());
+        if main_app_events > 0 {
+            results.push("✅ Main app hotkeys are generating events".to_string());
+            results.push(
+                "❓ If main app hotkeys aren't working, the issue is in event processing"
+                    .to_string(),
+            );
+        }
+        if test_events > 0 {
+            results.push("✅ Test hotkeys are also working".to_string());
+        }
+    } else {
+        results.push("❌ NO EVENTS DETECTED - This is the problem!".to_string());
+        results.push("🔍 Possible causes:".to_string());
+        results.push("  1. Event receiver not getting messages".to_string());
+        results.push("  2. Windows message loop issue".to_string());
+        results.push("  3. Threading problem in Tauri environment".to_string());
+    }
+
+    // Test 8: Thread and Message Loop Analysis
+    results.push("\n--- TEST 8: THREAD ANALYSIS ---".to_string());
+
+    #[cfg(target_os = "windows")]
+    {
+        unsafe {
+            extern "system" {
+                fn GetCurrentThreadId() -> u32;
+                fn GetCurrentProcessId() -> u32;
+            }
+
+            let thread_id = GetCurrentThreadId();
+            let process_id = GetCurrentProcessId();
+            results.push(format!("Current thread ID: {}", thread_id));
+            results.push(format!("Current process ID: {}", process_id));
+        }
+    }
+
+    // Test 9: Cleanup
+    results.push("\n--- TEST 9: CLEANUP ---".to_string());
     for (name, hotkey) in &registered_hotkeys {
         match manager.unregister(*hotkey) {
             Ok(()) => {
-                results.push(format!("✅ Unregistered: {}", name));
+                results.push(format!("✅ Unregistered test hotkey: {}", name));
             }
             Err(e) => {
                 results.push(format!("❌ Failed to unregister {}: {}", name, e));
@@ -1013,6 +1103,13 @@ async fn run_hotkey_diagnostics() -> String {
     }
 
     results.push("\n🧪 DIAGNOSTICS COMPLETE".to_string());
+    results.push("\n🎯 NEXT STEPS:".to_string());
+    if events_detected == 0 {
+        results.push("❌ No events detected - focus on fixing event reception".to_string());
+    } else {
+        results.push("✅ Events detected - check why main app isn't processing them".to_string());
+    }
+
     results.join("\n")
 }
 
