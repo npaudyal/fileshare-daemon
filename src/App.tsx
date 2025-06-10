@@ -645,12 +645,12 @@ function App() {
                 whileHover={{ y: -2, boxShadow: "0 10px 25px -5px rgba(0, 0, 0, 0.1)" }}
                 whileTap={{ scale: 0.98 }}
                 className={`bg-white/10 backdrop-blur-sm rounded-lg p-4 border transition-all duration-200 hover:bg-white/15 relative group ${device.is_connected
-                        ? 'border-green-500/50 shadow-lg shadow-green-500/10'
-                        : device.is_paired
-                            ? 'border-blue-500/50'
-                            : device.is_blocked
-                                ? 'border-red-500/50'
-                                : 'border-white/20'
+                    ? 'border-green-500/50 shadow-lg shadow-green-500/10'
+                    : device.is_paired
+                        ? 'border-blue-500/50'
+                        : device.is_blocked
+                            ? 'border-red-500/50'
+                            : 'border-white/20'
                     } ${isSelected ? 'ring-2 ring-blue-400' : ''} ${isFavorite ? 'ring-1 ring-yellow-400/50' : ''}`}
             >
                 {/* Selection checkbox */}
@@ -1207,8 +1207,8 @@ function App() {
                             whileTap={{ scale: 0.98 }}
                             onClick={() => setActiveTab(id as typeof activeTab)}
                             className={`flex-1 px-4 py-3 text-sm font-medium transition-colors flex items-center justify-center space-x-2 ${activeTab === id
-                                    ? 'text-blue-400 border-b-2 border-blue-400 bg-blue-500/10'
-                                    : 'text-gray-400 hover:text-white'
+                                ? 'text-blue-400 border-b-2 border-blue-400 bg-blue-500/10'
+                                : 'text-gray-400 hover:text-white'
                                 }`}
                         >
                             <Icon className="w-4 h-4" />
@@ -1298,15 +1298,38 @@ function App() {
                     )}
 
                     {activeTab === 'settings' && settings && (
-                        <FadeIn key="settings">
-                            <AdvancedSettings
-                                settings={settings}
-                                onSettingsChange={(newSettings) => {
-                                    setSettings(newSettings);
-                                    loadDevices();
+                        <>
+                            <FadeIn key="settings">
+                                <AdvancedSettings
+                                    settings={settings}
+                                    onSettingsChange={(newSettings) => {
+                                        setSettings(newSettings);
+                                        loadDevices();
+                                    }}
+                                />
+                            </FadeIn>
+                            <motion.button
+                                whileHover={{ scale: 1.05 }}
+                                whileTap={{ scale: 0.95 }}
+                                onClick={async () => {
+                                    try {
+                                        setIsLoading(true);
+                                        const result = await invoke<string>('test_hotkey_system');
+                                        console.log('Hotkey Test Results:', result);
+                                        // Show results in a modal or console
+                                        alert(`Hotkey test completed. Check console for details:\n\n${result.substring(0, 500)}...`);
+                                    } catch (error) {
+                                        console.error('Hotkey test failed:', error);
+                                        alert(`Hotkey test failed: ${error}`);
+                                    } finally {
+                                        setIsLoading(false);
+                                    }
                                 }}
-                            />
-                        </FadeIn>
+                                className="w-full px-4 py-2 bg-purple-500/20 text-purple-300 rounded hover:bg-purple-500/30 transition-colors"
+                            >
+                                🧪 Test Hotkey System
+                            </motion.button>
+                        </>
                     )}
 
                     {activeTab === 'info' && (
@@ -1388,10 +1411,10 @@ function App() {
                                     whileTap={{ scale: 0.98 }}
                                     onClick={confirmDialog.onConfirm}
                                     className={`flex-1 px-4 py-2 rounded transition-colors ${confirmDialog.confirmVariant === 'danger'
-                                            ? 'bg-red-600 hover:bg-red-700 text-white'
-                                            : confirmDialog.confirmVariant === 'warning'
-                                                ? 'bg-yellow-600 hover:bg-yellow-700 text-white'
-                                                : 'bg-blue-600 hover:bg-blue-700 text-white'
+                                        ? 'bg-red-600 hover:bg-red-700 text-white'
+                                        : confirmDialog.confirmVariant === 'warning'
+                                            ? 'bg-yellow-600 hover:bg-yellow-700 text-white'
+                                            : 'bg-blue-600 hover:bg-blue-700 text-white'
                                         }`}
                                 >
                                     {confirmDialog.confirmText}

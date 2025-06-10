@@ -74,6 +74,17 @@ async fn get_network_metrics(_state: tauri::State<'_, AppState>) -> Result<Netwo
 }
 
 #[tauri::command]
+async fn test_hotkey_system() -> Result<String, String> {
+    info!("🧪 Starting comprehensive hotkey system test...");
+
+    let test_results = tokio::spawn(async { run_hotkey_diagnostics().await })
+        .await
+        .map_err(|e| format!("Test spawn error: {}", e))?;
+
+    Ok(test_results)
+}
+
+#[tauri::command]
 async fn update_app_settings(
     settings: AppSettings,
     state: tauri::State<'_, AppState>,
@@ -781,6 +792,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             bulk_device_action,
             connect_to_peer,
             disconnect_from_peer,
+            test_hotkey_system,
             get_device_stats,
             get_app_settings,
             get_connection_status,
@@ -872,6 +884,136 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .expect("error while running tauri application");
 
     Ok(())
+}
+
+async fn run_hotkey_diagnostics() -> String {
+    use global_hotkey::{
+        hotkey::{Code, HotKey, Modifiers},
+        GlobalHotKeyEvent, GlobalHotKeyManager,
+    };
+
+    let mut results = Vec::new();
+    results.push("🧪 HOTKEY DIAGNOSTICS STARTING".to_string());
+    results.push(format!("Platform: {}", std::env::consts::OS));
+    results.push(format!("Architecture: {}", std::env::consts::ARCH));
+
+    // Test 1: Manager Creation
+    results.push("\n--- TEST 1: HOTKEY MANAGER CREATION ---".to_string());
+    let manager = match GlobalHotKeyManager::new() {
+        Ok(manager) => {
+            results.push("✅ GlobalHotKeyManager created successfully".to_string());
+            manager
+        }
+        Err(e) => {
+            results.push(format!("❌ Failed to create GlobalHotKeyManager: {}", e));
+            return results.join("\n");
+        }
+    };
+
+    // Test 2: Hotkey Definitions
+    results.push("\n--- TEST 2: HOTKEY DEFINITIONS ---".to_string());
+    let test_hotkeys = vec![
+        (
+            "Ctrl+Alt+Y",
+            HotKey::new(Some(Modifiers::CONTROL | Modifiers::ALT), Code::KeyY),
+        ),
+        (
+            "Ctrl+Alt+I",
+            HotKey::new(Some(Modifiers::CONTROL | Modifiers::ALT), Code::KeyI),
+        ),
+        (
+            "Ctrl+Shift+Y",
+            HotKey::new(Some(Modifiers::CONTROL | Modifiers::SHIFT), Code::KeyY),
+        ),
+        (
+            "Ctrl+Shift+I",
+            HotKey::new(Some(Modifiers::CONTROL | Modifiers::SHIFT), Code::KeyI),
+        ),
+        ("Alt+Y", HotKey::new(Some(Modifiers::ALT), Code::KeyY)),
+        ("Alt+I", HotKey::new(Some(Modifiers::ALT), Code::KeyI)),
+    ];
+
+    for (name, hotkey) in &test_hotkeys {
+        results.push(format!("Hotkey {}: ID={}", name, hotkey.id()));
+    }
+
+    // Test 3: Registration
+    results.push("\n--- TEST 3: HOTKEY REGISTRATION ---".to_string());
+    let mut registered_hotkeys = Vec::new();
+
+    for (name, hotkey) in &test_hotkeys {
+        match manager.register(*hotkey) {
+            Ok(()) => {
+                results.push(format!("✅ Successfully registered: {}", name));
+                registered_hotkeys.push((name, *hotkey));
+            }
+            Err(e) => {
+                results.push(format!("❌ Failed to register {}: {}", name, e));
+            }
+        }
+    }
+
+    if registered_hotkeys.is_empty() {
+        results.push("❌ NO HOTKEYS REGISTERED SUCCESSFULLY".to_string());
+        return results.join("\n");
+    }
+
+    // Test 4: Event Receiver Setup
+    results.push("\n--- TEST 4: EVENT RECEIVER SETUP ---".to_string());
+    let receiver = GlobalHotKeyEvent::receiver();
+    results.push("✅ Event receiver created".to_string());
+
+    // Test 5: Event Detection (Wait for 10 seconds)
+    results.push("\n--- TEST 5: EVENT DETECTION (10 second test) ---".to_string());
+    results.push("Press any registered hotkey within 10 seconds...".to_string());
+
+    let start_time = std::time::Instant::now();
+    let mut events_detected = 0;
+    let timeout = std::time::Duration::from_secs(10);
+
+    while start_time.elapsed() < timeout {
+        match receiver.try_recv() {
+            Ok(event) => {
+                events_detected += 1;
+                results.push(format!(
+                    "🎯 EVENT DETECTED! ID={}, State={:?}, Time={}ms",
+                    event.id,
+                    event.state,
+                    start_time.elapsed().as_millis()
+                ));
+
+                // Try to identify which hotkey was pressed
+                for (name, hotkey) in &registered_hotkeys {
+                    if event.id == hotkey.id() {
+                        results.push(format!("   └─ Identified as: {}", name));
+                        break;
+                    }
+                }
+            }
+            Err(_) => {
+                // No event, wait a bit
+                tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+            }
+        }
+    }
+
+    results.push(format!("Total events detected: {}", events_detected));
+
+    // Test 6: Cleanup
+    results.push("\n--- TEST 6: CLEANUP ---".to_string());
+    for (name, hotkey) in &registered_hotkeys {
+        match manager.unregister(*hotkey) {
+            Ok(()) => {
+                results.push(format!("✅ Unregistered: {}", name));
+            }
+            Err(e) => {
+                results.push(format!("❌ Failed to unregister {}: {}", name, e));
+            }
+        }
+    }
+
+    results.push("\n🧪 DIAGNOSTICS COMPLETE".to_string());
+    results.join("\n")
 }
 
 // NEW: Separate function to handle hotkey and daemon setup
