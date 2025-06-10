@@ -16,8 +16,8 @@ pub enum HotkeyEvent {
 
 pub struct HotkeyManager {
     manager: Option<GlobalHotKeyManager>,
-    copy_hotkey: HotKey,
-    paste_hotkey: HotKey,
+    copy_hotkey: Option<HotKey>,
+    paste_hotkey: Option<HotKey>,
     event_tx: mpsc::UnboundedSender<HotkeyEvent>,
     event_rx: mpsc::UnboundedReceiver<HotkeyEvent>,
     is_running: Arc<AtomicBool>,
@@ -31,44 +31,12 @@ impl HotkeyManager {
             FileshareError::Unknown(format!("Failed to create hotkey manager: {}", e))
         })?;
 
-        // Platform-specific key combinations
-        let (copy_modifiers, paste_modifiers, copy_key_str, paste_key_str) =
-            if cfg!(target_os = "macos") {
-                (
-                    Modifiers::META | Modifiers::SHIFT,
-                    Modifiers::META | Modifiers::SHIFT,
-                    "Cmd+Shift+Y",
-                    "Cmd+Shift+I",
-                )
-            } else if cfg!(target_os = "windows") {
-                (
-                    Modifiers::CONTROL | Modifiers::ALT,
-                    Modifiers::CONTROL | Modifiers::ALT,
-                    "Ctrl+Alt+Y",
-                    "Ctrl+Alt+I",
-                )
-            } else {
-                (
-                    Modifiers::CONTROL | Modifiers::SHIFT,
-                    Modifiers::CONTROL | Modifiers::SHIFT,
-                    "Ctrl+Shift+Y",
-                    "Ctrl+Shift+I",
-                )
-            };
-
-        let copy_hotkey = HotKey::new(Some(copy_modifiers), Code::KeyY);
-        let paste_hotkey = HotKey::new(Some(paste_modifiers), Code::KeyI);
-
-        info!("🎹 Hotkey combinations for this platform:");
-        info!("  📋 Copy: {}", copy_key_str);
-        info!("  📁 Paste: {}", paste_key_str);
-
         let (event_tx, event_rx) = mpsc::unbounded_channel();
 
         Ok(Self {
             manager: Some(manager),
-            copy_hotkey,
-            paste_hotkey,
+            copy_hotkey: None,
+            paste_hotkey: None,
             event_tx,
             event_rx,
             is_running: Arc::new(AtomicBool::new(false)),
@@ -80,31 +48,16 @@ impl HotkeyManager {
         info!("🎹 Starting hotkey manager...");
 
         if let Some(manager) = &self.manager {
-            // Try to register hotkeys with fallbacks
-            let final_copy_hotkey = self.register_hotkey_with_fallback(
-                manager,
-                self.copy_hotkey,
-                "copy",
-                &[
-                    HotKey::new(Some(Modifiers::CONTROL | Modifiers::SHIFT), Code::F1),
-                    HotKey::new(Some(Modifiers::CONTROL | Modifiers::ALT), Code::KeyY),
-                    HotKey::new(Some(Modifiers::SHIFT | Modifiers::ALT), Code::KeyY),
-                ],
-            )?;
+            // Try to register hotkeys with extensive fallbacks
+            let (copy_hotkey, copy_combo) = self.register_copy_hotkey(manager)?;
+            let (paste_hotkey, paste_combo) = self.register_paste_hotkey(manager)?;
 
-            let final_paste_hotkey = self.register_hotkey_with_fallback(
-                manager,
-                self.paste_hotkey,
-                "paste",
-                &[
-                    HotKey::new(Some(Modifiers::CONTROL | Modifiers::SHIFT), Code::F2),
-                    HotKey::new(Some(Modifiers::CONTROL | Modifiers::ALT), Code::KeyI),
-                    HotKey::new(Some(Modifiers::SHIFT | Modifiers::ALT), Code::KeyI),
-                ],
-            )?;
+            self.copy_hotkey = Some(copy_hotkey);
+            self.paste_hotkey = Some(paste_hotkey);
 
-            self.copy_hotkey = final_copy_hotkey;
-            self.paste_hotkey = final_paste_hotkey;
+            info!("✅ Hotkeys registered successfully:");
+            info!("   📋 Copy: {}", copy_combo);
+            info!("   📁 Paste: {}", paste_combo);
 
             // Start platform-specific listener
             self.start_event_listener().await?;
@@ -117,59 +70,188 @@ impl HotkeyManager {
         Ok(())
     }
 
-    fn register_hotkey_with_fallback(
-        &self,
-        manager: &GlobalHotKeyManager,
-        primary: HotKey,
-        hotkey_name: &str,
-        fallbacks: &[HotKey],
-    ) -> Result<HotKey> {
-        // Try primary hotkey first
-        match manager.register(primary) {
-            Ok(()) => {
-                info!("✅ {} hotkey registered successfully", hotkey_name);
-                return Ok(primary);
-            }
-            Err(e) => {
-                warn!(
-                    "❌ Failed to register primary {} hotkey: {}",
-                    hotkey_name, e
-                );
-            }
-        }
+    fn register_copy_hotkey(&self, manager: &GlobalHotKeyManager) -> Result<(HotKey, String)> {
+        // Extensive list of fallback combinations for copy
+        let copy_combinations = vec![
+            // Windows-specific (less common combinations)
+            (
+                Modifiers::CONTROL | Modifiers::SHIFT | Modifiers::ALT,
+                Code::KeyY,
+                "Ctrl+Shift+Alt+Y",
+            ),
+            (
+                Modifiers::CONTROL | Modifiers::SHIFT,
+                Code::F9,
+                "Ctrl+Shift+F9",
+            ),
+            (Modifiers::CONTROL | Modifiers::ALT, Code::F9, "Ctrl+Alt+F9"),
+            (Modifiers::SHIFT | Modifiers::ALT, Code::F9, "Shift+Alt+F9"),
+            // Try original combinations
+            (
+                Modifiers::CONTROL | Modifiers::ALT,
+                Code::KeyY,
+                "Ctrl+Alt+Y",
+            ),
+            (
+                Modifiers::CONTROL | Modifiers::SHIFT,
+                Code::KeyY,
+                "Ctrl+Shift+Y",
+            ),
+            (Modifiers::SHIFT | Modifiers::ALT, Code::KeyY, "Shift+Alt+Y"),
+            // Function key fallbacks
+            (
+                Modifiers::CONTROL | Modifiers::SHIFT,
+                Code::F1,
+                "Ctrl+Shift+F1",
+            ),
+            (Modifiers::CONTROL | Modifiers::ALT, Code::F1, "Ctrl+Alt+F1"),
+            (Modifiers::SHIFT | Modifiers::ALT, Code::F1, "Shift+Alt+F1"),
+            // More unique combinations
+            (
+                Modifiers::CONTROL | Modifiers::SHIFT,
+                Code::F10,
+                "Ctrl+Shift+F10",
+            ),
+            (
+                Modifiers::CONTROL | Modifiers::SHIFT,
+                Code::F11,
+                "Ctrl+Shift+F11",
+            ),
+            (
+                Modifiers::CONTROL | Modifiers::SHIFT,
+                Code::F12,
+                "Ctrl+Shift+F12",
+            ),
+            // Last resort - very uncommon combinations
+            (
+                Modifiers::CONTROL | Modifiers::ALT,
+                Code::Semicolon,
+                "Ctrl+Alt+;",
+            ),
+            (
+                Modifiers::CONTROL | Modifiers::SHIFT,
+                Code::Quote,
+                "Ctrl+Shift+'",
+            ),
+            (
+                Modifiers::SHIFT | Modifiers::ALT,
+                Code::Comma,
+                "Shift+Alt+,",
+            ),
+        ];
 
-        // Try fallbacks
-        for (i, &fallback) in fallbacks.iter().enumerate() {
-            match manager.register(fallback) {
+        for (modifiers, code, description) in copy_combinations {
+            let hotkey = HotKey::new(Some(modifiers), code);
+            match manager.register(hotkey) {
                 Ok(()) => {
-                    info!(
-                        "✅ {} hotkey registered with fallback {}",
-                        hotkey_name,
-                        i + 1
-                    );
-                    return Ok(fallback);
+                    info!("✅ Copy hotkey registered: {}", description);
+                    return Ok((hotkey, description.to_string()));
                 }
                 Err(e) => {
-                    warn!(
-                        "❌ Failed to register {} fallback {}: {}",
-                        hotkey_name,
-                        i + 1,
-                        e
-                    );
+                    debug!("⚠️ Failed to register copy hotkey {}: {}", description, e);
                 }
             }
         }
 
-        Err(FileshareError::Unknown(format!(
-            "Failed to register {} hotkey with any combination",
-            hotkey_name
-        )))
+        Err(FileshareError::Unknown(
+            "Failed to register copy hotkey with any combination".to_string(),
+        ))
+    }
+
+    fn register_paste_hotkey(&self, manager: &GlobalHotKeyManager) -> Result<(HotKey, String)> {
+        // Extensive list of fallback combinations for paste
+        let paste_combinations = vec![
+            // Windows-specific (less common combinations)
+            (
+                Modifiers::CONTROL | Modifiers::SHIFT | Modifiers::ALT,
+                Code::KeyI,
+                "Ctrl+Shift+Alt+I",
+            ),
+            (
+                Modifiers::CONTROL | Modifiers::SHIFT,
+                Code::F8,
+                "Ctrl+Shift+F8",
+            ),
+            (Modifiers::CONTROL | Modifiers::ALT, Code::F8, "Ctrl+Alt+F8"),
+            (Modifiers::SHIFT | Modifiers::ALT, Code::F8, "Shift+Alt+F8"),
+            // Try original combinations
+            (
+                Modifiers::CONTROL | Modifiers::ALT,
+                Code::KeyI,
+                "Ctrl+Alt+I",
+            ),
+            (
+                Modifiers::CONTROL | Modifiers::SHIFT,
+                Code::KeyI,
+                "Ctrl+Shift+I",
+            ),
+            (Modifiers::SHIFT | Modifiers::ALT, Code::KeyI, "Shift+Alt+I"),
+            // Function key fallbacks
+            (
+                Modifiers::CONTROL | Modifiers::SHIFT,
+                Code::F2,
+                "Ctrl+Shift+F2",
+            ),
+            (Modifiers::CONTROL | Modifiers::ALT, Code::F2, "Ctrl+Alt+F2"),
+            (Modifiers::SHIFT | Modifiers::ALT, Code::F2, "Shift+Alt+F2"),
+            // More unique combinations
+            (
+                Modifiers::CONTROL | Modifiers::SHIFT,
+                Code::F7,
+                "Ctrl+Shift+F7",
+            ),
+            (
+                Modifiers::CONTROL | Modifiers::SHIFT,
+                Code::F6,
+                "Ctrl+Shift+F6",
+            ),
+            (
+                Modifiers::CONTROL | Modifiers::SHIFT,
+                Code::F5,
+                "Ctrl+Shift+F5",
+            ),
+            // Last resort
+            (
+                Modifiers::CONTROL | Modifiers::ALT,
+                Code::BracketLeft,
+                "Ctrl+Alt+[",
+            ),
+            (
+                Modifiers::CONTROL | Modifiers::SHIFT,
+                Code::BracketRight,
+                "Ctrl+Shift+]",
+            ),
+            (
+                Modifiers::SHIFT | Modifiers::ALT,
+                Code::Period,
+                "Shift+Alt+.",
+            ),
+        ];
+
+        for (modifiers, code, description) in paste_combinations {
+            let hotkey = HotKey::new(Some(modifiers), code);
+            match manager.register(hotkey) {
+                Ok(()) => {
+                    info!("✅ Paste hotkey registered: {}", description);
+                    return Ok((hotkey, description.to_string()));
+                }
+                Err(e) => {
+                    debug!("⚠️ Failed to register paste hotkey {}: {}", description, e);
+                }
+            }
+        }
+
+        Err(FileshareError::Unknown(
+            "Failed to register paste hotkey with any combination".to_string(),
+        ))
     }
 
     async fn start_event_listener(&mut self) -> Result<()> {
         let event_tx = self.event_tx.clone();
-        let copy_hotkey = self.copy_hotkey;
-        let paste_hotkey = self.paste_hotkey;
+        let copy_hotkey = self.copy_hotkey.expect("Copy hotkey should be registered");
+        let paste_hotkey = self
+            .paste_hotkey
+            .expect("Paste hotkey should be registered");
         let is_running = self.is_running.clone();
 
         is_running.store(true, Ordering::SeqCst);
@@ -216,7 +298,6 @@ impl HotkeyManager {
 
         // Initialize COM for this thread
         unsafe {
-            use std::ffi::c_void;
             use windows::Win32::System::Com::{CoInitializeEx, COINIT_APARTMENTTHREADED};
             let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
         }
@@ -363,16 +444,20 @@ impl HotkeyManager {
         self.is_running.store(false, Ordering::SeqCst);
 
         if let Some(manager) = &self.manager {
-            if let Err(e) = manager.unregister(self.copy_hotkey) {
-                warn!("❌ Failed to unregister copy hotkey: {}", e);
-            } else {
-                info!("✅ Copy hotkey unregistered");
+            if let Some(copy_hotkey) = self.copy_hotkey {
+                if let Err(e) = manager.unregister(copy_hotkey) {
+                    warn!("❌ Failed to unregister copy hotkey: {}", e);
+                } else {
+                    info!("✅ Copy hotkey unregistered");
+                }
             }
 
-            if let Err(e) = manager.unregister(self.paste_hotkey) {
-                warn!("❌ Failed to unregister paste hotkey: {}", e);
-            } else {
-                info!("✅ Paste hotkey unregistered");
+            if let Some(paste_hotkey) = self.paste_hotkey {
+                if let Err(e) = manager.unregister(paste_hotkey) {
+                    warn!("❌ Failed to unregister paste hotkey: {}", e);
+                } else {
+                    info!("✅ Paste hotkey unregistered");
+                }
             }
         }
 

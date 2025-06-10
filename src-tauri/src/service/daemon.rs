@@ -8,7 +8,7 @@ use crate::{
     Result,
 };
 use std::sync::Arc;
-use tokio::sync::{broadcast, mpsc, RwLock}; // Added mpsc import
+use tokio::sync::{broadcast, mpsc, RwLock};
 use tracing::{error, info, warn};
 
 pub struct FileshareDaemon {
@@ -25,6 +25,11 @@ impl FileshareDaemon {
     pub async fn new(settings: Settings) -> Result<Self> {
         let settings = Arc::new(settings);
         let (shutdown_tx, shutdown_rx) = broadcast::channel(1);
+
+        // Clean up any previous instances first
+        if let Err(e) = Self::cleanup_previous_instances().await {
+            warn!("Failed to cleanup previous instances: {}", e);
+        }
 
         // Initialize peer manager
         let peer_manager = Arc::new(RwLock::new(PeerManager::new(settings.clone()).await?));
@@ -54,6 +59,80 @@ impl FileshareDaemon {
         })
     }
 
+    // Cleanup function for previous instances and hotkeys
+    async fn cleanup_previous_instances() -> Result<()> {
+        info!("🧹 Cleaning up previous instances and hotkeys...");
+
+        #[cfg(target_os = "windows")]
+        {
+            use std::process::Command;
+
+            // Kill any existing instances of the application
+            let kill_result = Command::new("taskkill")
+                .args(&["/F", "/IM", "fileshare-daemon.exe", "/T"])
+                .output();
+
+            match kill_result {
+                Ok(output) => {
+                    if output.status.success() {
+                        info!("🧹 Terminated previous fileshare-daemon instances");
+                    } else {
+                        let stderr = String::from_utf8_lossy(&output.stderr);
+                        if !stderr.contains("not found") && !stderr.contains("not running") {
+                            warn!("Failed to kill previous instances: {}", stderr);
+                        }
+                    }
+                }
+                Err(e) => {
+                    warn!("Error running taskkill: {}", e);
+                }
+            }
+
+            // Additional cleanup for any lingering processes
+            let _ = Command::new("taskkill")
+                .args(&["/F", "/FI", "IMAGENAME eq fileshare*"])
+                .output();
+
+            // Wait for processes to fully terminate
+            tokio::time::sleep(tokio::time::Duration::from_millis(2000)).await;
+
+            // Try to unregister any lingering global hotkeys by creating and destroying a manager
+            if let Ok(temp_manager) = global_hotkey::GlobalHotKeyManager::new() {
+                info!("🧹 Created temporary hotkey manager for cleanup");
+                // The manager will automatically clean up on drop
+                drop(temp_manager);
+                tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+            }
+        }
+
+        #[cfg(target_os = "macos")]
+        {
+            use std::process::Command;
+
+            // Kill any existing instances on macOS
+            let _ = Command::new("pkill")
+                .args(&["-f", "fileshare-daemon"])
+                .output();
+
+            tokio::time::sleep(tokio::time::Duration::from_millis(1000)).await;
+        }
+
+        #[cfg(target_os = "linux")]
+        {
+            use std::process::Command;
+
+            // Kill any existing instances on Linux
+            let _ = Command::new("pkill")
+                .args(&["-f", "fileshare-daemon"])
+                .output();
+
+            tokio::time::sleep(tokio::time::Duration::from_millis(1000)).await;
+        }
+
+        info!("✅ Cleanup completed");
+        Ok(())
+    }
+
     // Add method to get the hotkey event sender
     pub fn get_hotkey_event_sender(&self) -> mpsc::UnboundedSender<HotkeyEvent> {
         self.hotkey_manager.get_event_sender()
@@ -71,11 +150,11 @@ impl FileshareDaemon {
         info!("🏷️ Device Name: {}", self.settings.device.name);
         info!("🌐 Listening on port: {}", self.settings.network.port);
 
-        // Add a small delay to ensure Tauri is fully initialized
+        // Add a delay to ensure Tauri is fully initialized
         tokio::time::sleep(tokio::time::Duration::from_millis(1000)).await;
         info!("⏱️ Tauri initialization delay completed");
 
-        // Start hotkey manager with better error handling
+        // Start hotkey manager with enhanced error handling
         match self.hotkey_manager.start().await {
             Ok(()) => {
                 info!("✅ Hotkey manager started successfully");
@@ -83,7 +162,33 @@ impl FileshareDaemon {
             Err(e) => {
                 error!("❌ Failed to start hotkey manager: {}", e);
                 warn!("⚠️ Continuing without hotkeys - basic functionality will still work");
-                // Don't return error - hotkeys are not critical for basic functionality
+
+                // Try one more time with a fresh manager after cleanup
+                info!("🔄 Attempting to restart hotkey manager after additional cleanup...");
+
+                if let Err(cleanup_err) = Self::cleanup_previous_instances().await {
+                    warn!("Additional cleanup failed: {}", cleanup_err);
+                }
+
+                // Wait a bit longer and try again
+                tokio::time::sleep(tokio::time::Duration::from_millis(2000)).await;
+
+                // Create a new hotkey manager
+                match HotkeyManager::new() {
+                    Ok(mut new_manager) => match new_manager.start().await {
+                        Ok(()) => {
+                            info!("✅ Hotkey manager restarted successfully on second attempt");
+                            self.hotkey_manager = new_manager;
+                        }
+                        Err(e2) => {
+                            error!("❌ Failed to restart hotkey manager: {}", e2);
+                            warn!("⚠️ Proceeding without hotkeys");
+                        }
+                    },
+                    Err(e3) => {
+                        error!("❌ Failed to create new hotkey manager: {}", e3);
+                    }
+                }
             }
         }
 
@@ -159,19 +264,23 @@ impl FileshareDaemon {
             info!("🎹 Try copying a file with your hotkeys:");
 
             #[cfg(target_os = "windows")]
-            info!("   📋 Copy: Ctrl+Alt+Y");
-            #[cfg(target_os = "windows")]
-            info!("   📁 Paste: Ctrl+Alt+I");
+            {
+                info!("   📋 Copy: Check logs above for the registered combination");
+                info!("   📁 Paste: Check logs above for the registered combination");
+                info!("   💡 If hotkeys don't work, try restarting the application");
+            }
 
             #[cfg(target_os = "macos")]
-            info!("   📋 Copy: Cmd+Shift+Y");
-            #[cfg(target_os = "macos")]
-            info!("   📁 Paste: Cmd+Shift+I");
+            {
+                info!("   📋 Copy: Cmd+Shift+Y");
+                info!("   📁 Paste: Cmd+Shift+I");
+            }
 
             #[cfg(target_os = "linux")]
-            info!("   📋 Copy: Ctrl+Shift+Y");
-            #[cfg(target_os = "linux")]
-            info!("   📁 Paste: Ctrl+Shift+I");
+            {
+                info!("   📋 Copy: Ctrl+Shift+Y");
+                info!("   📁 Paste: Ctrl+Shift+I");
+            }
         });
 
         // Wait for shutdown signal or critical service failure
