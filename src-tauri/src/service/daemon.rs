@@ -26,11 +26,6 @@ impl FileshareDaemon {
         let settings = Arc::new(settings);
         let (shutdown_tx, shutdown_rx) = broadcast::channel(1);
 
-        // Clean up any previous instances first
-        if let Err(e) = Self::cleanup_previous_instances().await {
-            warn!("Failed to cleanup previous instances: {}", e);
-        }
-
         // Initialize peer manager
         let peer_manager = Arc::new(RwLock::new(PeerManager::new(settings.clone()).await?));
 
@@ -42,7 +37,7 @@ impl FileshareDaemon {
         )
         .await?;
 
-        // Initialize hotkey manager
+        // Initialize hotkey manager (FIXED: using simple version)
         let hotkey_manager = HotkeyManager::new()?;
 
         // Initialize clipboard manager with device ID
@@ -59,143 +54,7 @@ impl FileshareDaemon {
         })
     }
 
-    // Cleanup function for previous instances and hotkeys
-    // Fixed cleanup function in daemon.rs
-    async fn cleanup_previous_instances() -> Result<()> {
-        info!("🧹 Cleaning up previous instances and hotkeys...");
-
-        #[cfg(target_os = "windows")]
-        {
-            use std::process::Command;
-
-            // Get current process ID to avoid killing ourselves
-            let current_pid = std::process::id();
-            info!("🔍 Current process PID: {}", current_pid);
-
-            // First, let's see what processes are running
-            let list_result = Command::new("tasklist")
-                .args(&["/FI", "IMAGENAME eq fileshare-daemon.exe", "/FO", "CSV"])
-                .output();
-
-            if let Ok(output) = list_result {
-                let output_str = String::from_utf8_lossy(&output.stdout);
-                info!("📋 Found processes:\n{}", output_str);
-
-                // Parse the output to get PIDs and kill only other instances
-                for line in output_str.lines().skip(1) {
-                    // Skip header
-                    if line.contains("fileshare-daemon.exe") {
-                        // Parse CSV format: "Image Name","PID","Session Name","Session#","Mem Usage"
-                        let parts: Vec<&str> = line.split(',').collect();
-                        if parts.len() >= 2 {
-                            if let Ok(pid) = parts[1].trim_matches('"').parse::<u32>() {
-                                if pid != current_pid {
-                                    info!("🎯 Killing previous instance with PID: {}", pid);
-                                    let kill_result = Command::new("taskkill")
-                                        .args(&["/F", "/PID", &pid.to_string()])
-                                        .output();
-
-                                    match kill_result {
-                                        Ok(kill_output) => {
-                                            if kill_output.status.success() {
-                                                info!("✅ Successfully killed PID {}", pid);
-                                            } else {
-                                                let stderr =
-                                                    String::from_utf8_lossy(&kill_output.stderr);
-                                                warn!("⚠️ Failed to kill PID {}: {}", pid, stderr);
-                                            }
-                                        }
-                                        Err(e) => {
-                                            warn!("❌ Error killing PID {}: {}", pid, e);
-                                        }
-                                    }
-                                } else {
-                                    info!("⏭️ Skipping current process PID: {}", pid);
-                                }
-                            }
-                        }
-                    }
-                }
-            } else {
-                info!("ℹ️ No previous instances found or tasklist failed");
-            }
-
-            // Wait for processes to fully terminate
-            tokio::time::sleep(tokio::time::Duration::from_millis(1000)).await;
-
-            // Try to unregister any lingering global hotkeys by creating and destroying a manager
-            // This is safe and won't affect the current process
-            if let Ok(temp_manager) = global_hotkey::GlobalHotKeyManager::new() {
-                info!("🧹 Created temporary hotkey manager for cleanup");
-                // The manager will automatically clean up on drop
-                drop(temp_manager);
-                tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
-            }
-        }
-
-        #[cfg(target_os = "macos")]
-        {
-            use std::process::Command;
-
-            // Get current process ID to avoid killing ourselves
-            let current_pid = std::process::id();
-
-            // List processes and kill only others
-            let list_result = Command::new("pgrep")
-                .args(&["-f", "fileshare-daemon"])
-                .output();
-
-            if let Ok(output) = list_result {
-                let output_str = String::from_utf8_lossy(&output.stdout);
-                for line in output_str.lines() {
-                    if let Ok(pid) = line.trim().parse::<u32>() {
-                        if pid != current_pid {
-                            info!("🎯 Killing previous instance with PID: {}", pid);
-                            let _ = Command::new("kill")
-                                .args(&["-9", &pid.to_string()])
-                                .output();
-                        }
-                    }
-                }
-            }
-
-            tokio::time::sleep(tokio::time::Duration::from_millis(1000)).await;
-        }
-
-        #[cfg(target_os = "linux")]
-        {
-            use std::process::Command;
-
-            // Get current process ID to avoid killing ourselves
-            let current_pid = std::process::id();
-
-            // List processes and kill only others
-            let list_result = Command::new("pgrep")
-                .args(&["-f", "fileshare-daemon"])
-                .output();
-
-            if let Ok(output) = list_result {
-                let output_str = String::from_utf8_lossy(&output.stdout);
-                for line in output_str.lines() {
-                    if let Ok(pid) = line.trim().parse::<u32>() {
-                        if pid != current_pid {
-                            info!("🎯 Killing previous instance with PID: {}", pid);
-                            let _ = Command::new("kill")
-                                .args(&["-9", &pid.to_string()])
-                                .output();
-                        }
-                    }
-                }
-            }
-
-            tokio::time::sleep(tokio::time::Duration::from_millis(1000)).await;
-        }
-
-        info!("✅ Cleanup completed - current process preserved");
-        Ok(())
-    }
-
-    // Add method to get the hotkey event sender
+    // Method to get the hotkey event sender
     pub fn get_hotkey_event_sender(&self) -> mpsc::UnboundedSender<HotkeyEvent> {
         self.hotkey_manager.get_event_sender()
     }
@@ -212,50 +71,10 @@ impl FileshareDaemon {
         info!("🏷️ Device Name: {}", self.settings.device.name);
         info!("🌐 Listening on port: {}", self.settings.network.port);
 
-        // Add a delay to ensure Tauri is fully initialized
-        tokio::time::sleep(tokio::time::Duration::from_millis(1000)).await;
-        info!("⏱️ Tauri initialization delay completed");
-
-        // Start hotkey manager with enhanced error handling
-        match self.hotkey_manager.start().await {
-            Ok(()) => {
-                info!("✅ Hotkey manager started successfully");
-            }
-            Err(e) => {
-                error!("❌ Failed to start hotkey manager: {}", e);
-                warn!("⚠️ Continuing without hotkeys - basic functionality will still work");
-
-                // Try one more time with a fresh manager after cleanup
-                info!("🔄 Attempting to restart hotkey manager after additional cleanup...");
-
-                if let Err(cleanup_err) = Self::cleanup_previous_instances().await {
-                    warn!("Additional cleanup failed: {}", cleanup_err);
-                }
-
-                // Wait a bit longer and try again
-                tokio::time::sleep(tokio::time::Duration::from_millis(2000)).await;
-
-                // Create a new hotkey manager
-                match HotkeyManager::new() {
-                    Ok(mut new_manager) => match new_manager.start().await {
-                        Ok(()) => {
-                            info!("✅ Hotkey manager restarted successfully on second attempt");
-                            self.hotkey_manager = new_manager;
-                        }
-                        Err(e2) => {
-                            error!("❌ Failed to restart hotkey manager: {}", e2);
-                            warn!("⚠️ Proceeding without hotkeys");
-                        }
-                    },
-                    Err(e3) => {
-                        error!("❌ Failed to create new hotkey manager: {}", e3);
-                    }
-                }
-            }
-        }
-
-        // Additional delay to ensure hotkeys are properly registered
-        tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+        // CRITICAL FIX: Start hotkey manager FIRST with proper threading context
+        info!("🎹 Initializing hotkey manager...");
+        self.hotkey_manager.start().await?;
+        info!("✅ Hotkey manager started successfully");
 
         // Start discovery service
         let mut discovery_handle = if let Some(mut discovery) = self.discovery.take() {
@@ -295,7 +114,7 @@ impl FileshareDaemon {
             }))
         };
 
-        // Start hotkey event handler
+        // FIXED: Start hotkey event handler with proper context
         let mut hotkey_handle = {
             let peer_manager = self.peer_manager.clone();
             let clipboard = self.clipboard.clone();
@@ -319,121 +138,80 @@ impl FileshareDaemon {
 
         info!("✅ All background services started successfully");
 
-        // Test hotkeys after a short delay
-        tokio::spawn(async move {
-            tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
-            info!("🎹 Hotkey system ready!");
-            info!("🎹 Try copying a file with your hotkeys:");
-
-            #[cfg(target_os = "windows")]
-            {
-                info!("   📋 Copy: Ctrl+Shift+Y");
-                info!("   📁 Paste: Ctrl+Shift+I");
-            }
-
-            #[cfg(target_os = "macos")]
-            {
-                info!("   📋 Copy: Cmd+Shift+Y");
-                info!("   📁 Paste: Cmd+Shift+I");
-            }
-
-            #[cfg(target_os = "linux")]
-            {
-                info!("   📋 Copy: Ctrl+Shift+Y");
-                info!("   📁 Paste: Ctrl+Shift+I");
-            }
-        });
-
-        // Wait for shutdown signal or critical service failure
+        // Wait for shutdown signal - this keeps the daemon running
         let mut shutdown_rx = self.shutdown_rx;
 
-        loop {
-            tokio::select! {
-                // Wait for explicit shutdown
-                _ = shutdown_rx.recv() => {
-                    info!("🛑 Shutdown signal received");
-                    break;
+        // FIXED: Better shutdown handling for Tauri with proper handle management
+        tokio::select! {
+            _ = shutdown_rx.recv() => {
+                info!("🛑 Shutdown signal received");
+            }
+            _ = tokio::signal::ctrl_c() => {
+                info!("🛑 Ctrl+C received, shutting down");
+            }
+            // Use references to avoid moving the handles
+            result = async {
+                if let Some(handle) = discovery_handle.as_mut() {
+                    handle.await
+                } else {
+                    // Create a future that never completes if no handle
+                    std::future::pending().await
                 }
-
-                // Monitor discovery service
-                result = async {
-                    if let Some(handle) = &mut discovery_handle {
-                        handle.await
-                    } else {
-                        // If no handle, wait forever
-                        std::future::pending().await
-                    }
-                } => {
-                    match result {
-                        Ok(_) => warn!("🔍 Discovery service completed unexpectedly"),
-                        Err(e) => error!("❌ Discovery service panicked: {}", e),
-                    }
-                    discovery_handle = None; // Mark as completed
+            } => {
+                match result {
+                    Ok(_) => info!("🔍 Discovery service stopped"),
+                    Err(e) => error!("❌ Discovery service crashed: {}", e),
                 }
-
-                // Monitor peer manager
-                result = async {
-                    if let Some(handle) = &mut peer_manager_handle {
-                        handle.await
-                    } else {
-                        // If no handle, wait forever
-                        std::future::pending().await
-                    }
-                } => {
-                    match result {
-                        Ok(_) => warn!("🌐 Peer manager completed unexpectedly"),
-                        Err(e) => error!("❌ Peer manager panicked: {}", e),
-                    }
-                    peer_manager_handle = None; // Mark as completed
+            }
+            result = async {
+                if let Some(handle) = peer_manager_handle.as_mut() {
+                    handle.await
+                } else {
+                    std::future::pending().await
                 }
-
-                // Monitor hotkey handler
-                result = async {
-                    if let Some(handle) = &mut hotkey_handle {
-                        handle.await
-                    } else {
-                        // If no handle, wait forever
-                        std::future::pending().await
-                    }
-                } => {
-                    match result {
-                        Ok(_) => warn!("🎹 Hotkey handler completed unexpectedly"),
-                        Err(e) => error!("❌ Hotkey handler panicked: {}", e),
-                    }
-                    hotkey_handle = None; // Mark as completed
+            } => {
+                match result {
+                    Ok(_) => info!("🌐 Peer manager stopped"),
+                    Err(e) => error!("❌ Peer manager crashed: {}", e),
+                }
+            }
+            result = async {
+                if let Some(handle) = hotkey_handle.as_mut() {
+                    handle.await
+                } else {
+                    std::future::pending().await
+                }
+            } => {
+                match result {
+                    Ok(_) => info!("🎹 Hotkey handler stopped"),
+                    Err(e) => error!("❌ Hotkey handler crashed: {}", e),
                 }
             }
         }
 
-        // Clean shutdown
+        // Clean shutdown - now we can safely abort since we used Option<JoinHandle>
         info!("🛑 Shutting down services...");
 
-        // Send shutdown signal to all services
-        if let Err(e) = self.shutdown_tx.send(()) {
-            warn!("Failed to send shutdown signal: {}", e);
-        }
-
-        // Give services time to shut down gracefully
-        tokio::time::sleep(tokio::time::Duration::from_millis(1000)).await;
-
-        // Force abort remaining tasks
-        if let Some(handle) = discovery_handle.take() {
-            handle.abort();
-        }
-        if let Some(handle) = peer_manager_handle.take() {
-            handle.abort();
-        }
-        if let Some(handle) = hotkey_handle.take() {
+        if let Some(handle) = discovery_handle {
             handle.abort();
         }
 
-        // Wait a bit more for cleanup
-        tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+        if let Some(handle) = peer_manager_handle {
+            handle.abort();
+        }
 
-        info!("✅ Fileshare Daemon stopped cleanly");
+        if let Some(handle) = hotkey_handle {
+            handle.abort();
+        }
+
+        // Give tasks a moment to clean up
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+
+        info!("✅ Fileshare Daemon stopped");
         Ok(())
     }
 
+    // FIXED: Simplified hotkey event handler (no complex Windows logic)
     async fn handle_hotkey_events(
         hotkey_manager: &mut HotkeyManager,
         peer_manager: Arc<RwLock<PeerManager>>,
@@ -624,6 +402,7 @@ impl FileshareDaemon {
             }
         });
 
+        // Message handling task with proper transfer routing
         let message_pm = peer_manager.clone();
         let message_clipboard = clipboard.clone();
         let message_handle = tokio::spawn(async move {
@@ -634,7 +413,7 @@ impl FileshareDaemon {
                 let mut pm = message_pm.write().await;
 
                 while let Ok((peer_id, message)) = pm.message_rx.try_recv() {
-                    // Route outgoing transfer messages directly
+                    // Route outgoing transfer messages directly to avoid loops
                     match &message.message_type {
                         MessageType::FileOffer { transfer_id, .. } => {
                             let is_our_outgoing = {

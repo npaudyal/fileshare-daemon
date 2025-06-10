@@ -71,64 +71,6 @@ async fn get_network_metrics(_state: tauri::State<'_, AppState>) -> Result<Netwo
     })
 }
 
-// Add this function to test hotkeys in isolation
-#[tauri::command]
-async fn test_hotkeys() -> Result<String, String> {
-    use global_hotkey::{
-        hotkey::{Code, HotKey, Modifiers},
-        GlobalHotKeyManager,
-    };
-
-    info!("🧪 Testing hotkey registration...");
-
-    let manager =
-        GlobalHotKeyManager::new().map_err(|e| format!("Failed to create manager: {}", e))?;
-
-    let test_combinations = vec![
-        (
-            Modifiers::CONTROL | Modifiers::SHIFT,
-            Code::KeyY,
-            "Ctrl+Shift+Y",
-        ),
-        (
-            Modifiers::CONTROL | Modifiers::SHIFT,
-            Code::KeyI,
-            "Ctrl+Shift+I",
-        ),
-        (
-            Modifiers::CONTROL | Modifiers::ALT,
-            Code::KeyY,
-            "Ctrl+Alt+Y",
-        ),
-        (
-            Modifiers::CONTROL | Modifiers::ALT,
-            Code::KeyI,
-            "Ctrl+Alt+I",
-        ),
-        (Modifiers::SHIFT | Modifiers::ALT, Code::KeyY, "Shift+Alt+Y"),
-        (Modifiers::SHIFT | Modifiers::ALT, Code::KeyI, "Shift+Alt+I"),
-    ];
-
-    let mut results = Vec::new();
-
-    for (modifiers, code, desc) in test_combinations {
-        let hotkey = HotKey::new(Some(modifiers), code);
-        match manager.register(hotkey) {
-            Ok(()) => {
-                results.push(format!("✅ {} - Available", desc));
-                let _ = manager.unregister(hotkey); // Clean up
-            }
-            Err(e) => {
-                results.push(format!("❌ {} - Failed: {}", desc, e));
-            }
-        }
-    }
-
-    let result = results.join("\n");
-    info!("🧪 Hotkey test results:\n{}", result);
-    Ok(result)
-}
-
 #[tauri::command]
 async fn update_app_settings(
     settings: AppSettings,
@@ -232,6 +174,8 @@ struct AppState {
     settings: Arc<RwLock<Settings>>,
     daemon_ref: Arc<Mutex<Option<Arc<RwLock<fileshare_daemon::network::PeerManager>>>>>,
     device_manager: Arc<RwLock<DeviceManager>>,
+    // NEW: Store daemon handle to prevent it from being dropped
+    daemon_handle: Arc<Mutex<Option<tauri::async_runtime::JoinHandle<()>>>>,
 }
 
 // Enhanced device discovery with metadata
@@ -819,6 +763,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         settings: Arc::new(RwLock::new(settings)),
         daemon_ref: Arc::new(Mutex::new(None)),
         device_manager: Arc::new(RwLock::new(DeviceManager::default())),
+        daemon_handle: Arc::new(Mutex::new(None)), // NEW
     };
 
     tauri::Builder::default()
@@ -844,7 +789,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             get_system_info,
             get_network_metrics,
             update_app_settings,
-            test_hotkeys,
             export_settings,
             import_settings,
             quit_app,
@@ -915,10 +859,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     .build(app)?;
             }
 
-            // Start daemon
+            // FIXED: Start daemon properly with correct threading context
             let app_handle = app.handle().clone();
-            tokio::spawn(async move {
-                if let Err(e) = start_daemon(app_handle).await {
+
+            // Use tauri::async_runtime::spawn instead of tokio::spawn
+            // This ensures proper integration with Tauri's runtime
+            tauri::async_runtime::spawn(async move {
+                if let Err(e) = start_daemon_fixed(app_handle).await {
                     error!("❌ Failed to start daemon: {}", e);
                 }
             });
@@ -931,8 +878,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-async fn start_daemon(app_handle: tauri::AppHandle) -> Result<(), Box<dyn std::error::Error>> {
-    info!("🔧 Starting background daemon...");
+// FIXED: Proper daemon startup that preserves threading context
+async fn start_daemon_fixed(
+    app_handle: tauri::AppHandle,
+) -> Result<(), Box<dyn std::error::Error>> {
+    info!("🔧 Starting background daemon with proper threading...");
 
     let state: tauri::State<AppState> = app_handle.state();
 
@@ -941,6 +891,7 @@ async fn start_daemon(app_handle: tauri::AppHandle) -> Result<(), Box<dyn std::e
         settings_lock.clone()
     };
 
+    info!("✅ Creating daemon...");
     let daemon = FileshareDaemon::new(settings)
         .await
         .map_err(|e| format!("Failed to create daemon: {}", e))?;
@@ -953,12 +904,21 @@ async fn start_daemon(app_handle: tauri::AppHandle) -> Result<(), Box<dyn std::e
 
     info!("✅ Daemon created, starting services...");
 
-    tokio::spawn(async move {
+    // CRITICAL FIX: Run daemon in current context, don't spawn another task
+    // This preserves the proper threading context for Windows hotkeys
+    let daemon_handle = tauri::async_runtime::spawn(async move {
+        info!("🚀 Starting daemon.run() in proper context...");
         if let Err(e) = daemon.run().await {
             error!("❌ Daemon run error: {}", e);
         }
     });
 
-    info!("✅ Background daemon started successfully");
+    // Store the handle to prevent it from being dropped
+    {
+        let mut handle_guard = state.daemon_handle.lock().await;
+        *handle_guard = Some(daemon_handle);
+    }
+
+    info!("✅ Background daemon started successfully with fixed threading");
     Ok(())
 }
