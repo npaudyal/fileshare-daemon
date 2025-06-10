@@ -47,7 +47,7 @@ impl DiscoveryService {
 
         // Start broadcaster
         let broadcast_settings = settings.clone();
-        let broadcaster_handle = tokio::spawn(async move {
+        tokio::spawn(async move {
             Self::run_broadcaster(broadcast_settings).await;
         });
 
@@ -55,7 +55,7 @@ impl DiscoveryService {
         let listen_settings = settings.clone();
         let listen_discovered_devices = discovered_devices.clone();
         let listen_peer_manager = peer_manager.clone();
-        let listener_handle = tokio::spawn(async move {
+        tokio::spawn(async move {
             Self::run_listener(
                 listen_settings,
                 listen_discovered_devices,
@@ -66,29 +66,12 @@ impl DiscoveryService {
 
         // Start cleanup task
         let cleanup_discovered_devices = discovered_devices.clone();
-        let cleanup_handle = tokio::spawn(async move {
+        tokio::spawn(async move {
             Self::run_cleanup(cleanup_discovered_devices).await;
         });
 
         info!("Discovery service started successfully");
-
-        // FIXED: Wait for all tasks to complete (they should run forever)
-        tokio::select! {
-            result = broadcaster_handle => {
-                error!("❌ Discovery broadcaster stopped unexpectedly: {:?}", result);
-            }
-            result = listener_handle => {
-                error!("❌ Discovery listener stopped unexpectedly: {:?}", result);
-            }
-            result = cleanup_handle => {
-                error!("❌ Discovery cleanup stopped unexpectedly: {:?}", result);
-            }
-        }
-
-        // If we reach here, one of the critical discovery tasks failed
-        Err(crate::FileshareError::Discovery(
-            "Discovery service task failed".to_string(),
-        ))
+        Ok(())
     }
 
     async fn run_broadcaster(settings: Arc<Settings>) {
