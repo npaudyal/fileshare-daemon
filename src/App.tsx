@@ -211,9 +211,9 @@ function App() {
         }
     }, []);
 
-    // Load devices with better error handling
-    const loadDevices = useCallback(async () => {
+    const loadDevices = async () => {
         try {
+            console.log("📱 Loading devices...");
             const discoveredDevices = await invoke<DeviceInfo[]>('get_discovered_devices');
             setDevices(discoveredDevices);
             setLastUpdate(new Date());
@@ -221,14 +221,13 @@ function App() {
         } catch (error) {
             console.error('❌ Failed to load devices:', error);
             addToast('error', 'Loading Failed', 'Failed to load devices');
-        } finally {
-            setIsLoading(false);
         }
-    }, [addToast]);
+    };
 
-    // Load settings
-    const loadSettings = useCallback(async () => {
+    // Load settings function
+    const loadSettings = async () => {
         try {
+            console.log("⚙️ Loading settings...");
             const appSettings = await invoke<AppSettings>('get_app_settings');
             setSettings(appSettings);
             console.log('⚙️ Settings loaded');
@@ -236,17 +235,17 @@ function App() {
             console.error('❌ Failed to load settings:', error);
             addToast('error', 'Settings Failed', 'Failed to load settings');
         }
-    }, [addToast]);
+    };
 
     // Check connection status
-    const checkConnectionStatus = useCallback(async () => {
+    const checkConnectionStatus = async () => {
         try {
             const status = await invoke<boolean>('get_connection_status');
             setConnectionStatus(status);
         } catch (error) {
             console.error('❌ Failed to check connection status:', error);
         }
-    }, []);
+    };
 
     // Manual refresh
     const handleRefresh = async () => {
@@ -267,24 +266,39 @@ function App() {
     // Initial load
     useEffect(() => {
         const loadInitialData = async () => {
+            console.log("🚀 Loading initial data...");
             setIsLoading(true);
-            await loadDevices();
-            await loadSettings();
-            await checkConnectionStatus();
+            try {
+                await Promise.all([
+                    loadDevices(),
+                    loadSettings(),
+                    checkConnectionStatus()
+                ]);
+            } catch (error) {
+                console.error("❌ Failed to load initial data:", error);
+            } finally {
+                setIsLoading(false);
+            }
         };
 
         loadInitialData();
-    }, [loadDevices, loadSettings, checkConnectionStatus]);
+    }, []); // Empty dependency array - runs only once
 
     // Auto-refresh every 3 seconds
     useEffect(() => {
         const interval = setInterval(async () => {
-            await loadDevices();
-            await checkConnectionStatus();
+            try {
+                await Promise.all([
+                    loadDevices(),
+                    checkConnectionStatus()
+                ]);
+            } catch (error) {
+                console.error("❌ Auto-refresh failed:", error);
+            }
         }, 3000);
 
         return () => clearInterval(interval);
-    }, [loadDevices, checkConnectionStatus]);
+    }, []); // Empty dependency array - sets up interval once
 
     // Enhanced device actions with toast notifications
     const handlePairDevice = async (deviceId: string, trustLevel: TrustLevel = 'Trusted') => {
@@ -1307,90 +1321,48 @@ function App() {
                                 }}
                             />
 
-                            {/* ADD THIS TEST SECTION */}
-                            <motion.button
-                                whileHover={{ scale: 1.02 }}
-                                whileTap={{ scale: 0.98 }}
-                                onClick={async () => {
-                                    try {
-                                        const result = await invoke<string>('test_isolated_hotkey');
-                                        console.log("🔬 Isolated Test Result:", result);
-                                        alert(result);
-                                    } catch (error) {
-                                        console.error('❌ Isolated test failed:', error);
-                                        alert(`Isolated test failed: ${error}`);
-                                    }
-                                }}
-                                className="w-full px-4 py-2 bg-red-600/20 text-red-300 rounded hover:bg-red-600/30 transition-colors flex items-center justify-center space-x-2"
-                            >
-                                <span>🔬</span>
-                                <span>Test Isolated Hotkey (F9)</span>
-                            </motion.button>
+                            {/* SIMPLIFIED TEST SECTION */}
                             <div className="mt-6 p-4 bg-purple-500/10 border border-purple-500/20 rounded-lg">
                                 <h3 className="text-purple-300 font-medium mb-3">🧪 Hotkey Diagnostics</h3>
                                 <div className="space-y-3">
-                                    <motion.button
-                                        whileHover={{ scale: 1.02 }}
-                                        whileTap={{ scale: 0.98 }}
+                                    <button
                                         onClick={async () => {
                                             try {
-                                                setIsLoading(true);
                                                 console.log("🧪 Starting hotkey test...");
-                                                const result = await invoke<string>('test_hotkey_system');
-                                                console.log("📋 Hotkey Test Results:", result);
-
-                                                // Show results in browser console and alert
-                                                alert(`Hotkey test completed! Check browser console for full details.\n\nSummary: ${result.split('\n').slice(-5).join('\n')}`);
+                                                const result = await invoke('test_hotkey_system');
+                                                console.log("📋 FULL HOTKEY TEST RESULTS:");
+                                                console.log(result);
+                                                alert("Test completed! Check browser console for full results.");
                                             } catch (error) {
                                                 console.error('❌ Hotkey test failed:', error);
                                                 alert(`Hotkey test failed: ${error}`);
-                                            } finally {
-                                                setIsLoading(false);
                                             }
                                         }}
-                                        className="w-full px-4 py-2 bg-purple-600/20 text-purple-300 rounded hover:bg-purple-600/30 transition-colors flex items-center justify-center space-x-2"
-                                        disabled={isLoading}
+                                        className="w-full px-4 py-2 bg-purple-600/20 text-purple-300 rounded hover:bg-purple-600/30 transition-colors"
                                     >
-                                        {isLoading ? (
-                                            <>
-                                                <div className="w-4 h-4 border-2 border-purple-300 border-t-transparent rounded-full animate-spin" />
-                                                <span>Testing...</span>
-                                            </>
-                                        ) : (
-                                            <>
-                                                <span>🧪</span>
-                                                <span>Run Full Hotkey Test</span>
-                                            </>
-                                        )}
-                                    </motion.button>
+                                        🧪 Run Hotkey Test
+                                    </button>
 
-                                    <motion.button
-                                        whileHover={{ scale: 1.02 }}
-                                        whileTap={{ scale: 0.98 }}
+                                    <button
                                         onClick={async () => {
                                             try {
-                                                const result = await invoke<string>('check_main_hotkey_status');
-                                                console.log("🔍 Main Hotkey Status:", result);
-                                                alert(result);
+                                                console.log("🔬 Starting isolated test...");
+                                                const result = await invoke('test_isolated_hotkey');
+                                                console.log("🔬 ISOLATED TEST RESULTS:");
+                                                console.log(result);
+                                                alert(`Isolated test result: ${result}`);
                                             } catch (error) {
-                                                console.error('❌ Status check failed:', error);
-                                                alert(`Status check failed: ${error}`);
+                                                console.error('❌ Isolated test failed:', error);
+                                                alert(`Isolated test failed: ${error}`);
                                             }
                                         }}
-                                        className="w-full px-4 py-2 bg-blue-600/20 text-blue-300 rounded hover:bg-blue-600/30 transition-colors flex items-center justify-center space-x-2"
+                                        className="w-full px-4 py-2 bg-red-600/20 text-red-300 rounded hover:bg-red-600/30 transition-colors"
                                     >
-                                        <span>🔍</span>
-                                        <span>Check Main Hotkey Status</span>
-                                    </motion.button>
+                                        🔬 Test Simple F9 Hotkey
+                                    </button>
 
-                                    <div className="text-xs text-gray-400 mt-2">
-                                        <p>💡 <strong>Testing Instructions:</strong></p>
-                                        <p>1. Click "Run Full Hotkey Test"</p>
-                                        <p>2. When prompted, try pressing these keys:</p>
-                                        <p>   • <kbd className="bg-black/30 px-1 rounded">Ctrl+Alt+Y</kbd> (main copy hotkey)</p>
-                                        <p>   • <kbd className="bg-black/30 px-1 rounded">Ctrl+Alt+I</kbd> (main paste hotkey)</p>
-                                        <p>   • <kbd className="bg-black/30 px-1 rounded">Ctrl+Alt+F11</kbd> (test hotkey)</p>
-                                        <p>3. Check browser console for detailed results</p>
+                                    <div className="text-xs text-gray-400">
+                                        <p>💡 Click the test buttons and check your browser console (F12) for detailed results</p>
                                     </div>
                                 </div>
                             </div>
