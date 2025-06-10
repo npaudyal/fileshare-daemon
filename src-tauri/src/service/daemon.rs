@@ -60,6 +60,7 @@ impl FileshareDaemon {
     }
 
     // Cleanup function for previous instances and hotkeys
+    // Fixed cleanup function in daemon.rs
     async fn cleanup_previous_instances() -> Result<()> {
         info!("🧹 Cleaning up previous instances and hotkeys...");
 
@@ -67,36 +68,63 @@ impl FileshareDaemon {
         {
             use std::process::Command;
 
-            // Kill any existing instances of the application
-            let kill_result = Command::new("taskkill")
-                .args(&["/F", "/IM", "fileshare-daemon.exe", "/T"])
+            // Get current process ID to avoid killing ourselves
+            let current_pid = std::process::id();
+            info!("🔍 Current process PID: {}", current_pid);
+
+            // First, let's see what processes are running
+            let list_result = Command::new("tasklist")
+                .args(&["/FI", "IMAGENAME eq fileshare-daemon.exe", "/FO", "CSV"])
                 .output();
 
-            match kill_result {
-                Ok(output) => {
-                    if output.status.success() {
-                        info!("🧹 Terminated previous fileshare-daemon instances");
-                    } else {
-                        let stderr = String::from_utf8_lossy(&output.stderr);
-                        if !stderr.contains("not found") && !stderr.contains("not running") {
-                            warn!("Failed to kill previous instances: {}", stderr);
+            if let Ok(output) = list_result {
+                let output_str = String::from_utf8_lossy(&output.stdout);
+                info!("📋 Found processes:\n{}", output_str);
+
+                // Parse the output to get PIDs and kill only other instances
+                for line in output_str.lines().skip(1) {
+                    // Skip header
+                    if line.contains("fileshare-daemon.exe") {
+                        // Parse CSV format: "Image Name","PID","Session Name","Session#","Mem Usage"
+                        let parts: Vec<&str> = line.split(',').collect();
+                        if parts.len() >= 2 {
+                            if let Ok(pid) = parts[1].trim_matches('"').parse::<u32>() {
+                                if pid != current_pid {
+                                    info!("🎯 Killing previous instance with PID: {}", pid);
+                                    let kill_result = Command::new("taskkill")
+                                        .args(&["/F", "/PID", &pid.to_string()])
+                                        .output();
+
+                                    match kill_result {
+                                        Ok(kill_output) => {
+                                            if kill_output.status.success() {
+                                                info!("✅ Successfully killed PID {}", pid);
+                                            } else {
+                                                let stderr =
+                                                    String::from_utf8_lossy(&kill_output.stderr);
+                                                warn!("⚠️ Failed to kill PID {}: {}", pid, stderr);
+                                            }
+                                        }
+                                        Err(e) => {
+                                            warn!("❌ Error killing PID {}: {}", pid, e);
+                                        }
+                                    }
+                                } else {
+                                    info!("⏭️ Skipping current process PID: {}", pid);
+                                }
+                            }
                         }
                     }
                 }
-                Err(e) => {
-                    warn!("Error running taskkill: {}", e);
-                }
+            } else {
+                info!("ℹ️ No previous instances found or tasklist failed");
             }
 
-            // Additional cleanup for any lingering processes
-            let _ = Command::new("taskkill")
-                .args(&["/F", "/FI", "IMAGENAME eq fileshare*"])
-                .output();
-
             // Wait for processes to fully terminate
-            tokio::time::sleep(tokio::time::Duration::from_millis(2000)).await;
+            tokio::time::sleep(tokio::time::Duration::from_millis(1000)).await;
 
             // Try to unregister any lingering global hotkeys by creating and destroying a manager
+            // This is safe and won't affect the current process
             if let Ok(temp_manager) = global_hotkey::GlobalHotKeyManager::new() {
                 info!("🧹 Created temporary hotkey manager for cleanup");
                 // The manager will automatically clean up on drop
@@ -109,10 +137,27 @@ impl FileshareDaemon {
         {
             use std::process::Command;
 
-            // Kill any existing instances on macOS
-            let _ = Command::new("pkill")
+            // Get current process ID to avoid killing ourselves
+            let current_pid = std::process::id();
+
+            // List processes and kill only others
+            let list_result = Command::new("pgrep")
                 .args(&["-f", "fileshare-daemon"])
                 .output();
+
+            if let Ok(output) = list_result {
+                let output_str = String::from_utf8_lossy(&output.stdout);
+                for line in output_str.lines() {
+                    if let Ok(pid) = line.trim().parse::<u32>() {
+                        if pid != current_pid {
+                            info!("🎯 Killing previous instance with PID: {}", pid);
+                            let _ = Command::new("kill")
+                                .args(&["-9", &pid.to_string()])
+                                .output();
+                        }
+                    }
+                }
+            }
 
             tokio::time::sleep(tokio::time::Duration::from_millis(1000)).await;
         }
@@ -121,15 +166,32 @@ impl FileshareDaemon {
         {
             use std::process::Command;
 
-            // Kill any existing instances on Linux
-            let _ = Command::new("pkill")
+            // Get current process ID to avoid killing ourselves
+            let current_pid = std::process::id();
+
+            // List processes and kill only others
+            let list_result = Command::new("pgrep")
                 .args(&["-f", "fileshare-daemon"])
                 .output();
+
+            if let Ok(output) = list_result {
+                let output_str = String::from_utf8_lossy(&output.stdout);
+                for line in output_str.lines() {
+                    if let Ok(pid) = line.trim().parse::<u32>() {
+                        if pid != current_pid {
+                            info!("🎯 Killing previous instance with PID: {}", pid);
+                            let _ = Command::new("kill")
+                                .args(&["-9", &pid.to_string()])
+                                .output();
+                        }
+                    }
+                }
+            }
 
             tokio::time::sleep(tokio::time::Duration::from_millis(1000)).await;
         }
 
-        info!("✅ Cleanup completed");
+        info!("✅ Cleanup completed - current process preserved");
         Ok(())
     }
 
