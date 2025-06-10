@@ -76,52 +76,73 @@ impl FileshareDaemon {
         self.hotkey_manager.start().await?;
         info!("✅ Hotkey manager started successfully");
 
+        // Create a JoinSet to manage all background tasks
+        let mut task_set = tokio::task::JoinSet::new();
+
         // Start discovery service
-        let mut discovery_handle = if let Some(mut discovery) = self.discovery.take() {
-            Some(tokio::spawn(async move {
+        if let Some(mut discovery) = self.discovery.take() {
+            task_set.spawn(async move {
                 info!("🔍 Starting discovery service...");
-                if let Err(e) = discovery.run().await {
-                    error!("❌ Discovery service error: {}", e);
-                } else {
-                    info!("✅ Discovery service started successfully");
+
+                // FIXED: Discovery service should run forever, if it stops it's an error
+                loop {
+                    match discovery.run().await {
+                        Ok(_) => {
+                            error!("❌ Discovery service stopped unexpectedly, restarting...");
+                            tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
+                        }
+                        Err(e) => {
+                            error!("❌ Discovery service error: {}, restarting in 5s...", e);
+                            tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
+                        }
+                    }
                 }
-            }))
+            });
         } else {
             error!("❌ Discovery service not available");
             return Err(crate::FileshareError::Unknown(
                 "Discovery service not available".to_string(),
             ));
-        };
+        }
 
         // Start peer manager
-        let mut peer_manager_handle = {
+        {
             let peer_manager = self.peer_manager.clone();
             let settings = self.settings.clone();
             let clipboard = self.clipboard.clone();
             let mut shutdown_rx = self.shutdown_tx.subscribe();
 
-            Some(tokio::spawn(async move {
-                tokio::select! {
-                    result = Self::run_peer_manager(peer_manager, settings, clipboard) => {
-                        if let Err(e) = result {
-                            error!("❌ Peer manager error: {}", e);
+            task_set.spawn(async move {
+                loop {
+                    tokio::select! {
+                        result = Self::run_peer_manager(peer_manager.clone(), settings.clone(), clipboard.clone()) => {
+                            match result {
+                                Ok(_) => {
+                                    error!("❌ Peer manager stopped unexpectedly, restarting...");
+                                }
+                                Err(e) => {
+                                    error!("❌ Peer manager error: {}, restarting in 5s...", e);
+                                }
+                            }
+                            tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
+                        }
+                        _ = shutdown_rx.recv() => {
+                            info!("🛑 Peer manager shutdown requested");
+                            break;
                         }
                     }
-                    _ = shutdown_rx.recv() => {
-                        info!("🛑 Peer manager shutdown requested");
-                    }
                 }
-            }))
-        };
+            });
+        }
 
-        // FIXED: Start hotkey event handler with proper context
-        let mut hotkey_handle = {
+        // Start hotkey event handler
+        {
             let peer_manager = self.peer_manager.clone();
             let clipboard = self.clipboard.clone();
             let mut hotkey_manager = self.hotkey_manager;
             let mut shutdown_rx = self.shutdown_tx.subscribe();
 
-            Some(tokio::spawn(async move {
+            task_set.spawn(async move {
                 tokio::select! {
                     _ = Self::handle_hotkey_events(&mut hotkey_manager, peer_manager, clipboard) => {
                         info!("🎹 Hotkey handler stopped");
@@ -133,15 +154,14 @@ impl FileshareDaemon {
                         }
                     }
                 }
-            }))
-        };
+            });
+        }
 
         info!("✅ All background services started successfully");
 
-        // Wait for shutdown signal - this keeps the daemon running
+        // FIXED: Only shut down on explicit signals, not on service completion
         let mut shutdown_rx = self.shutdown_rx;
 
-        // FIXED: Better shutdown handling for Tauri with proper handle management
         tokio::select! {
             _ = shutdown_rx.recv() => {
                 info!("🛑 Shutdown signal received");
@@ -149,63 +169,22 @@ impl FileshareDaemon {
             _ = tokio::signal::ctrl_c() => {
                 info!("🛑 Ctrl+C received, shutting down");
             }
-            // Use references to avoid moving the handles
-            result = async {
-                if let Some(handle) = discovery_handle.as_mut() {
-                    handle.await
-                } else {
-                    // Create a future that never completes if no handle
-                    std::future::pending().await
-                }
-            } => {
-                match result {
-                    Ok(_) => info!("🔍 Discovery service stopped"),
-                    Err(e) => error!("❌ Discovery service crashed: {}", e),
-                }
-            }
-            result = async {
-                if let Some(handle) = peer_manager_handle.as_mut() {
-                    handle.await
-                } else {
-                    std::future::pending().await
-                }
-            } => {
-                match result {
-                    Ok(_) => info!("🌐 Peer manager stopped"),
-                    Err(e) => error!("❌ Peer manager crashed: {}", e),
-                }
-            }
-            result = async {
-                if let Some(handle) = hotkey_handle.as_mut() {
-                    handle.await
-                } else {
-                    std::future::pending().await
-                }
-            } => {
-                match result {
-                    Ok(_) => info!("🎹 Hotkey handler stopped"),
-                    Err(e) => error!("❌ Hotkey handler crashed: {}", e),
-                }
-            }
+            // DON'T shut down if a service "completes" - services should run forever
+            // Only shut down on explicit shutdown signals
         }
 
-        // Clean shutdown - now we can safely abort since we used Option<JoinHandle>
+        // Clean shutdown - abort all remaining tasks
         info!("🛑 Shutting down services...");
+        task_set.abort_all();
 
-        if let Some(handle) = discovery_handle {
-            handle.abort();
+        // Wait for all tasks to finish aborting
+        while let Some(result) = task_set.join_next().await {
+            match result {
+                Ok(_) => info!("✅ Task shut down cleanly"),
+                Err(e) if e.is_cancelled() => info!("✅ Task cancelled during shutdown"),
+                Err(e) => warn!("⚠️ Task error during shutdown: {}", e),
+            }
         }
-
-        if let Some(handle) = peer_manager_handle {
-            handle.abort();
-        }
-
-        if let Some(handle) = hotkey_handle {
-            handle.abort();
-        }
-
-        // Give tasks a moment to clean up
-        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
         info!("✅ Fileshare Daemon stopped");
         Ok(())
