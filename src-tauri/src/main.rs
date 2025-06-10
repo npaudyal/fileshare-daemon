@@ -71,6 +71,64 @@ async fn get_network_metrics(_state: tauri::State<'_, AppState>) -> Result<Netwo
     })
 }
 
+// Add this function to test hotkeys in isolation
+#[tauri::command]
+async fn test_hotkeys() -> Result<String, String> {
+    use global_hotkey::{
+        hotkey::{Code, HotKey, Modifiers},
+        GlobalHotKeyManager,
+    };
+
+    info!("🧪 Testing hotkey registration...");
+
+    let manager =
+        GlobalHotKeyManager::new().map_err(|e| format!("Failed to create manager: {}", e))?;
+
+    let test_combinations = vec![
+        (
+            Modifiers::CONTROL | Modifiers::SHIFT,
+            Code::KeyY,
+            "Ctrl+Shift+Y",
+        ),
+        (
+            Modifiers::CONTROL | Modifiers::SHIFT,
+            Code::KeyI,
+            "Ctrl+Shift+I",
+        ),
+        (
+            Modifiers::CONTROL | Modifiers::ALT,
+            Code::KeyY,
+            "Ctrl+Alt+Y",
+        ),
+        (
+            Modifiers::CONTROL | Modifiers::ALT,
+            Code::KeyI,
+            "Ctrl+Alt+I",
+        ),
+        (Modifiers::SHIFT | Modifiers::ALT, Code::KeyY, "Shift+Alt+Y"),
+        (Modifiers::SHIFT | Modifiers::ALT, Code::KeyI, "Shift+Alt+I"),
+    ];
+
+    let mut results = Vec::new();
+
+    for (modifiers, code, desc) in test_combinations {
+        let hotkey = HotKey::new(Some(modifiers), code);
+        match manager.register(hotkey) {
+            Ok(()) => {
+                results.push(format!("✅ {} - Available", desc));
+                let _ = manager.unregister(hotkey); // Clean up
+            }
+            Err(e) => {
+                results.push(format!("❌ {} - Failed: {}", desc, e));
+            }
+        }
+    }
+
+    let result = results.join("\n");
+    info!("🧪 Hotkey test results:\n{}", result);
+    Ok(result)
+}
+
 #[tauri::command]
 async fn update_app_settings(
     settings: AppSettings,
@@ -786,6 +844,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             get_system_info,
             get_network_metrics,
             update_app_settings,
+            test_hotkeys,
             export_settings,
             import_settings,
             quit_app,

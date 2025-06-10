@@ -26,11 +26,14 @@ pub struct HotkeyManager {
 
 impl HotkeyManager {
     pub fn new() -> Result<Self> {
+        info!("🎹 Creating hotkey manager...");
+
         let manager = GlobalHotKeyManager::new().map_err(|e| {
             error!("❌ Failed to create hotkey manager: {}", e);
             FileshareError::Unknown(format!("Failed to create hotkey manager: {}", e))
         })?;
 
+        info!("✅ Hotkey manager created successfully");
         let (event_tx, event_rx) = mpsc::unbounded_channel();
 
         Ok(Self {
@@ -48,26 +51,38 @@ impl HotkeyManager {
         info!("🎹 Starting hotkey manager...");
 
         if let Some(manager) = &self.manager {
+            // Test basic hotkey registration first
+            info!("🧪 Testing basic hotkey registration capabilities...");
+
+            // Try a very uncommon combination first to test if registration works at all
+            let test_hotkey = HotKey::new(Some(Modifiers::CONTROL | Modifiers::SHIFT), Code::F12);
+            match manager.register(test_hotkey) {
+                Ok(()) => {
+                    info!("✅ Basic hotkey registration works");
+                    let _ = manager.unregister(test_hotkey);
+                }
+                Err(e) => {
+                    error!("❌ Basic hotkey registration failed: {}", e);
+                    return Err(FileshareError::Unknown(format!(
+                        "Hotkey registration not working: {}",
+                        e
+                    )));
+                }
+            }
+
             // Platform-specific key combinations
             let (copy_modifiers, paste_modifiers, copy_key_str, paste_key_str) =
                 if cfg!(target_os = "macos") {
                     (
-                        Modifiers::META | Modifiers::SHIFT, // Cmd+Shift on macOS
+                        Modifiers::META | Modifiers::SHIFT,
                         Modifiers::META | Modifiers::SHIFT,
                         "Cmd+Shift+Y",
                         "Cmd+Shift+I",
                     )
-                } else if cfg!(target_os = "windows") {
-                    (
-                        Modifiers::CONTROL | Modifiers::SHIFT, // Ctrl+Shift on Windows
-                        Modifiers::CONTROL | Modifiers::SHIFT,
-                        "Ctrl+Shift+Y",
-                        "Ctrl+Shift+I",
-                    )
                 } else {
-                    // Linux
+                    // Windows and Linux
                     (
-                        Modifiers::CONTROL | Modifiers::SHIFT, // Ctrl+Shift on Linux
+                        Modifiers::CONTROL | Modifiers::SHIFT,
                         Modifiers::CONTROL | Modifiers::SHIFT,
                         "Ctrl+Shift+Y",
                         "Ctrl+Shift+I",
@@ -77,24 +92,80 @@ impl HotkeyManager {
             let copy_hotkey = HotKey::new(Some(copy_modifiers), Code::KeyY);
             let paste_hotkey = HotKey::new(Some(paste_modifiers), Code::KeyI);
 
-            info!("🎹 Hotkey combinations for this platform:");
-            info!("  📋 Copy: {}", copy_key_str);
-            info!("  📁 Paste: {}", paste_key_str);
+            info!("🎹 Attempting to register hotkey combinations:");
+            info!(
+                "  📋 Copy: {} (Modifiers: {:?}, Code: {:?})",
+                copy_key_str,
+                copy_modifiers,
+                Code::KeyY
+            );
+            info!(
+                "  📁 Paste: {} (Modifiers: {:?}, Code: {:?})",
+                paste_key_str,
+                paste_modifiers,
+                Code::KeyI
+            );
 
-            // Try to register hotkeys with fallbacks
-            let (final_copy_hotkey, copy_combo) =
-                self.register_copy_hotkey(manager, copy_hotkey, copy_key_str)?;
-            let (final_paste_hotkey, paste_combo) =
-                self.register_paste_hotkey(manager, paste_hotkey, paste_key_str)?;
+            // Try to register copy hotkey
+            match manager.register(copy_hotkey) {
+                Ok(()) => {
+                    info!("✅ Copy hotkey registered successfully: {}", copy_key_str);
+                    self.copy_hotkey = Some(copy_hotkey);
+                }
+                Err(e) => {
+                    error!("❌ Failed to register copy hotkey {}: {}", copy_key_str, e);
 
-            self.copy_hotkey = Some(final_copy_hotkey);
-            self.paste_hotkey = Some(final_paste_hotkey);
+                    // Try fallback
+                    let fallback_copy =
+                        HotKey::new(Some(Modifiers::CONTROL | Modifiers::ALT), Code::KeyY);
+                    match manager.register(fallback_copy) {
+                        Ok(()) => {
+                            info!("✅ Copy hotkey registered with fallback: Ctrl+Alt+Y");
+                            self.copy_hotkey = Some(fallback_copy);
+                        }
+                        Err(e2) => {
+                            error!("❌ Failed to register copy fallback: {}", e2);
+                            return Err(FileshareError::Unknown(format!(
+                                "Cannot register copy hotkey: {}",
+                                e2
+                            )));
+                        }
+                    }
+                }
+            }
 
-            info!("✅ Hotkeys registered successfully:");
-            info!("   📋 Copy: {}", copy_combo);
-            info!("   📁 Paste: {}", paste_combo);
+            // Try to register paste hotkey
+            match manager.register(paste_hotkey) {
+                Ok(()) => {
+                    info!("✅ Paste hotkey registered successfully: {}", paste_key_str);
+                    self.paste_hotkey = Some(paste_hotkey);
+                }
+                Err(e) => {
+                    error!(
+                        "❌ Failed to register paste hotkey {}: {}",
+                        paste_key_str, e
+                    );
 
-            // Start platform-specific listener
+                    // Try fallback
+                    let fallback_paste =
+                        HotKey::new(Some(Modifiers::CONTROL | Modifiers::ALT), Code::KeyI);
+                    match manager.register(fallback_paste) {
+                        Ok(()) => {
+                            info!("✅ Paste hotkey registered with fallback: Ctrl+Alt+I");
+                            self.paste_hotkey = Some(fallback_paste);
+                        }
+                        Err(e2) => {
+                            error!("❌ Failed to register paste fallback: {}", e2);
+                            return Err(FileshareError::Unknown(format!(
+                                "Cannot register paste hotkey: {}",
+                                e2
+                            )));
+                        }
+                    }
+                }
+            }
+
+            // Start the event listener
             self.start_event_listener().await?;
         } else {
             return Err(FileshareError::Unknown(
@@ -103,149 +174,6 @@ impl HotkeyManager {
         }
 
         Ok(())
-    }
-
-    fn register_copy_hotkey(
-        &self,
-        manager: &GlobalHotKeyManager,
-        primary: HotKey,
-        primary_desc: &str,
-    ) -> Result<(HotKey, String)> {
-        // Try primary hotkey first
-        match manager.register(primary) {
-            Ok(()) => {
-                info!("✅ Copy hotkey registered: {}", primary_desc);
-                return Ok((primary, primary_desc.to_string()));
-            }
-            Err(e) => {
-                warn!(
-                    "❌ Failed to register primary copy hotkey {}: {}",
-                    primary_desc, e
-                );
-            }
-        }
-
-        // Fallback combinations for copy
-        let copy_fallbacks = if cfg!(target_os = "windows") {
-            vec![
-                (
-                    Modifiers::CONTROL | Modifiers::ALT,
-                    Code::KeyY,
-                    "Ctrl+Alt+Y",
-                ),
-                (Modifiers::SHIFT | Modifiers::ALT, Code::KeyY, "Shift+Alt+Y"),
-                (
-                    Modifiers::CONTROL | Modifiers::SHIFT,
-                    Code::F9,
-                    "Ctrl+Shift+F9",
-                ),
-                (Modifiers::CONTROL | Modifiers::ALT, Code::F9, "Ctrl+Alt+F9"),
-            ]
-        } else {
-            vec![
-                (
-                    Modifiers::CONTROL | Modifiers::ALT,
-                    Code::KeyY,
-                    "Ctrl+Alt+Y",
-                ),
-                (Modifiers::SHIFT | Modifiers::ALT, Code::KeyY, "Shift+Alt+Y"),
-                (
-                    Modifiers::CONTROL | Modifiers::SHIFT,
-                    Code::F9,
-                    "Ctrl+Shift+F9",
-                ),
-            ]
-        };
-
-        for (modifiers, code, description) in copy_fallbacks {
-            let hotkey = HotKey::new(Some(modifiers), code);
-            match manager.register(hotkey) {
-                Ok(()) => {
-                    info!("✅ Copy hotkey registered with fallback: {}", description);
-                    return Ok((hotkey, description.to_string()));
-                }
-                Err(e) => {
-                    debug!("⚠️ Failed to register copy fallback {}: {}", description, e);
-                }
-            }
-        }
-
-        Err(FileshareError::Unknown(
-            "Failed to register copy hotkey with any combination".to_string(),
-        ))
-    }
-
-    fn register_paste_hotkey(
-        &self,
-        manager: &GlobalHotKeyManager,
-        primary: HotKey,
-        primary_desc: &str,
-    ) -> Result<(HotKey, String)> {
-        // Try primary hotkey first
-        match manager.register(primary) {
-            Ok(()) => {
-                info!("✅ Paste hotkey registered: {}", primary_desc);
-                return Ok((primary, primary_desc.to_string()));
-            }
-            Err(e) => {
-                warn!(
-                    "❌ Failed to register primary paste hotkey {}: {}",
-                    primary_desc, e
-                );
-            }
-        }
-
-        // Fallback combinations for paste
-        let paste_fallbacks = if cfg!(target_os = "windows") {
-            vec![
-                (
-                    Modifiers::CONTROL | Modifiers::ALT,
-                    Code::KeyI,
-                    "Ctrl+Alt+I",
-                ),
-                (Modifiers::SHIFT | Modifiers::ALT, Code::KeyI, "Shift+Alt+I"),
-                (
-                    Modifiers::CONTROL | Modifiers::SHIFT,
-                    Code::F8,
-                    "Ctrl+Shift+F8",
-                ),
-                (Modifiers::CONTROL | Modifiers::ALT, Code::F8, "Ctrl+Alt+F8"),
-            ]
-        } else {
-            vec![
-                (
-                    Modifiers::CONTROL | Modifiers::ALT,
-                    Code::KeyI,
-                    "Ctrl+Alt+I",
-                ),
-                (Modifiers::SHIFT | Modifiers::ALT, Code::KeyI, "Shift+Alt+I"),
-                (
-                    Modifiers::CONTROL | Modifiers::SHIFT,
-                    Code::F8,
-                    "Ctrl+Shift+F8",
-                ),
-            ]
-        };
-
-        for (modifiers, code, description) in paste_fallbacks {
-            let hotkey = HotKey::new(Some(modifiers), code);
-            match manager.register(hotkey) {
-                Ok(()) => {
-                    info!("✅ Paste hotkey registered with fallback: {}", description);
-                    return Ok((hotkey, description.to_string()));
-                }
-                Err(e) => {
-                    debug!(
-                        "⚠️ Failed to register paste fallback {}: {}",
-                        description, e
-                    );
-                }
-            }
-        }
-
-        Err(FileshareError::Unknown(
-            "Failed to register paste hotkey with any combination".to_string(),
-        ))
     }
 
     async fn start_event_listener(&mut self) -> Result<()> {
@@ -258,174 +186,122 @@ impl HotkeyManager {
 
         is_running.store(true, Ordering::SeqCst);
 
-        // Platform-specific listener implementations
-        #[cfg(target_os = "windows")]
-        {
-            info!("🎹 Starting Windows hotkey listener with proper message pump...");
-            let hotkey_thread = std::thread::spawn(move || {
-                Self::windows_message_pump_listener(
-                    event_tx,
-                    copy_hotkey,
-                    paste_hotkey,
-                    is_running,
-                );
-            });
-            self._hotkey_thread = Some(hotkey_thread);
-        }
+        info!("🎹 Starting event listener...");
+        info!("🎹 Listening for copy hotkey ID: {}", copy_hotkey.id());
+        info!("🎹 Listening for paste hotkey ID: {}", paste_hotkey.id());
 
-        #[cfg(not(target_os = "windows"))]
-        {
-            info!("🎹 Starting cross-platform hotkey listener...");
-            let hotkey_thread = std::thread::spawn(move || {
-                Self::cross_platform_listener(event_tx, copy_hotkey, paste_hotkey, is_running);
-            });
-            self._hotkey_thread = Some(hotkey_thread);
-        }
+        let hotkey_thread = std::thread::spawn(move || {
+            info!("🎹 Hotkey listener thread started");
+
+            #[cfg(target_os = "windows")]
+            {
+                // Initialize COM for Windows
+                unsafe {
+                    use windows::Win32::System::Com::{CoInitializeEx, COINIT_APARTMENTTHREADED};
+                    let com_result = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
+                    info!("🪟 COM initialization result: {:?}", com_result);
+                }
+            }
+
+            let receiver = GlobalHotKeyEvent::receiver();
+            info!("🎹 Event receiver created");
+
+            let mut event_count = 0;
+            while is_running.load(Ordering::SeqCst) {
+                // Process Windows messages on Windows
+                #[cfg(target_os = "windows")]
+                {
+                    unsafe {
+                        use windows::Win32::UI::WindowsAndMessaging::{
+                            DispatchMessageW, PeekMessageW, TranslateMessage, MSG, PM_REMOVE,
+                            WM_QUIT,
+                        };
+
+                        let mut msg = MSG::default();
+                        while PeekMessageW(&mut msg, None, 0, 0, PM_REMOVE).as_bool() {
+                            if msg.message == WM_QUIT {
+                                info!("🪟 Received WM_QUIT message");
+                                is_running.store(false, Ordering::SeqCst);
+                                break;
+                            }
+                            TranslateMessage(&msg);
+                            DispatchMessageW(&msg);
+                        }
+                    }
+                }
+
+                // Check for hotkey events
+                match receiver.try_recv() {
+                    Ok(event) => {
+                        event_count += 1;
+                        info!(
+                            "🎹 Event #{} received - ID: {}, State: {:?}",
+                            event_count, event.id, event.state
+                        );
+
+                        if event.state == global_hotkey::HotKeyState::Pressed {
+                            let hotkey_event = if event.id == copy_hotkey.id() {
+                                info!("🎹 COPY HOTKEY DETECTED! (ID: {})", event.id);
+                                Some(HotkeyEvent::CopyFiles)
+                            } else if event.id == paste_hotkey.id() {
+                                info!("🎹 PASTE HOTKEY DETECTED! (ID: {})", event.id);
+                                Some(HotkeyEvent::PasteFiles)
+                            } else {
+                                warn!(
+                                    "🎹 Unknown hotkey ID: {} (expected copy: {} or paste: {})",
+                                    event.id,
+                                    copy_hotkey.id(),
+                                    paste_hotkey.id()
+                                );
+                                None
+                            };
+
+                            if let Some(hotkey_event) = hotkey_event {
+                                info!("🎹 Sending hotkey event: {:?}", hotkey_event);
+                                if let Err(e) = event_tx.send(hotkey_event) {
+                                    error!("❌ Failed to send hotkey event: {}", e);
+                                    break;
+                                } else {
+                                    info!("✅ Hotkey event sent successfully");
+                                }
+                            }
+                        } else {
+                            debug!("🎹 Ignoring hotkey release event");
+                        }
+                    }
+                    Err(crossbeam_channel::TryRecvError::Empty) => {
+                        // No events, continue
+                    }
+                    Err(crossbeam_channel::TryRecvError::Disconnected) => {
+                        warn!("🎹 Hotkey event receiver disconnected");
+                        break;
+                    }
+                }
+
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+
+            #[cfg(target_os = "windows")]
+            {
+                unsafe {
+                    use windows::Win32::System::Com::CoUninitialize;
+                    CoUninitialize();
+                }
+            }
+
+            info!(
+                "🎹 Hotkey listener thread stopped (processed {} events)",
+                event_count
+            );
+        });
+
+        self._hotkey_thread = Some(hotkey_thread);
 
         // Give the system time to initialize
         tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
-        info!("✅ Hotkey listener initialized");
+        info!("✅ Hotkey listener initialized and ready");
 
         Ok(())
-    }
-
-    #[cfg(target_os = "windows")]
-    fn windows_message_pump_listener(
-        event_tx: mpsc::UnboundedSender<HotkeyEvent>,
-        copy_hotkey: HotKey,
-        paste_hotkey: HotKey,
-        is_running: Arc<AtomicBool>,
-    ) {
-        info!("🎹 Windows message pump listener thread started");
-
-        // Initialize COM for this thread
-        unsafe {
-            use windows::Win32::System::Com::{CoInitializeEx, COINIT_APARTMENTTHREADED};
-            let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
-        }
-
-        let receiver = GlobalHotKeyEvent::receiver();
-
-        // Windows message pump implementation
-        loop {
-            if !is_running.load(Ordering::SeqCst) {
-                break;
-            }
-
-            // Process Windows messages
-            unsafe {
-                use windows::Win32::UI::WindowsAndMessaging::{
-                    DispatchMessageW, PeekMessageW, TranslateMessage, MSG, PM_REMOVE, WM_QUIT,
-                };
-
-                let mut msg = MSG::default();
-                while PeekMessageW(&mut msg, None, 0, 0, PM_REMOVE).as_bool() {
-                    if msg.message == WM_QUIT {
-                        is_running.store(false, Ordering::SeqCst);
-                        break;
-                    }
-                    TranslateMessage(&msg);
-                    DispatchMessageW(&msg);
-                }
-            }
-
-            // Check for hotkey events
-            match receiver.try_recv() {
-                Ok(event) => {
-                    if event.state == global_hotkey::HotKeyState::Pressed {
-                        info!(
-                            "🎹 Windows hotkey event: ID={}, State={:?}",
-                            event.id, event.state
-                        );
-
-                        let hotkey_event = if event.id == copy_hotkey.id() {
-                            info!("🎹 Copy hotkey detected! (ID: {})", event.id);
-                            Some(HotkeyEvent::CopyFiles)
-                        } else if event.id == paste_hotkey.id() {
-                            info!("🎹 Paste hotkey detected! (ID: {})", event.id);
-                            Some(HotkeyEvent::PasteFiles)
-                        } else {
-                            debug!("🎹 Unknown hotkey ID: {}", event.id);
-                            None
-                        };
-
-                        if let Some(hotkey_event) = hotkey_event {
-                            info!("🎹 Sending hotkey event: {:?}", hotkey_event);
-                            if let Err(e) = event_tx.send(hotkey_event) {
-                                error!("❌ Failed to send hotkey event: {}", e);
-                                break;
-                            }
-                        }
-                    }
-                }
-                Err(crossbeam_channel::TryRecvError::Empty) => {
-                    // No hotkey events, continue message pump
-                }
-                Err(crossbeam_channel::TryRecvError::Disconnected) => {
-                    warn!("🎹 Hotkey event receiver disconnected");
-                    break;
-                }
-            }
-
-            // Small sleep to prevent CPU spinning
-            std::thread::sleep(std::time::Duration::from_millis(10));
-        }
-
-        // Cleanup COM
-        unsafe {
-            use windows::Win32::System::Com::CoUninitialize;
-            CoUninitialize();
-        }
-
-        info!("🎹 Windows message pump listener stopped");
-    }
-
-    #[cfg(not(target_os = "windows"))]
-    fn cross_platform_listener(
-        event_tx: mpsc::UnboundedSender<HotkeyEvent>,
-        copy_hotkey: HotKey,
-        paste_hotkey: HotKey,
-        is_running: Arc<AtomicBool>,
-    ) {
-        info!("🎹 Cross-platform hotkey listener thread started");
-
-        let receiver = GlobalHotKeyEvent::receiver();
-
-        while is_running.load(Ordering::SeqCst) {
-            match receiver.try_recv() {
-                Ok(event) => {
-                    if event.state == global_hotkey::HotKeyState::Pressed {
-                        info!("🎹 Hotkey event: ID={}, State={:?}", event.id, event.state);
-
-                        let hotkey_event = if event.id == copy_hotkey.id() {
-                            info!("🎹 Copy hotkey detected!");
-                            Some(HotkeyEvent::CopyFiles)
-                        } else if event.id == paste_hotkey.id() {
-                            info!("🎹 Paste hotkey detected!");
-                            Some(HotkeyEvent::PasteFiles)
-                        } else {
-                            None
-                        };
-
-                        if let Some(hotkey_event) = hotkey_event {
-                            if let Err(e) = event_tx.send(hotkey_event) {
-                                error!("❌ Failed to send hotkey event: {}", e);
-                                break;
-                            }
-                        }
-                    }
-                }
-                Err(crossbeam_channel::TryRecvError::Empty) => {
-                    std::thread::sleep(std::time::Duration::from_millis(50));
-                }
-                Err(crossbeam_channel::TryRecvError::Disconnected) => {
-                    warn!("🎹 Hotkey event receiver disconnected");
-                    break;
-                }
-            }
-        }
-
-        info!("🎹 Cross-platform hotkey listener stopped");
     }
 
     pub async fn get_event(&mut self) -> Option<HotkeyEvent> {
