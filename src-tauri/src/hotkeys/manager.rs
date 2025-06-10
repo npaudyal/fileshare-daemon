@@ -48,12 +48,47 @@ impl HotkeyManager {
         info!("🎹 Starting hotkey manager...");
 
         if let Some(manager) = &self.manager {
-            // Try to register hotkeys with extensive fallbacks
-            let (copy_hotkey, copy_combo) = self.register_copy_hotkey(manager)?;
-            let (paste_hotkey, paste_combo) = self.register_paste_hotkey(manager)?;
+            // Platform-specific key combinations
+            let (copy_modifiers, paste_modifiers, copy_key_str, paste_key_str) =
+                if cfg!(target_os = "macos") {
+                    (
+                        Modifiers::META | Modifiers::SHIFT, // Cmd+Shift on macOS
+                        Modifiers::META | Modifiers::SHIFT,
+                        "Cmd+Shift+Y",
+                        "Cmd+Shift+I",
+                    )
+                } else if cfg!(target_os = "windows") {
+                    (
+                        Modifiers::CONTROL | Modifiers::SHIFT, // Ctrl+Shift on Windows
+                        Modifiers::CONTROL | Modifiers::SHIFT,
+                        "Ctrl+Shift+Y",
+                        "Ctrl+Shift+I",
+                    )
+                } else {
+                    // Linux
+                    (
+                        Modifiers::CONTROL | Modifiers::SHIFT, // Ctrl+Shift on Linux
+                        Modifiers::CONTROL | Modifiers::SHIFT,
+                        "Ctrl+Shift+Y",
+                        "Ctrl+Shift+I",
+                    )
+                };
 
-            self.copy_hotkey = Some(copy_hotkey);
-            self.paste_hotkey = Some(paste_hotkey);
+            let copy_hotkey = HotKey::new(Some(copy_modifiers), Code::KeyY);
+            let paste_hotkey = HotKey::new(Some(paste_modifiers), Code::KeyI);
+
+            info!("🎹 Hotkey combinations for this platform:");
+            info!("  📋 Copy: {}", copy_key_str);
+            info!("  📁 Paste: {}", paste_key_str);
+
+            // Try to register hotkeys with fallbacks
+            let (final_copy_hotkey, copy_combo) =
+                self.register_copy_hotkey(manager, copy_hotkey, copy_key_str)?;
+            let (final_paste_hotkey, paste_combo) =
+                self.register_paste_hotkey(manager, paste_hotkey, paste_key_str)?;
+
+            self.copy_hotkey = Some(final_copy_hotkey);
+            self.paste_hotkey = Some(final_paste_hotkey);
 
             info!("✅ Hotkeys registered successfully:");
             info!("   📋 Copy: {}", copy_combo);
@@ -70,85 +105,67 @@ impl HotkeyManager {
         Ok(())
     }
 
-    fn register_copy_hotkey(&self, manager: &GlobalHotKeyManager) -> Result<(HotKey, String)> {
-        // Extensive list of fallback combinations for copy
-        let copy_combinations = vec![
-            // Windows-specific (less common combinations)
-            (
-                Modifiers::CONTROL | Modifiers::SHIFT | Modifiers::ALT,
-                Code::KeyY,
-                "Ctrl+Shift+Alt+Y",
-            ),
-            (
-                Modifiers::CONTROL | Modifiers::SHIFT,
-                Code::F9,
-                "Ctrl+Shift+F9",
-            ),
-            (Modifiers::CONTROL | Modifiers::ALT, Code::F9, "Ctrl+Alt+F9"),
-            (Modifiers::SHIFT | Modifiers::ALT, Code::F9, "Shift+Alt+F9"),
-            // Try original combinations
-            (
-                Modifiers::CONTROL | Modifiers::ALT,
-                Code::KeyY,
-                "Ctrl+Alt+Y",
-            ),
-            (
-                Modifiers::CONTROL | Modifiers::SHIFT,
-                Code::KeyY,
-                "Ctrl+Shift+Y",
-            ),
-            (Modifiers::SHIFT | Modifiers::ALT, Code::KeyY, "Shift+Alt+Y"),
-            // Function key fallbacks
-            (
-                Modifiers::CONTROL | Modifiers::SHIFT,
-                Code::F1,
-                "Ctrl+Shift+F1",
-            ),
-            (Modifiers::CONTROL | Modifiers::ALT, Code::F1, "Ctrl+Alt+F1"),
-            (Modifiers::SHIFT | Modifiers::ALT, Code::F1, "Shift+Alt+F1"),
-            // More unique combinations
-            (
-                Modifiers::CONTROL | Modifiers::SHIFT,
-                Code::F10,
-                "Ctrl+Shift+F10",
-            ),
-            (
-                Modifiers::CONTROL | Modifiers::SHIFT,
-                Code::F11,
-                "Ctrl+Shift+F11",
-            ),
-            (
-                Modifiers::CONTROL | Modifiers::SHIFT,
-                Code::F12,
-                "Ctrl+Shift+F12",
-            ),
-            // Last resort - very uncommon combinations
-            (
-                Modifiers::CONTROL | Modifiers::ALT,
-                Code::Semicolon,
-                "Ctrl+Alt+;",
-            ),
-            (
-                Modifiers::CONTROL | Modifiers::SHIFT,
-                Code::Quote,
-                "Ctrl+Shift+'",
-            ),
-            (
-                Modifiers::SHIFT | Modifiers::ALT,
-                Code::Comma,
-                "Shift+Alt+,",
-            ),
-        ];
+    fn register_copy_hotkey(
+        &self,
+        manager: &GlobalHotKeyManager,
+        primary: HotKey,
+        primary_desc: &str,
+    ) -> Result<(HotKey, String)> {
+        // Try primary hotkey first
+        match manager.register(primary) {
+            Ok(()) => {
+                info!("✅ Copy hotkey registered: {}", primary_desc);
+                return Ok((primary, primary_desc.to_string()));
+            }
+            Err(e) => {
+                warn!(
+                    "❌ Failed to register primary copy hotkey {}: {}",
+                    primary_desc, e
+                );
+            }
+        }
 
-        for (modifiers, code, description) in copy_combinations {
+        // Fallback combinations for copy
+        let copy_fallbacks = if cfg!(target_os = "windows") {
+            vec![
+                (
+                    Modifiers::CONTROL | Modifiers::ALT,
+                    Code::KeyY,
+                    "Ctrl+Alt+Y",
+                ),
+                (Modifiers::SHIFT | Modifiers::ALT, Code::KeyY, "Shift+Alt+Y"),
+                (
+                    Modifiers::CONTROL | Modifiers::SHIFT,
+                    Code::F9,
+                    "Ctrl+Shift+F9",
+                ),
+                (Modifiers::CONTROL | Modifiers::ALT, Code::F9, "Ctrl+Alt+F9"),
+            ]
+        } else {
+            vec![
+                (
+                    Modifiers::CONTROL | Modifiers::ALT,
+                    Code::KeyY,
+                    "Ctrl+Alt+Y",
+                ),
+                (Modifiers::SHIFT | Modifiers::ALT, Code::KeyY, "Shift+Alt+Y"),
+                (
+                    Modifiers::CONTROL | Modifiers::SHIFT,
+                    Code::F9,
+                    "Ctrl+Shift+F9",
+                ),
+            ]
+        };
+
+        for (modifiers, code, description) in copy_fallbacks {
             let hotkey = HotKey::new(Some(modifiers), code);
             match manager.register(hotkey) {
                 Ok(()) => {
-                    info!("✅ Copy hotkey registered: {}", description);
+                    info!("✅ Copy hotkey registered with fallback: {}", description);
                     return Ok((hotkey, description.to_string()));
                 }
                 Err(e) => {
-                    debug!("⚠️ Failed to register copy hotkey {}: {}", description, e);
+                    debug!("⚠️ Failed to register copy fallback {}: {}", description, e);
                 }
             }
         }
@@ -158,85 +175,70 @@ impl HotkeyManager {
         ))
     }
 
-    fn register_paste_hotkey(&self, manager: &GlobalHotKeyManager) -> Result<(HotKey, String)> {
-        // Extensive list of fallback combinations for paste
-        let paste_combinations = vec![
-            // Windows-specific (less common combinations)
-            (
-                Modifiers::CONTROL | Modifiers::SHIFT | Modifiers::ALT,
-                Code::KeyI,
-                "Ctrl+Shift+Alt+I",
-            ),
-            (
-                Modifiers::CONTROL | Modifiers::SHIFT,
-                Code::F8,
-                "Ctrl+Shift+F8",
-            ),
-            (Modifiers::CONTROL | Modifiers::ALT, Code::F8, "Ctrl+Alt+F8"),
-            (Modifiers::SHIFT | Modifiers::ALT, Code::F8, "Shift+Alt+F8"),
-            // Try original combinations
-            (
-                Modifiers::CONTROL | Modifiers::ALT,
-                Code::KeyI,
-                "Ctrl+Alt+I",
-            ),
-            (
-                Modifiers::CONTROL | Modifiers::SHIFT,
-                Code::KeyI,
-                "Ctrl+Shift+I",
-            ),
-            (Modifiers::SHIFT | Modifiers::ALT, Code::KeyI, "Shift+Alt+I"),
-            // Function key fallbacks
-            (
-                Modifiers::CONTROL | Modifiers::SHIFT,
-                Code::F2,
-                "Ctrl+Shift+F2",
-            ),
-            (Modifiers::CONTROL | Modifiers::ALT, Code::F2, "Ctrl+Alt+F2"),
-            (Modifiers::SHIFT | Modifiers::ALT, Code::F2, "Shift+Alt+F2"),
-            // More unique combinations
-            (
-                Modifiers::CONTROL | Modifiers::SHIFT,
-                Code::F7,
-                "Ctrl+Shift+F7",
-            ),
-            (
-                Modifiers::CONTROL | Modifiers::SHIFT,
-                Code::F6,
-                "Ctrl+Shift+F6",
-            ),
-            (
-                Modifiers::CONTROL | Modifiers::SHIFT,
-                Code::F5,
-                "Ctrl+Shift+F5",
-            ),
-            // Last resort
-            (
-                Modifiers::CONTROL | Modifiers::ALT,
-                Code::BracketLeft,
-                "Ctrl+Alt+[",
-            ),
-            (
-                Modifiers::CONTROL | Modifiers::SHIFT,
-                Code::BracketRight,
-                "Ctrl+Shift+]",
-            ),
-            (
-                Modifiers::SHIFT | Modifiers::ALT,
-                Code::Period,
-                "Shift+Alt+.",
-            ),
-        ];
+    fn register_paste_hotkey(
+        &self,
+        manager: &GlobalHotKeyManager,
+        primary: HotKey,
+        primary_desc: &str,
+    ) -> Result<(HotKey, String)> {
+        // Try primary hotkey first
+        match manager.register(primary) {
+            Ok(()) => {
+                info!("✅ Paste hotkey registered: {}", primary_desc);
+                return Ok((primary, primary_desc.to_string()));
+            }
+            Err(e) => {
+                warn!(
+                    "❌ Failed to register primary paste hotkey {}: {}",
+                    primary_desc, e
+                );
+            }
+        }
 
-        for (modifiers, code, description) in paste_combinations {
+        // Fallback combinations for paste
+        let paste_fallbacks = if cfg!(target_os = "windows") {
+            vec![
+                (
+                    Modifiers::CONTROL | Modifiers::ALT,
+                    Code::KeyI,
+                    "Ctrl+Alt+I",
+                ),
+                (Modifiers::SHIFT | Modifiers::ALT, Code::KeyI, "Shift+Alt+I"),
+                (
+                    Modifiers::CONTROL | Modifiers::SHIFT,
+                    Code::F8,
+                    "Ctrl+Shift+F8",
+                ),
+                (Modifiers::CONTROL | Modifiers::ALT, Code::F8, "Ctrl+Alt+F8"),
+            ]
+        } else {
+            vec![
+                (
+                    Modifiers::CONTROL | Modifiers::ALT,
+                    Code::KeyI,
+                    "Ctrl+Alt+I",
+                ),
+                (Modifiers::SHIFT | Modifiers::ALT, Code::KeyI, "Shift+Alt+I"),
+                (
+                    Modifiers::CONTROL | Modifiers::SHIFT,
+                    Code::F8,
+                    "Ctrl+Shift+F8",
+                ),
+            ]
+        };
+
+        for (modifiers, code, description) in paste_fallbacks {
             let hotkey = HotKey::new(Some(modifiers), code);
             match manager.register(hotkey) {
                 Ok(()) => {
-                    info!("✅ Paste hotkey registered: {}", description);
+                    info!("✅ Paste hotkey registered with fallback: {}", description);
                     return Ok((hotkey, description.to_string()));
                 }
                 Err(e) => {
-                    debug!("⚠️ Failed to register paste hotkey {}: {}", description, e);
+                    debug!(
+                        "⚠️ Failed to register paste fallback {}: {}",
+                        description, e
+                    );
                 }
             }
         }

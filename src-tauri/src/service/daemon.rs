@@ -327,9 +327,8 @@ impl FileshareDaemon {
 
             #[cfg(target_os = "windows")]
             {
-                info!("   📋 Copy: Check logs above for the registered combination");
-                info!("   📁 Paste: Check logs above for the registered combination");
-                info!("   💡 If hotkeys don't work, try restarting the application");
+                info!("   📋 Copy: Ctrl+Shift+Y");
+                info!("   📁 Paste: Ctrl+Shift+I");
             }
 
             #[cfg(target_os = "macos")]
