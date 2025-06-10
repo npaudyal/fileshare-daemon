@@ -207,18 +207,40 @@ impl HotkeyManager {
             info!("🎹 Event receiver created");
 
             let mut event_count = 0;
+            let mut last_heartbeat = std::time::Instant::now();
+
             while is_running.load(Ordering::SeqCst) {
+                // Show heartbeat every 10 seconds
+                if last_heartbeat.elapsed().as_secs() >= 10 {
+                    info!(
+                        "🎹 Hotkey listener heartbeat - still running, {} events processed",
+                        event_count
+                    );
+                    last_heartbeat = std::time::Instant::now();
+                }
+
                 // Process Windows messages on Windows
                 #[cfg(target_os = "windows")]
                 {
                     unsafe {
                         use windows::Win32::UI::WindowsAndMessaging::{
                             DispatchMessageW, PeekMessageW, TranslateMessage, MSG, PM_REMOVE,
-                            WM_QUIT,
+                            WM_HOTKEY, WM_QUIT,
                         };
 
                         let mut msg = MSG::default();
+                        let mut msg_count = 0;
                         while PeekMessageW(&mut msg, None, 0, 0, PM_REMOVE).as_bool() {
+                            msg_count += 1;
+
+                            // Log all hotkey-related messages
+                            if msg.message == WM_HOTKEY {
+                                info!(
+                                    "🪟 Received WM_HOTKEY message: wParam={}, lParam={}",
+                                    msg.wParam.0, msg.lParam.0
+                                );
+                            }
+
                             if msg.message == WM_QUIT {
                                 info!("🪟 Received WM_QUIT message");
                                 is_running.store(false, Ordering::SeqCst);
@@ -226,6 +248,10 @@ impl HotkeyManager {
                             }
                             TranslateMessage(&msg);
                             DispatchMessageW(&msg);
+                        }
+
+                        if msg_count > 0 {
+                            debug!("🪟 Processed {} Windows messages", msg_count);
                         }
                     }
                 }
@@ -235,16 +261,16 @@ impl HotkeyManager {
                     Ok(event) => {
                         event_count += 1;
                         info!(
-                            "🎹 Event #{} received - ID: {}, State: {:?}",
+                            "🎹 *** HOTKEY EVENT #{} RECEIVED *** - ID: {}, State: {:?}",
                             event_count, event.id, event.state
                         );
 
                         if event.state == global_hotkey::HotKeyState::Pressed {
                             let hotkey_event = if event.id == copy_hotkey.id() {
-                                info!("🎹 COPY HOTKEY DETECTED! (ID: {})", event.id);
+                                info!("🎹 *** COPY HOTKEY DETECTED! *** (ID: {})", event.id);
                                 Some(HotkeyEvent::CopyFiles)
                             } else if event.id == paste_hotkey.id() {
-                                info!("🎹 PASTE HOTKEY DETECTED! (ID: {})", event.id);
+                                info!("🎹 *** PASTE HOTKEY DETECTED! *** (ID: {})", event.id);
                                 Some(HotkeyEvent::PasteFiles)
                             } else {
                                 warn!(
@@ -266,7 +292,7 @@ impl HotkeyManager {
                                 }
                             }
                         } else {
-                            debug!("🎹 Ignoring hotkey release event");
+                            info!("🎹 Hotkey release event ignored (ID: {})", event.id);
                         }
                     }
                     Err(crossbeam_channel::TryRecvError::Empty) => {
