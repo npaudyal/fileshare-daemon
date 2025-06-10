@@ -71,20 +71,35 @@ impl FileshareDaemon {
         info!("🏷️ Device Name: {}", self.settings.device.name);
         info!("🌐 Listening on port: {}", self.settings.network.port);
 
-        // Start hotkey manager FIRST (this is crucial for Windows)
-        self.hotkey_manager.start().await?;
-        info!("✅ Hotkey manager started");
+        // Add a small delay to ensure Tauri is fully initialized
+        tokio::time::sleep(tokio::time::Duration::from_millis(1000)).await;
+        info!("⏱️ Tauri initialization delay completed");
+
+        // Start hotkey manager with better error handling
+        match self.hotkey_manager.start().await {
+            Ok(()) => {
+                info!("✅ Hotkey manager started successfully");
+            }
+            Err(e) => {
+                error!("❌ Failed to start hotkey manager: {}", e);
+                warn!("⚠️ Continuing without hotkeys - basic functionality will still work");
+                // Don't return error - hotkeys are not critical for basic functionality
+            }
+        }
+
+        // Additional delay to ensure hotkeys are properly registered
+        tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
 
         // Start discovery service
-        let discovery_handle = if let Some(mut discovery) = self.discovery.take() {
-            tokio::spawn(async move {
+        let mut discovery_handle = if let Some(mut discovery) = self.discovery.take() {
+            Some(tokio::spawn(async move {
                 info!("🔍 Starting discovery service...");
                 if let Err(e) = discovery.run().await {
                     error!("❌ Discovery service error: {}", e);
                 } else {
                     info!("✅ Discovery service started successfully");
                 }
-            })
+            }))
         } else {
             error!("❌ Discovery service not available");
             return Err(crate::FileshareError::Unknown(
@@ -93,13 +108,13 @@ impl FileshareDaemon {
         };
 
         // Start peer manager
-        let peer_manager_handle = {
+        let mut peer_manager_handle = {
             let peer_manager = self.peer_manager.clone();
             let settings = self.settings.clone();
             let clipboard = self.clipboard.clone();
             let mut shutdown_rx = self.shutdown_tx.subscribe();
 
-            tokio::spawn(async move {
+            Some(tokio::spawn(async move {
                 tokio::select! {
                     result = Self::run_peer_manager(peer_manager, settings, clipboard) => {
                         if let Err(e) = result {
@@ -110,17 +125,17 @@ impl FileshareDaemon {
                         info!("🛑 Peer manager shutdown requested");
                     }
                 }
-            })
+            }))
         };
 
         // Start hotkey event handler
-        let hotkey_handle = {
+        let mut hotkey_handle = {
             let peer_manager = self.peer_manager.clone();
             let clipboard = self.clipboard.clone();
             let mut hotkey_manager = self.hotkey_manager;
             let mut shutdown_rx = self.shutdown_tx.subscribe();
 
-            tokio::spawn(async move {
+            Some(tokio::spawn(async move {
                 tokio::select! {
                     _ = Self::handle_hotkey_events(&mut hotkey_manager, peer_manager, clipboard) => {
                         info!("🎹 Hotkey handler stopped");
@@ -132,22 +147,120 @@ impl FileshareDaemon {
                         }
                     }
                 }
-            })
+            }))
         };
 
         info!("✅ All background services started successfully");
 
-        // Wait for shutdown signal
+        // Test hotkeys after a short delay
+        tokio::spawn(async move {
+            tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+            info!("🎹 Hotkey system ready!");
+            info!("🎹 Try copying a file with your hotkeys:");
+
+            #[cfg(target_os = "windows")]
+            info!("   📋 Copy: Ctrl+Alt+Y");
+            #[cfg(target_os = "windows")]
+            info!("   📁 Paste: Ctrl+Alt+I");
+
+            #[cfg(target_os = "macos")]
+            info!("   📋 Copy: Cmd+Shift+Y");
+            #[cfg(target_os = "macos")]
+            info!("   📁 Paste: Cmd+Shift+I");
+
+            #[cfg(target_os = "linux")]
+            info!("   📋 Copy: Ctrl+Shift+Y");
+            #[cfg(target_os = "linux")]
+            info!("   📁 Paste: Ctrl+Shift+I");
+        });
+
+        // Wait for shutdown signal or critical service failure
         let mut shutdown_rx = self.shutdown_rx;
-        shutdown_rx.recv().await.ok();
+
+        loop {
+            tokio::select! {
+                // Wait for explicit shutdown
+                _ = shutdown_rx.recv() => {
+                    info!("🛑 Shutdown signal received");
+                    break;
+                }
+
+                // Monitor discovery service
+                result = async {
+                    if let Some(handle) = &mut discovery_handle {
+                        handle.await
+                    } else {
+                        // If no handle, wait forever
+                        std::future::pending().await
+                    }
+                } => {
+                    match result {
+                        Ok(_) => warn!("🔍 Discovery service completed unexpectedly"),
+                        Err(e) => error!("❌ Discovery service panicked: {}", e),
+                    }
+                    discovery_handle = None; // Mark as completed
+                }
+
+                // Monitor peer manager
+                result = async {
+                    if let Some(handle) = &mut peer_manager_handle {
+                        handle.await
+                    } else {
+                        // If no handle, wait forever
+                        std::future::pending().await
+                    }
+                } => {
+                    match result {
+                        Ok(_) => warn!("🌐 Peer manager completed unexpectedly"),
+                        Err(e) => error!("❌ Peer manager panicked: {}", e),
+                    }
+                    peer_manager_handle = None; // Mark as completed
+                }
+
+                // Monitor hotkey handler
+                result = async {
+                    if let Some(handle) = &mut hotkey_handle {
+                        handle.await
+                    } else {
+                        // If no handle, wait forever
+                        std::future::pending().await
+                    }
+                } => {
+                    match result {
+                        Ok(_) => warn!("🎹 Hotkey handler completed unexpectedly"),
+                        Err(e) => error!("❌ Hotkey handler panicked: {}", e),
+                    }
+                    hotkey_handle = None; // Mark as completed
+                }
+            }
+        }
 
         // Clean shutdown
         info!("🛑 Shutting down services...");
-        discovery_handle.abort();
-        peer_manager_handle.abort();
-        hotkey_handle.abort();
 
-        info!("✅ Fileshare Daemon stopped");
+        // Send shutdown signal to all services
+        if let Err(e) = self.shutdown_tx.send(()) {
+            warn!("Failed to send shutdown signal: {}", e);
+        }
+
+        // Give services time to shut down gracefully
+        tokio::time::sleep(tokio::time::Duration::from_millis(1000)).await;
+
+        // Force abort remaining tasks
+        if let Some(handle) = discovery_handle.take() {
+            handle.abort();
+        }
+        if let Some(handle) = peer_manager_handle.take() {
+            handle.abort();
+        }
+        if let Some(handle) = hotkey_handle.take() {
+            handle.abort();
+        }
+
+        // Wait a bit more for cleanup
+        tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+
+        info!("✅ Fileshare Daemon stopped cleanly");
         Ok(())
     }
 
