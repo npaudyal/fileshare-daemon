@@ -1298,38 +1298,103 @@ function App() {
                     )}
 
                     {activeTab === 'settings' && settings && (
-                        <>
-                            <FadeIn key="settings">
-                                <AdvancedSettings
-                                    settings={settings}
-                                    onSettingsChange={(newSettings) => {
-                                        setSettings(newSettings);
-                                        loadDevices();
-                                    }}
-                                />
-                            </FadeIn>
+                        <FadeIn key="settings">
+                            <AdvancedSettings
+                                settings={settings}
+                                onSettingsChange={(newSettings) => {
+                                    setSettings(newSettings);
+                                    loadDevices();
+                                }}
+                            />
+
+                            {/* ADD THIS TEST SECTION */}
                             <motion.button
-                                whileHover={{ scale: 1.05 }}
-                                whileTap={{ scale: 0.95 }}
+                                whileHover={{ scale: 1.02 }}
+                                whileTap={{ scale: 0.98 }}
                                 onClick={async () => {
                                     try {
-                                        setIsLoading(true);
-                                        const result = await invoke<string>('test_hotkey_system');
-                                        console.log('Hotkey Test Results:', result);
-                                        // Show results in a modal or console
-                                        alert(`Hotkey test completed. Check console for details:\n\n${result.substring(0, 500)}...`);
+                                        const result = await invoke<string>('test_isolated_hotkey');
+                                        console.log("🔬 Isolated Test Result:", result);
+                                        alert(result);
                                     } catch (error) {
-                                        console.error('Hotkey test failed:', error);
-                                        alert(`Hotkey test failed: ${error}`);
-                                    } finally {
-                                        setIsLoading(false);
+                                        console.error('❌ Isolated test failed:', error);
+                                        alert(`Isolated test failed: ${error}`);
                                     }
                                 }}
-                                className="w-full px-4 py-2 bg-purple-500/20 text-purple-300 rounded hover:bg-purple-500/30 transition-colors"
+                                className="w-full px-4 py-2 bg-red-600/20 text-red-300 rounded hover:bg-red-600/30 transition-colors flex items-center justify-center space-x-2"
                             >
-                                🧪 Test Hotkey System
+                                <span>🔬</span>
+                                <span>Test Isolated Hotkey (F9)</span>
                             </motion.button>
-                        </>
+                            <div className="mt-6 p-4 bg-purple-500/10 border border-purple-500/20 rounded-lg">
+                                <h3 className="text-purple-300 font-medium mb-3">🧪 Hotkey Diagnostics</h3>
+                                <div className="space-y-3">
+                                    <motion.button
+                                        whileHover={{ scale: 1.02 }}
+                                        whileTap={{ scale: 0.98 }}
+                                        onClick={async () => {
+                                            try {
+                                                setIsLoading(true);
+                                                console.log("🧪 Starting hotkey test...");
+                                                const result = await invoke<string>('test_hotkey_system');
+                                                console.log("📋 Hotkey Test Results:", result);
+
+                                                // Show results in browser console and alert
+                                                alert(`Hotkey test completed! Check browser console for full details.\n\nSummary: ${result.split('\n').slice(-5).join('\n')}`);
+                                            } catch (error) {
+                                                console.error('❌ Hotkey test failed:', error);
+                                                alert(`Hotkey test failed: ${error}`);
+                                            } finally {
+                                                setIsLoading(false);
+                                            }
+                                        }}
+                                        className="w-full px-4 py-2 bg-purple-600/20 text-purple-300 rounded hover:bg-purple-600/30 transition-colors flex items-center justify-center space-x-2"
+                                        disabled={isLoading}
+                                    >
+                                        {isLoading ? (
+                                            <>
+                                                <div className="w-4 h-4 border-2 border-purple-300 border-t-transparent rounded-full animate-spin" />
+                                                <span>Testing...</span>
+                                            </>
+                                        ) : (
+                                            <>
+                                                <span>🧪</span>
+                                                <span>Run Full Hotkey Test</span>
+                                            </>
+                                        )}
+                                    </motion.button>
+
+                                    <motion.button
+                                        whileHover={{ scale: 1.02 }}
+                                        whileTap={{ scale: 0.98 }}
+                                        onClick={async () => {
+                                            try {
+                                                const result = await invoke<string>('check_main_hotkey_status');
+                                                console.log("🔍 Main Hotkey Status:", result);
+                                                alert(result);
+                                            } catch (error) {
+                                                console.error('❌ Status check failed:', error);
+                                                alert(`Status check failed: ${error}`);
+                                            }
+                                        }}
+                                        className="w-full px-4 py-2 bg-blue-600/20 text-blue-300 rounded hover:bg-blue-600/30 transition-colors flex items-center justify-center space-x-2"
+                                    >
+                                        <span>🔍</span>
+                                        <span>Check Main Hotkey Status</span>
+                                    </motion.button>
+
+                                    <div className="text-xs text-gray-400 mt-2">
+                                        <p>💡 <strong>Testing Instructions:</strong></p>
+                                        <p>1. Click "Run Full Hotkey Test"</p>
+                                        <p>2. When prompted, try pressing these keys:</p>
+                                        <p>   • <kbd className="bg-black/30 px-1 rounded">Ctrl+Alt+Y</kbd> (main copy hotkey)</p>
+                                        <p>   • <kbd className="bg-black/30 px-1 rounded">Ctrl+Alt+I</kbd> (main paste hotkey)</p>
+                                        <p>   • <kbd className="bg-black/30 px-1 rounded">Ctrl+Alt+F11</kbd> (test hotkey)</p>
+                                        <p>3. Check browser console for detailed results</p>
+                                    </div>
+                                </div>
+                            </div>
+                        </FadeIn>
                     )}
 
                     {activeTab === 'info' && (
