@@ -1177,7 +1177,7 @@ async fn setup_global_hotkeys(
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
 
-    info!("🎹 Initializing global hotkeys...");
+    info!("🎹 Initializing global hotkeys with Windows message pump...");
 
     let manager = GlobalHotKeyManager::new()
         .map_err(|e| format!("Failed to create hotkey manager: {}", e))?;
@@ -1201,7 +1201,7 @@ async fn setup_global_hotkeys(
     while retry_count < 3 {
         match manager.register(copy_hotkey) {
             Ok(()) => {
-                info!("✅ Copy hotkey registered successfully");
+                info!("✅ Copy hotkey (Ctrl+Alt+Y) registered successfully");
                 break;
             }
             Err(e) => {
@@ -1225,7 +1225,7 @@ async fn setup_global_hotkeys(
     while retry_count < 3 {
         match manager.register(paste_hotkey) {
             Ok(()) => {
-                info!("✅ Paste hotkey registered successfully");
+                info!("✅ Paste hotkey (Ctrl+Alt+I) registered successfully");
                 break;
             }
             Err(e) => {
@@ -1245,20 +1245,24 @@ async fn setup_global_hotkeys(
         }
     }
 
-    info!("🎹 Starting hotkey event listener...");
+    info!("🎹 Starting Windows-compatible hotkey event listener...");
 
-    // Message loop - optimized for Windows
+    // CRITICAL FIX: Use blocking thread with Windows message pump
     let is_running = Arc::new(AtomicBool::new(true));
     let is_running_clone = is_running.clone();
 
-    // Use a blocking thread for Windows message pump compatibility
     std::thread::spawn(move || {
         let receiver = GlobalHotKeyEvent::receiver();
 
-        info!("🎹 Hotkey listener thread started");
+        info!("🎹 Hotkey listener thread started with message pump");
 
         while is_running_clone.load(Ordering::SeqCst) {
-            match receiver.recv_timeout(std::time::Duration::from_millis(100)) {
+            // CRITICAL: Pump Windows messages first
+            #[cfg(target_os = "windows")]
+            pump_windows_messages();
+
+            // Then check for hotkey events
+            match receiver.try_recv() {
                 Ok(event) => {
                     if event.state == global_hotkey::HotKeyState::Pressed {
                         info!("🎹 Hotkey event received: ID={}", event.id);
@@ -1281,15 +1285,17 @@ async fn setup_global_hotkeys(
                         }
                     }
                 }
-                Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
-                    // Normal timeout, continue
-                    continue;
+                Err(crossbeam_channel::TryRecvError::Empty) => {
+                    // No events, continue
                 }
-                Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
+                Err(crossbeam_channel::TryRecvError::Disconnected) => {
                     warn!("🎹 Hotkey event receiver disconnected");
                     break;
                 }
             }
+
+            // Small delay to prevent CPU spinning
+            std::thread::sleep(std::time::Duration::from_millis(10));
         }
 
         info!("🎹 Hotkey listener thread stopped");
@@ -1298,8 +1304,52 @@ async fn setup_global_hotkeys(
     // Keep the manager alive by preventing it from being dropped
     std::mem::forget(manager);
 
-    info!("✅ Hotkey system initialized successfully");
+    info!("✅ Hotkey system initialized successfully with message pump");
     Ok(())
+}
+
+#[cfg(target_os = "windows")]
+fn pump_windows_messages() {
+    use std::ptr;
+
+    #[repr(C)]
+    struct MSG {
+        hwnd: *mut std::ffi::c_void,
+        message: u32,
+        wparam: usize,
+        lparam: isize,
+        time: u32,
+        pt: (i32, i32),
+    }
+
+    extern "system" {
+        fn PeekMessageW(
+            lpmsg: *mut MSG,
+            hwnd: *mut std::ffi::c_void,
+            wmsgfiltermin: u32,
+            wmsgfiltermax: u32,
+            wremovemsg: u32,
+        ) -> i32;
+        fn TranslateMessage(lpmsg: *const MSG) -> i32;
+        fn DispatchMessageW(lpmsg: *const MSG) -> isize;
+    }
+
+    const PM_REMOVE: u32 = 0x0001;
+
+    unsafe {
+        let mut msg: MSG = std::mem::zeroed();
+
+        // Process all available messages
+        while PeekMessageW(&mut msg, ptr::null_mut(), 0, 0, PM_REMOVE) != 0 {
+            TranslateMessage(&msg);
+            DispatchMessageW(&msg);
+        }
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn pump_windows_messages() {
+    // No-op on non-Windows platforms
 }
 
 // Helper functions for hotkey operations
