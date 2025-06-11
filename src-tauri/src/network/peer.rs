@@ -1,7 +1,7 @@
 use crate::{
     config::Settings,
     network::{discovery::DeviceInfo, protocol::*},
-    service::file_transfer::{DirectPeerSender, FileTransferManager, TransferDirection},
+    service::file_transfer::{FileTransferManager, MessageSender, TransferDirection},
     FileshareError, Result,
 };
 use std::collections::HashMap;
@@ -63,48 +63,25 @@ impl PeerManager {
             FileTransferManager::new(settings.clone()).await?,
         ));
 
-        Ok(Self {
+        let peer_manager = Self {
             settings,
             peers: HashMap::new(),
             file_transfer,
             message_tx: message_tx.clone(),
             message_rx,
             connections: HashMap::new(),
-        })
+        };
+
+        // Set up the message sender for file transfers
+        peer_manager.set_file_transfer_message_sender().await;
+
+        Ok(peer_manager)
     }
 
-    // Set up direct sender for file transfers to bypass message loop
-    pub async fn setup_file_transfer_direct_sender(&self) {
-        let connections = self.connections.clone();
-
-        let direct_sender: DirectPeerSender = Arc::new(move |peer_id: Uuid, message: Message| {
-            info!(
-                "📤 DIRECT SEND to peer {}: {:?}",
-                peer_id, message.message_type
-            );
-
-            if let Some(conn) = connections.get(&peer_id) {
-                conn.send(message).map_err(|e| {
-                    error!("❌ Direct send failed to peer {}: {}", peer_id, e);
-                    FileshareError::Transfer(format!("Direct send failed: {}", e))
-                })
-            } else {
-                error!("❌ No connection to peer {} for direct send", peer_id);
-                Err(FileshareError::Transfer(format!(
-                    "No connection to peer {}",
-                    peer_id
-                )))
-            }
-        });
-
+    // Connect file transfer manager with message sender
+    async fn set_file_transfer_message_sender(&self) {
         let mut ft = self.file_transfer.write().await;
-        ft.set_direct_sender(direct_sender);
-        info!("✅ Direct sender configured for file transfers");
-    }
-
-    // Initialize file transfer sender (called from daemon)
-    pub async fn initialize_file_transfer_sender(&mut self) {
-        self.setup_file_transfer_direct_sender().await;
+        ft.set_message_sender(self.message_tx.clone());
     }
 
     pub fn debug_connection_status(&self) {
@@ -123,6 +100,21 @@ impl PeerManager {
             info!("Active connection to: {}", peer_id);
         }
         info!("=== END CONNECTION STATUS ===");
+    }
+
+    // Add this method for direct connection sending (used by daemon routing)
+    pub async fn send_direct_to_connection(&self, peer_id: Uuid, message: Message) -> Result<()> {
+        if let Some(conn) = self.connections.get(&peer_id) {
+            conn.send(message).map_err(|e| {
+                FileshareError::Transfer(format!("Failed to send direct message: {}", e))
+            })?;
+            Ok(())
+        } else {
+            Err(FileshareError::Transfer(format!(
+                "No connection to peer {}",
+                peer_id
+            )))
+        }
     }
 
     // Simplified message sending
@@ -392,9 +384,6 @@ impl PeerManager {
         // Store the connection sender so we can send messages to this peer
         self.connections.insert(peer_id, conn_tx);
 
-        // IMPORTANT: Update the direct sender after adding new connection
-        self.setup_file_transfer_direct_sender().await;
-
         // Split the connection into read and write halves
         let (mut read_half, mut write_half) = connection.split();
 
@@ -490,7 +479,7 @@ impl PeerManager {
             .collect()
     }
 
-    // Simplified message handling - no complex routing
+    // Simplified message handling
     pub async fn handle_message(
         &mut self,
         peer_id: Uuid,

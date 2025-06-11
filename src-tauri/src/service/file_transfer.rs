@@ -6,8 +6,8 @@ use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
-// Direct sender to peer connections (bypasses message loop)
-pub type DirectPeerSender = Arc<dyn Fn(Uuid, Message) -> Result<()> + Send + Sync>;
+// Use simple message sender instead of DirectPeerSender
+pub type MessageSender = mpsc::UnboundedSender<(Uuid, Message)>;
 
 #[derive(Debug)]
 pub struct FileTransfer {
@@ -42,7 +42,7 @@ pub enum TransferStatus {
 pub struct FileTransferManager {
     settings: Arc<Settings>,
     active_transfers: HashMap<Uuid, FileTransfer>,
-    direct_sender: Option<DirectPeerSender>,
+    message_sender: Option<MessageSender>,
 }
 
 impl FileTransferManager {
@@ -50,13 +50,13 @@ impl FileTransferManager {
         Ok(Self {
             settings,
             active_transfers: HashMap::new(),
-            direct_sender: None,
+            message_sender: None,
         })
     }
 
-    // Set the direct sender to peer connections
-    pub fn set_direct_sender(&mut self, sender: DirectPeerSender) {
-        self.direct_sender = Some(sender);
+    // Set the message sender (replaces DirectPeerSender)
+    pub fn set_message_sender(&mut self, sender: MessageSender) {
+        self.message_sender = Some(sender);
     }
 
     pub async fn send_file_with_target_dir(
@@ -111,32 +111,35 @@ impl FileTransferManager {
             transfer_id, peer_id
         );
 
-        // Send FileOffer DIRECTLY to peer (bypass message loop)
-        if let Some(ref sender) = self.direct_sender {
+        // Send FileOffer through normal message channel (not direct)
+        if let Some(ref sender) = self.message_sender {
             let file_offer = Message::new(MessageType::FileOffer {
                 transfer_id,
                 metadata: metadata.clone(),
             });
 
             info!(
-                "🚀 SEND_FILE: Sending FileOffer {} DIRECTLY to peer {}",
+                "🚀 SEND_FILE: Sending FileOffer {} to message channel for peer {}",
                 transfer_id, peer_id
             );
 
-            if let Err(e) = sender(peer_id, file_offer) {
-                error!("Failed to send file offer directly: {}", e);
+            if let Err(e) = sender.send((peer_id, file_offer)) {
+                error!("Failed to send file offer: {}", e);
                 self.active_transfers.remove(&transfer_id);
-                return Err(e);
+                return Err(FileshareError::Transfer(format!(
+                    "Failed to send file offer: {}",
+                    e
+                )));
             }
 
             info!(
-                "🚀 SEND_FILE: FileOffer {} sent DIRECTLY to peer {}",
+                "🚀 SEND_FILE: FileOffer {} sent to message channel for peer {}",
                 transfer_id, peer_id
             );
         } else {
             self.active_transfers.remove(&transfer_id);
             return Err(FileshareError::Transfer(
-                "Direct sender not configured".to_string(),
+                "Message sender not configured".to_string(),
             ));
         }
 
@@ -214,14 +217,14 @@ impl FileTransferManager {
             )
         };
 
-        let direct_sender = self
-            .direct_sender
+        let message_sender = self
+            .message_sender
             .clone()
-            .ok_or_else(|| FileshareError::Transfer("Direct sender not configured".to_string()))?;
+            .ok_or_else(|| FileshareError::Transfer("Message sender not configured".to_string()))?;
 
         tokio::spawn(async move {
             if let Err(e) =
-                Self::send_file_chunks(direct_sender, peer_id, transfer_id, file_path, chunk_size)
+                Self::send_file_chunks(message_sender, peer_id, transfer_id, file_path, chunk_size)
                     .await
             {
                 error!("Failed to send file chunks: {}", e);
@@ -232,7 +235,7 @@ impl FileTransferManager {
     }
 
     async fn send_file_chunks(
-        direct_sender: DirectPeerSender,
+        message_sender: MessageSender,
         peer_id: Uuid,
         transfer_id: Uuid,
         file_path: PathBuf,
@@ -284,15 +287,18 @@ impl FileTransferManager {
 
             let message = Message::new(MessageType::FileChunk { transfer_id, chunk });
 
-            // Send chunk DIRECTLY to peer
-            if let Err(e) = direct_sender(peer_id, message) {
-                error!("Failed to send chunk {} directly: {}", chunk_index, e);
+            // Send through normal message channel (not direct)
+            if let Err(e) = message_sender.send((peer_id, message)) {
+                error!("Failed to send chunk {}: {}", chunk_index, e);
                 let error_msg = Message::new(MessageType::TransferError {
                     transfer_id,
                     error: format!("Failed to send chunk: {}", e),
                 });
-                let _ = direct_sender(peer_id, error_msg);
-                return Err(e);
+                let _ = message_sender.send((peer_id, error_msg));
+                return Err(FileshareError::Transfer(format!(
+                    "Failed to send chunk: {}",
+                    e
+                )));
             }
 
             bytes_sent = chunk_end;
@@ -302,7 +308,7 @@ impl FileTransferManager {
             tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
         }
 
-        // Send completion message DIRECTLY
+        // Send completion message through normal channel
         let checksum = format!("{:x}", hasher.finalize());
         info!(
             "File transfer complete. Total bytes sent: {}, Checksum: {}",
@@ -314,8 +320,8 @@ impl FileTransferManager {
             checksum,
         });
 
-        if let Err(e) = direct_sender(peer_id, complete_msg) {
-            error!("Failed to send transfer complete directly: {}", e);
+        if let Err(e) = message_sender.send((peer_id, complete_msg)) {
+            error!("Failed to send transfer complete: {}", e);
         } else {
             info!("File transfer {} completed successfully", transfer_id);
         }
@@ -334,7 +340,7 @@ impl FileTransferManager {
             peer_id, metadata.name, metadata.size
         );
 
-        // USE target directory from metadata
+        // Use target directory from metadata
         let save_path = self.get_save_path(&metadata.name, metadata.target_dir.as_deref())?;
 
         // Initialize received_data buffer with the expected size
@@ -488,13 +494,13 @@ impl FileTransferManager {
             info!("Transfer {} is complete, finalizing...", transfer_id);
             self.complete_file_transfer(transfer_id).await?;
         } else {
-            // Send acknowledgment DIRECTLY to peer
-            if let Some(ref sender) = self.direct_sender {
+            // Send acknowledgment through normal message channel
+            if let Some(ref sender) = self.message_sender {
                 let ack = Message::new(MessageType::FileChunkAck {
                     transfer_id,
                     chunk_index: chunk.index,
                 });
-                let _ = sender(peer_id, ack);
+                let _ = sender.send((peer_id, ack));
             }
         }
 

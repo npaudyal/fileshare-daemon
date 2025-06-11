@@ -3,6 +3,7 @@ use crate::{
     config::Settings,
     hotkeys::{HotkeyEvent, HotkeyManager},
     network::{DiscoveryService, PeerManager},
+    service::file_transfer::TransferDirection,
     utils::format_file_size,
     Result,
 };
@@ -26,11 +27,7 @@ impl FileshareDaemon {
         let (shutdown_tx, shutdown_rx) = broadcast::channel(1);
 
         // Initialize peer manager
-        let mut peer_manager = PeerManager::new(settings.clone()).await?;
-
-        // Set up direct sender for file transfers
-        peer_manager.initialize_file_transfer_sender().await;
-
+        let peer_manager = PeerManager::new(settings.clone()).await?;
         let peer_manager = Arc::new(RwLock::new(peer_manager));
 
         // Initialize discovery service
@@ -56,11 +53,6 @@ impl FileshareDaemon {
             shutdown_tx,
             shutdown_rx,
         })
-    }
-
-    // Add method to get the hotkey event sender
-    pub fn get_hotkey_event_sender(&self) -> tokio::sync::mpsc::UnboundedSender<HotkeyEvent> {
-        self.hotkey_manager.get_event_sender()
     }
 
     // Method to get discovered devices
@@ -316,7 +308,7 @@ impl FileshareDaemon {
         Ok(())
     }
 
-    // FIXED: Simplified message processing - no more dual routing!
+    // FIXED: Smart routing message processing
     async fn run_peer_manager(
         peer_manager: Arc<RwLock<PeerManager>>,
         settings: Arc<Settings>,
@@ -352,7 +344,7 @@ impl FileshareDaemon {
             }
         });
 
-        // SIMPLIFIED: Process ALL messages the same way (no dual routing)
+        // FIXED: Smart routing for outgoing transfer messages
         let message_pm = peer_manager.clone();
         let message_clipboard = clipboard.clone();
         let message_handle = tokio::spawn(async move {
@@ -362,13 +354,125 @@ impl FileshareDaemon {
 
                 let mut pm = message_pm.write().await;
 
-                // Simple message processing - all messages go through handle_message
                 while let Ok((peer_id, message)) = pm.message_rx.try_recv() {
+                    // CRITICAL: Route ALL outgoing transfer messages directly to avoid loops
+                    match &message.message_type {
+                        crate::network::protocol::MessageType::FileOffer {
+                            transfer_id, ..
+                        } => {
+                            let is_our_outgoing = {
+                                let ft = pm.file_transfer.read().await;
+                                ft.has_transfer(*transfer_id)
+                                    && matches!(
+                                        ft.get_transfer_direction(*transfer_id),
+                                        Some(TransferDirection::Outgoing)
+                                    )
+                            };
+
+                            if is_our_outgoing {
+                                info!(
+                                    "🚀 Sending outgoing FileOffer {} directly to peer {}",
+                                    transfer_id, peer_id
+                                );
+                                if let Err(e) = pm.send_direct_to_connection(peer_id, message).await
+                                {
+                                    error!(
+                                        "❌ Failed to send FileOffer to peer {}: {}",
+                                        peer_id, e
+                                    );
+                                }
+                                continue; // Don't process locally
+                            }
+                        }
+
+                        crate::network::protocol::MessageType::FileChunk {
+                            transfer_id, ..
+                        } => {
+                            let is_our_outgoing = {
+                                let ft = pm.file_transfer.read().await;
+                                ft.has_transfer(*transfer_id)
+                                    && matches!(
+                                        ft.get_transfer_direction(*transfer_id),
+                                        Some(TransferDirection::Outgoing)
+                                    )
+                            };
+
+                            if is_our_outgoing {
+                                info!("🚀 Sending outgoing FileChunk for transfer {} directly to peer {}", transfer_id, peer_id);
+                                if let Err(e) = pm.send_direct_to_connection(peer_id, message).await
+                                {
+                                    error!(
+                                        "❌ Failed to send FileChunk to peer {}: {}",
+                                        peer_id, e
+                                    );
+                                }
+                                continue; // Don't process locally
+                            }
+                        }
+
+                        crate::network::protocol::MessageType::TransferComplete {
+                            transfer_id,
+                            ..
+                        } => {
+                            let is_our_outgoing = {
+                                let ft = pm.file_transfer.read().await;
+                                ft.has_transfer(*transfer_id)
+                                    && matches!(
+                                        ft.get_transfer_direction(*transfer_id),
+                                        Some(TransferDirection::Outgoing)
+                                    )
+                            };
+
+                            if is_our_outgoing {
+                                info!("🚀 Sending outgoing TransferComplete for transfer {} directly to peer {}", transfer_id, peer_id);
+                                if let Err(e) = pm.send_direct_to_connection(peer_id, message).await
+                                {
+                                    error!(
+                                        "❌ Failed to send TransferComplete to peer {}: {}",
+                                        peer_id, e
+                                    );
+                                }
+                                continue; // Don't process locally
+                            }
+                        }
+
+                        crate::network::protocol::MessageType::TransferError {
+                            transfer_id,
+                            ..
+                        } => {
+                            let is_our_outgoing = {
+                                let ft = pm.file_transfer.read().await;
+                                ft.has_transfer(*transfer_id)
+                                    && matches!(
+                                        ft.get_transfer_direction(*transfer_id),
+                                        Some(TransferDirection::Outgoing)
+                                    )
+                            };
+
+                            if is_our_outgoing {
+                                info!("🚀 Sending outgoing TransferError for transfer {} directly to peer {}", transfer_id, peer_id);
+                                if let Err(e) = pm.send_direct_to_connection(peer_id, message).await
+                                {
+                                    error!(
+                                        "❌ Failed to send TransferError to peer {}: {}",
+                                        peer_id, e
+                                    );
+                                }
+                                continue; // Don't process locally
+                            }
+                        }
+
+                        _ => {
+                            // All non-transfer messages process normally
+                        }
+                    }
+
+                    // Process all other messages normally (including incoming transfer messages)
                     if let Err(e) = pm
                         .handle_message(peer_id, message, &message_clipboard)
                         .await
                     {
-                        error!("❌ Error processing message: {}", e);
+                        error!("Error processing message: {}", e);
                     }
                 }
             }
