@@ -2,13 +2,12 @@ use crate::{
     clipboard::ClipboardManager,
     config::Settings,
     hotkeys::{HotkeyEvent, HotkeyManager},
-    network::{DiscoveryService, MessageType, PeerManager},
-    service::file_transfer::TransferDirection,
+    network::{DiscoveryService, PeerManager},
     utils::format_file_size,
     Result,
 };
 use std::sync::Arc;
-use tokio::sync::{broadcast, mpsc, RwLock};
+use tokio::sync::{broadcast, RwLock};
 use tracing::{error, info, warn};
 
 pub struct FileshareDaemon {
@@ -55,7 +54,7 @@ impl FileshareDaemon {
     }
 
     // Add method to get the hotkey event sender
-    pub fn get_hotkey_event_sender(&self) -> mpsc::UnboundedSender<HotkeyEvent> {
+    pub fn get_hotkey_event_sender(&self) -> tokio::sync::mpsc::UnboundedSender<HotkeyEvent> {
         self.hotkey_manager.get_event_sender()
     }
 
@@ -71,8 +70,8 @@ impl FileshareDaemon {
         info!("🏷️ Device Name: {}", self.settings.device.name);
         info!("🌐 Listening on port: {}", self.settings.network.port);
 
-        // Start hotkey manager FIRST with platform-specific initialization
-        info!("🎹 Initializing platform-specific hotkey system...");
+        // Start hotkey manager
+        info!("🎹 Initializing hotkey system...");
         self.hotkey_manager.start().await?;
         info!("✅ Hotkey manager started successfully");
 
@@ -114,7 +113,7 @@ impl FileshareDaemon {
             })
         };
 
-        // Start hotkey event handler with improved error handling
+        // Start hotkey event handler
         let hotkey_handle = {
             let peer_manager = self.peer_manager.clone();
             let clipboard = self.clipboard.clone();
@@ -312,6 +311,7 @@ impl FileshareDaemon {
         Ok(())
     }
 
+    // FIXED: Simplified message processing - no more dual routing!
     async fn run_peer_manager(
         peer_manager: Arc<RwLock<PeerManager>>,
         settings: Arc<Settings>,
@@ -347,6 +347,7 @@ impl FileshareDaemon {
             }
         });
 
+        // CRITICAL FIX: Simple message processing like the working CLI version
         let message_pm = peer_manager.clone();
         let message_clipboard = clipboard.clone();
         let message_handle = tokio::spawn(async move {
@@ -356,103 +357,8 @@ impl FileshareDaemon {
 
                 let mut pm = message_pm.write().await;
 
+                // SIMPLE: Process ALL messages the same way (like working version)
                 while let Ok((peer_id, message)) = pm.message_rx.try_recv() {
-                    // Route outgoing transfer messages directly
-                    match &message.message_type {
-                        MessageType::FileOffer { transfer_id, .. } => {
-                            let is_our_outgoing = {
-                                let ft = pm.file_transfer.read().await;
-                                ft.has_transfer(*transfer_id)
-                                    && matches!(
-                                        ft.get_transfer_direction(*transfer_id),
-                                        Some(TransferDirection::Outgoing)
-                                    )
-                            };
-
-                            if is_our_outgoing {
-                                if let Err(e) = pm.send_direct_to_connection(peer_id, message).await
-                                {
-                                    error!(
-                                        "❌ Failed to send FileOffer to peer {}: {}",
-                                        peer_id, e
-                                    );
-                                }
-                                continue;
-                            }
-                        }
-
-                        MessageType::FileChunk { transfer_id, .. } => {
-                            let is_our_outgoing = {
-                                let ft = pm.file_transfer.read().await;
-                                ft.has_transfer(*transfer_id)
-                                    && matches!(
-                                        ft.get_transfer_direction(*transfer_id),
-                                        Some(TransferDirection::Outgoing)
-                                    )
-                            };
-
-                            if is_our_outgoing {
-                                if let Err(e) = pm.send_direct_to_connection(peer_id, message).await
-                                {
-                                    error!(
-                                        "❌ Failed to send FileChunk to peer {}: {}",
-                                        peer_id, e
-                                    );
-                                }
-                                continue;
-                            }
-                        }
-
-                        MessageType::TransferComplete { transfer_id, .. } => {
-                            let is_our_outgoing = {
-                                let ft = pm.file_transfer.read().await;
-                                ft.has_transfer(*transfer_id)
-                                    && matches!(
-                                        ft.get_transfer_direction(*transfer_id),
-                                        Some(TransferDirection::Outgoing)
-                                    )
-                            };
-
-                            if is_our_outgoing {
-                                if let Err(e) = pm.send_direct_to_connection(peer_id, message).await
-                                {
-                                    error!(
-                                        "❌ Failed to send TransferComplete to peer {}: {}",
-                                        peer_id, e
-                                    );
-                                }
-                                continue;
-                            }
-                        }
-
-                        MessageType::TransferError { transfer_id, .. } => {
-                            let is_our_outgoing = {
-                                let ft = pm.file_transfer.read().await;
-                                ft.has_transfer(*transfer_id)
-                                    && matches!(
-                                        ft.get_transfer_direction(*transfer_id),
-                                        Some(TransferDirection::Outgoing)
-                                    )
-                            };
-
-                            if is_our_outgoing {
-                                if let Err(e) = pm.send_direct_to_connection(peer_id, message).await
-                                {
-                                    error!(
-                                        "❌ Failed to send TransferError to peer {}: {}",
-                                        peer_id, e
-                                    );
-                                }
-                                continue;
-                            }
-                        }
-
-                        _ => {
-                            // All non-transfer messages process normally
-                        }
-                    }
-
-                    // Process all other messages normally
                     if let Err(e) = pm
                         .handle_message(peer_id, message, &message_clipboard)
                         .await
