@@ -867,12 +867,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             hide_window
         ])
         .setup(|app| {
-            // Create the main window with larger size for device management
             let _main_window = WebviewWindowBuilder::new(app, "main", WebviewUrl::default())
                 .title("Fileshare")
-                .inner_size(480.0, 650.0) // Larger for device management
+                .inner_size(550.0, 550.0) // Changed to 550x550
                 .center()
-                .decorations(false)
+                .decorations(true) // Changed to true to allow minimize button
                 .resizable(false)
                 .visible(false)
                 .focused(false)

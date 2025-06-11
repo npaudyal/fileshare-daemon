@@ -261,3 +261,15 @@ body {
     background-size: 200% 100%;
     animation: shimmer 1.5s infinite;
 }
+
+/* Window styling */
+.app-container {
+    border-radius: 12px;
+    overflow: hidden;
+}
+
+/* Fix for decorated window with rounded corners */
+body {
+    border-radius: 12px;
+    overflow: hidden;
+}

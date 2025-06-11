@@ -6,12 +6,10 @@ import {
     Upload,
     Shield,
     Zap,
-    HardDrive,
     Network,
     Eye,
     EyeOff,
     AlertTriangle,
-    CheckCircle,
     Settings as SettingsIcon
 } from 'lucide-react';
 import { useToast } from '../hooks/useToast';
@@ -138,8 +136,8 @@ const AdvancedSettings: React.FC<AdvancedSettingsProps> = ({ settings, onSetting
                             value={localSettings.network_port || 9876}
                             onChange={(e) => handleSettingChange('network_port', parseInt(e.target.value))}
                             className={`w-full px-3 py-2 bg-black/20 text-white rounded border focus:outline-none ${validatePortRange(localSettings.network_port)
-                                    ? 'border-white/20 focus:border-green-400'
-                                    : 'border-red-500 focus:border-red-400'
+                                ? 'border-white/20 focus:border-green-400'
+                                : 'border-red-500 focus:border-red-400'
                                 }`}
                             min="1024"
                             max="65535"
@@ -156,8 +154,8 @@ const AdvancedSettings: React.FC<AdvancedSettingsProps> = ({ settings, onSetting
                             value={localSettings.discovery_port || 9877}
                             onChange={(e) => handleSettingChange('discovery_port', parseInt(e.target.value))}
                             className={`w-full px-3 py-2 bg-black/20 text-white rounded border focus:outline-none ${validatePortRange(localSettings.discovery_port)
-                                    ? 'border-white/20 focus:border-green-400'
-                                    : 'border-red-500 focus:border-red-400'
+                                ? 'border-white/20 focus:border-green-400'
+                                : 'border-red-500 focus:border-red-400'
                                 }`}
                             min="1024"
                             max="65535"

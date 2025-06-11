@@ -4,7 +4,6 @@ import {
     Monitor,
     Cpu,
     HardDrive,
-    Wifi,
     Activity,
     Clock,
     Download,

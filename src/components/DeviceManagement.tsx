@@ -1,5 +1,5 @@
 import React, { useState } from 'react';
-import { Star, StarOff, Users, Zap, Activity, Download, Upload, Clock } from 'lucide-react';
+import { Star, StarOff, Users, Zap, Activity, Download, Clock } from 'lucide-react';
 
 interface DeviceStats {
     transferSpeed: number;
@@ -21,7 +21,6 @@ interface DeviceManagementProps {
 
 const DeviceManagement: React.FC<DeviceManagementProps> = ({
     deviceId,
-    deviceName,
     isFavorite,
     onToggleFavorite,
     onConnectDevice,
@@ -51,8 +50,8 @@ const DeviceManagement: React.FC<DeviceManagementProps> = ({
                     <button
                         onClick={() => onToggleFavorite(deviceId)}
                         className={`p-1 rounded transition-colors ${isFavorite
-                                ? 'text-yellow-400 hover:text-yellow-300'
-                                : 'text-gray-400 hover:text-yellow-400'
+                            ? 'text-yellow-400 hover:text-yellow-300'
+                            : 'text-gray-400 hover:text-yellow-400'
                             }`}
                         title={isFavorite ? 'Remove from favorites' : 'Add to favorites'}
                     >
