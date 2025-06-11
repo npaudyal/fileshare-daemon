@@ -49,6 +49,122 @@ struct DeviceAction {
     params: Option<HashMap<String, String>>,
 }
 
+// Test commands for debugging
+#[tauri::command]
+async fn test_hotkey_system() -> Result<String, String> {
+    info!("🧪 Starting comprehensive hotkey system test...");
+
+    tokio::task::spawn_blocking(|| run_hotkey_diagnostics())
+        .await
+        .map_err(|e| format!("Test spawn error: {}", e))
+}
+
+#[tauri::command]
+async fn test_isolated_hotkey() -> Result<String, String> {
+    tokio::task::spawn_blocking(|| isolated_hotkey_test())
+        .await
+        .map_err(|e| format!("Spawn error: {}", e))
+}
+
+fn run_hotkey_diagnostics() -> String {
+    use global_hotkey::{
+        hotkey::{Code, HotKey, Modifiers},
+        GlobalHotKeyEvent, GlobalHotKeyManager,
+    };
+
+    let mut results = Vec::new();
+    results.push("🧪 HOTKEY DIAGNOSTICS STARTING".to_string());
+    results.push(format!("Platform: {}", std::env::consts::OS));
+    results.push(format!("Architecture: {}", std::env::consts::ARCH));
+
+    // Test 1: Manager Creation
+    results.push("\n--- TEST 1: HOTKEY MANAGER CREATION ---".to_string());
+    let manager = match GlobalHotKeyManager::new() {
+        Ok(manager) => {
+            results.push("✅ GlobalHotKeyManager created successfully".to_string());
+            manager
+        }
+        Err(e) => {
+            results.push(format!("❌ Failed to create GlobalHotKeyManager: {}", e));
+            return results.join("\n");
+        }
+    };
+
+    // Test simple hotkeys
+    results.push("\n--- TEST 2: SIMPLE HOTKEY TEST ---".to_string());
+    let simple_hotkeys = vec![
+        ("F11", HotKey::new(None, Code::F11)),
+        (
+            "Ctrl+Alt+F11",
+            HotKey::new(Some(Modifiers::CONTROL | Modifiers::ALT), Code::F11),
+        ),
+        (
+            "Ctrl+Alt+Y",
+            HotKey::new(Some(Modifiers::CONTROL | Modifiers::ALT), Code::KeyY),
+        ),
+        (
+            "Ctrl+Alt+I",
+            HotKey::new(Some(Modifiers::CONTROL | Modifiers::ALT), Code::KeyI),
+        ),
+    ];
+
+    let mut registered = Vec::new();
+    for (name, hotkey) in &simple_hotkeys {
+        match manager.register(*hotkey) {
+            Ok(()) => {
+                results.push(format!("✅ Registered: {} (ID: {})", name, hotkey.id()));
+                registered.push((name, *hotkey));
+            }
+            Err(e) => {
+                results.push(format!("❌ Failed: {} - {}", name, e));
+            }
+        }
+    }
+
+    // Cleanup
+    for (name, hotkey) in &registered {
+        let _ = manager.unregister(*hotkey);
+        results.push(format!("Cleaned up: {}", name));
+    }
+
+    results.join("\n")
+}
+
+fn isolated_hotkey_test() -> String {
+    use global_hotkey::{
+        hotkey::{Code, HotKey},
+        GlobalHotKeyManager,
+    };
+
+    let mut results = Vec::new();
+    results.push("🔬 ISOLATED HOTKEY TEST".to_string());
+
+    let manager = match GlobalHotKeyManager::new() {
+        Ok(m) => {
+            results.push("✅ Fresh manager created".to_string());
+            m
+        }
+        Err(e) => {
+            results.push(format!("❌ Fresh manager failed: {}", e));
+            return results.join("\n");
+        }
+    };
+
+    let basic_hotkey = HotKey::new(None, Code::F9);
+
+    match manager.register(basic_hotkey) {
+        Ok(()) => {
+            results.push("✅ F9 registered successfully!".to_string());
+            let _ = manager.unregister(basic_hotkey);
+        }
+        Err(e) => {
+            results.push(format!("❌ Even F9 failed: {}", e));
+        }
+    }
+
+    results.join("\n")
+}
+
 #[tauri::command]
 async fn get_system_info() -> Result<SystemInfo, String> {
     Ok(SystemInfo {
@@ -752,7 +868,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with_env_filter("fileshare_daemon=debug,fileshare_daemon::network::discovery=debug")
         .init();
 
-    info!("🚀 Starting Fileshare Daemon with Enhanced Device Management");
+    info!("🚀 Starting Fileshare Daemon with Fixed Windows Hotkeys");
 
     let settings = Settings::load(None).map_err(|e| format!("Failed to load settings: {}", e))?;
     info!("📋 Configuration loaded: {:?}", settings.device.name);
@@ -788,6 +904,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             update_app_settings,
             export_settings,
             import_settings,
+            test_hotkey_system,
+            test_isolated_hotkey,
             quit_app,
             hide_window
         ])
@@ -856,10 +974,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     .build(app)?;
             }
 
-            // Start daemon
+            // Start daemon with the working hotkey approach
             let app_handle = app.handle().clone();
             tokio::spawn(async move {
-                info!("🚀 Starting daemon with improved hotkey handling...");
                 if let Err(e) = start_daemon(app_handle).await {
                     error!("❌ Failed to start daemon: {}", e);
                 }
@@ -874,7 +991,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 async fn start_daemon(app_handle: tauri::AppHandle) -> Result<(), Box<dyn std::error::Error>> {
-    info!("🔧 Starting background daemon with platform-specific hotkeys...");
+    info!("🔧 Starting background daemon with working Windows hotkeys...");
 
     let state: tauri::State<AppState> = app_handle.state();
 
@@ -901,6 +1018,6 @@ async fn start_daemon(app_handle: tauri::AppHandle) -> Result<(), Box<dyn std::e
         }
     });
 
-    info!("✅ Background daemon started successfully with platform-specific hotkeys");
+    info!("✅ Background daemon started successfully with working Windows hotkeys");
     Ok(())
 }
