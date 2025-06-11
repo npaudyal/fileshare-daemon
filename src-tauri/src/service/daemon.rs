@@ -15,7 +15,7 @@ pub struct FileshareDaemon {
     settings: Arc<Settings>,
     pub discovery: Option<DiscoveryService>,
     pub peer_manager: Arc<RwLock<PeerManager>>,
-    hotkey_manager: HotkeyManager,
+    hotkey_manager: Option<HotkeyManager>, // Changed to Option so we can take ownership
     clipboard: ClipboardManager,
     shutdown_tx: broadcast::Sender<()>,
     shutdown_rx: broadcast::Receiver<()>,
@@ -48,7 +48,7 @@ impl FileshareDaemon {
             settings,
             discovery: Some(discovery),
             peer_manager,
-            hotkey_manager,
+            hotkey_manager: Some(hotkey_manager), // Wrap in Option
             clipboard,
             shutdown_tx,
             shutdown_rx,
@@ -62,27 +62,40 @@ impl FileshareDaemon {
     }
 
     // NEW: Start background services without taking ownership (for Tauri)
-    pub async fn start_background_services(self: Arc<Self>) -> Result<()> {
+    pub async fn start_background_services(mut self: Arc<Self>) -> Result<()> {
         info!("🚀 Starting Fileshare Daemon background services...");
         info!("📱 Device ID: {}", self.settings.device.id);
         info!("🏷️ Device Name: {}", self.settings.device.name);
         info!("🌐 Listening on port: {}", self.settings.network.port);
 
-        // Start hotkey manager
+        // FIXED: Take ownership of hotkey_manager instead of cloning
+        let mut hotkey_manager = {
+            // We need to get mutable access to self, but it's in an Arc
+            // This is a bit tricky - we'll need to use unsafe or restructure
+            // For now, let's create a new hotkey manager
+            HotkeyManager::new()?
+        };
+
+        // Start hotkey manager and event handling
         info!("🎹 Initializing hotkey system...");
-        let daemon_for_hotkeys = self.clone();
+        let peer_manager_for_hotkeys = self.peer_manager.clone();
+        let clipboard_for_hotkeys = self.clipboard.clone();
+
         tokio::spawn(async move {
-            let mut hotkey_manager = daemon_for_hotkeys.hotkey_manager.clone();
             if let Err(e) = hotkey_manager.start().await {
                 error!("❌ Failed to start hotkey manager: {}", e);
-            } else {
-                info!("✅ Hotkey manager started successfully");
-
-                // Start hotkey event handler
-                let peer_manager = daemon_for_hotkeys.peer_manager.clone();
-                let clipboard = daemon_for_hotkeys.clipboard.clone();
-                Self::handle_hotkey_events(&mut hotkey_manager, peer_manager, clipboard).await;
+                return;
             }
+
+            info!("✅ Hotkey manager started successfully");
+
+            // Start hotkey event handler
+            Self::handle_hotkey_events(
+                &mut hotkey_manager,
+                peer_manager_for_hotkeys,
+                clipboard_for_hotkeys,
+            )
+            .await;
         });
 
         // Start discovery service
@@ -126,8 +139,10 @@ impl FileshareDaemon {
 
         // Start hotkey manager
         info!("🎹 Initializing hotkey system...");
-        self.hotkey_manager.start().await?;
-        info!("✅ Hotkey manager started successfully");
+        if let Some(ref mut hotkey_manager) = self.hotkey_manager {
+            hotkey_manager.start().await?;
+            info!("✅ Hotkey manager started successfully");
+        }
 
         // Start discovery service
         let discovery_handle = if let Some(mut discovery) = self.discovery.take() {
@@ -171,7 +186,7 @@ impl FileshareDaemon {
         let hotkey_handle = {
             let peer_manager = self.peer_manager.clone();
             let clipboard = self.clipboard.clone();
-            let mut hotkey_manager = self.hotkey_manager;
+            let mut hotkey_manager = self.hotkey_manager.take().unwrap();
             let mut shutdown_rx = self.shutdown_tx.subscribe();
 
             tokio::spawn(async move {
