@@ -106,12 +106,15 @@ impl FileTransferManager {
             ));
         }
 
-        let metadata = FileMetadata::from_path(&file_path)?.with_target_dir(target_dir);
+        // FIXED: Use the same chunk size as configured for this transfer manager
+        let chunk_size = self.settings.transfer.chunk_size;
+        let metadata = FileMetadata::from_path_with_chunk_size(&file_path, chunk_size)?
+            .with_target_dir(target_dir);
         let transfer_id = Uuid::new_v4();
 
         info!(
-            "🚀 SEND_FILE: Created transfer {} for peer {}, file size: {} bytes",
-            transfer_id, peer_id, metadata.size
+            "🚀 SEND_FILE: Created transfer {} for peer {}, file size: {} bytes, chunk size: {} bytes, total chunks: {}",
+            transfer_id, peer_id, metadata.size, metadata.chunk_size, metadata.total_chunks
         );
 
         // FIXED: Check for existing transfer with same file to same peer
@@ -148,7 +151,7 @@ impl FileTransferManager {
             chunks_received: Vec::new(),
             file_handle: None,
             received_data: Vec::new(),
-            created_at: std::time::Instant::now(), // NEW: Track creation time
+            created_at: std::time::Instant::now(),
         };
 
         // Store the transfer first
@@ -257,11 +260,11 @@ impl FileTransferManager {
                 .ok_or_else(|| FileshareError::Transfer("Transfer not found".to_string()))?;
 
             transfer.status = TransferStatus::Active;
-            (
-                transfer.file_path.clone(),
-                transfer.peer_id,
-                self.settings.transfer.chunk_size,
-            )
+
+            // FIXED: Use the chunk size from the metadata (what was agreed upon)
+            let chunk_size = transfer.metadata.chunk_size;
+
+            (transfer.file_path.clone(), transfer.peer_id, chunk_size)
         };
 
         let message_sender = self
@@ -393,8 +396,8 @@ impl FileTransferManager {
         metadata: FileMetadata,
     ) -> Result<()> {
         info!(
-            "📥 RECEIVER: Received file offer from {}: {} ({} bytes)",
-            peer_id, metadata.name, metadata.size
+            "📥 RECEIVER: Received file offer from {}: {} ({} bytes, chunk_size: {}, total_chunks: {})",
+            peer_id, metadata.name, metadata.size, metadata.chunk_size, metadata.total_chunks
         );
 
         // Clean up stale transfers first
@@ -415,13 +418,12 @@ impl FileTransferManager {
         // Initialize received_data buffer with the expected size
         let received_data = vec![0u8; metadata.size as usize];
 
-        // Calculate expected number of chunks
-        let expected_chunks = ((metadata.size + self.settings.transfer.chunk_size as u64 - 1)
-            / self.settings.transfer.chunk_size as u64) as usize;
+        // FIXED: Use the chunk count from metadata (sender's calculation)
+        let expected_chunks = metadata.total_chunks as usize;
 
         info!(
-            "📦 RECEIVER: Transfer {} expects {} chunks of max {} bytes each",
-            transfer_id, expected_chunks, self.settings.transfer.chunk_size
+            "📦 RECEIVER: Transfer {} expects {} chunks of max {} bytes each (from sender metadata)",
+            transfer_id, expected_chunks, metadata.chunk_size
         );
 
         let transfer = FileTransfer {
@@ -435,7 +437,7 @@ impl FileTransferManager {
             chunks_received: vec![false; expected_chunks],
             file_handle: None,
             received_data,
-            created_at: std::time::Instant::now(), // NEW: Track creation time
+            created_at: std::time::Instant::now(),
         };
 
         self.active_transfers.insert(transfer_id, transfer);
@@ -523,8 +525,8 @@ impl FileTransferManager {
                 return Err(FileshareError::Transfer("Transfer not active".to_string()));
             }
 
-            // FIXED: Better chunk validation
-            let chunk_size = self.settings.transfer.chunk_size as u64;
+            // FIXED: Use the chunk size from the agreed metadata (not local settings)
+            let chunk_size = transfer.metadata.chunk_size as u64;
             let expected_offset = chunk.index * chunk_size;
             let actual_end_offset = expected_offset + chunk.data.len() as u64;
             let expected_file_size = transfer.received_data.len() as u64;
@@ -532,8 +534,17 @@ impl FileTransferManager {
             // Enhanced validation with better error messages
             if chunk.index >= transfer.chunks_received.len() as u64 {
                 error!(
-                    "❌ RECEIVER: Chunk index {} out of bounds for transfer {}. Expected chunks: {}, file size: {} bytes",
-                    chunk.index, transfer_id, transfer.chunks_received.len(), expected_file_size
+                    "❌ RECEIVER: Chunk index {} out of bounds for transfer {}",
+                    chunk.index, transfer_id
+                );
+                error!(
+                    "   Expected chunks: {} (from metadata: {})",
+                    transfer.chunks_received.len(),
+                    transfer.metadata.total_chunks
+                );
+                error!(
+                    "   File size: {} bytes, Chunk size: {} bytes",
+                    expected_file_size, chunk_size
                 );
                 return Err(FileshareError::Transfer(format!(
                     "Chunk index {} out of bounds (expected max {})",
@@ -554,7 +565,7 @@ impl FileTransferManager {
                     chunk.data.len(),
                     actual_end_offset
                 );
-                error!("   Chunk size setting: {} bytes", chunk_size);
+                error!("   Agreed chunk size: {} bytes", chunk_size);
                 return Err(FileshareError::Transfer(format!(
                     "Chunk {} too large: offset {} + size {} = {} exceeds file size {}",
                     chunk.index,

@@ -84,6 +84,8 @@ pub struct FileMetadata {
     pub created: Option<u64>,
     pub modified: Option<u64>,
     pub target_dir: Option<String>,
+    pub chunk_size: usize, // NEW: Include chunk size in metadata
+    pub total_chunks: u64, // NEW: Include total expected chunks
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -123,7 +125,7 @@ impl Message {
 }
 
 impl FileMetadata {
-    pub fn from_path(path: &PathBuf) -> crate::Result<Self> {
+    pub fn from_path_with_chunk_size(path: &PathBuf, chunk_size: usize) -> crate::Result<Self> {
         use sha2::{Digest, Sha256};
         use std::fs;
         use std::io::Read;
@@ -134,6 +136,11 @@ impl FileMetadata {
             .ok_or_else(|| crate::FileshareError::FileOperation("Invalid file name".to_string()))?
             .to_string_lossy()
             .to_string();
+
+        let file_size = metadata.len();
+
+        // Calculate total chunks based on file size and chunk size
+        let total_chunks = (file_size + chunk_size as u64 - 1) / chunk_size as u64;
 
         // Calculate checksum
         let mut file = fs::File::open(path)?;
@@ -168,22 +175,28 @@ impl FileMetadata {
 
         Ok(Self {
             name,
-            size: metadata.len(),
+            size: file_size,
             checksum,
             mime_type,
             created,
             modified,
-            target_dir: None, // ADD THIS LINE - defaults to None for regular transfers
+            target_dir: None,
+            chunk_size,   // NEW: Store the chunk size used
+            total_chunks, // NEW: Store expected total chunks
         })
     }
 
-    // ADD THIS NEW METHOD
+    // Keep the old method for backward compatibility
+    pub fn from_path(path: &PathBuf) -> crate::Result<Self> {
+        // Use default 1MB chunk size for backward compatibility
+        Self::from_path_with_chunk_size(path, 1024 * 1024)
+    }
+
     pub fn with_target_dir(mut self, target_dir: Option<String>) -> Self {
         self.target_dir = target_dir;
         self
     }
 
-    // Rest of the implementation stays the same...
     fn guess_mime_type(filename: &str) -> Option<String> {
         let extension = std::path::Path::new(filename)
             .extension()?
