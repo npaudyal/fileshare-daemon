@@ -825,7 +825,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with_env_filter("fileshare_daemon=debug,fileshare_daemon::network::discovery=debug")
         .init();
 
-    info!("🚀 Starting Fileshare Daemon with Fixed Architecture");
+    info!("🚀 Starting Fileshare Daemon with Shared Ownership Architecture");
 
     let settings = Settings::load(None).map_err(|e| format!("Failed to load settings: {}", e))?;
     info!("📋 Configuration loaded: {:?}", settings.device.name);
@@ -931,7 +931,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     .build(app)?;
             }
 
-            // Start daemon with the simplified approach
+            // Start daemon with shared ownership architecture
             let app_handle = app.handle().clone();
             tokio::spawn(async move {
                 if let Err(e) = start_daemon(app_handle).await {
@@ -947,8 +947,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+// FIXED: Shared ownership daemon startup
 async fn start_daemon(app_handle: tauri::AppHandle) -> Result<(), Box<dyn std::error::Error>> {
-    info!("🔧 Starting background daemon with simplified architecture...");
+    info!("🔧 Starting background daemon with shared ownership architecture...");
 
     let state: tauri::State<AppState> = app_handle.state();
 
@@ -957,34 +958,29 @@ async fn start_daemon(app_handle: tauri::AppHandle) -> Result<(), Box<dyn std::e
         settings_lock.clone()
     };
 
-    // Create and start the daemon
-    let daemon = FileshareDaemon::new(settings)
-        .await
-        .map_err(|e| format!("Failed to create daemon: {}", e))?;
+    // Create the daemon wrapped in Arc for shared ownership
+    let daemon = Arc::new(
+        FileshareDaemon::new(settings)
+            .await
+            .map_err(|e| format!("Failed to create daemon: {}", e))?,
+    );
 
-    // Store daemon reference
+    info!("✅ Daemon created successfully");
+
+    // Store daemon reference for UI access
     {
         let mut daemon_ref = state.daemon_ref.lock().await;
-        *daemon_ref = Some(Arc::new(daemon));
+        *daemon_ref = Some(daemon.clone());
     }
 
-    info!("✅ Daemon created and stored");
+    info!("✅ Daemon reference stored for UI access");
 
-    // Start the daemon
-    let daemon_ref = {
-        let daemon_ref = state.daemon_ref.lock().await;
-        daemon_ref.as_ref().unwrap().clone()
-    };
+    // Start background services using shared ownership
+    daemon
+        .start_background_services()
+        .await
+        .map_err(|e| format!("Failed to start background services: {}", e))?;
 
-    // Clone the daemon to run it (since run() takes ownership)
-    let daemon_clone = Arc::try_unwrap(daemon_ref).map_err(|_| "Failed to unwrap daemon Arc")?;
-
-    tokio::spawn(async move {
-        if let Err(e) = daemon_clone.run().await {
-            error!("❌ Daemon run error: {}", e);
-        }
-    });
-
-    info!("✅ Background daemon started successfully with simplified architecture");
+    info!("✅ Background daemon started successfully with shared ownership");
     Ok(())
 }

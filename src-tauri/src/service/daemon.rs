@@ -55,12 +55,69 @@ impl FileshareDaemon {
         })
     }
 
-    // Method to get discovered devices
+    // Method to get discovered devices (for UI access)
     pub async fn get_discovered_devices(&self) -> Vec<crate::network::discovery::DeviceInfo> {
         let pm = self.peer_manager.read().await;
         pm.get_all_discovered_devices().await
     }
 
+    // NEW: Start background services without taking ownership (for Tauri)
+    pub async fn start_background_services(self: Arc<Self>) -> Result<()> {
+        info!("🚀 Starting Fileshare Daemon background services...");
+        info!("📱 Device ID: {}", self.settings.device.id);
+        info!("🏷️ Device Name: {}", self.settings.device.name);
+        info!("🌐 Listening on port: {}", self.settings.network.port);
+
+        // Start hotkey manager
+        info!("🎹 Initializing hotkey system...");
+        let daemon_for_hotkeys = self.clone();
+        tokio::spawn(async move {
+            let mut hotkey_manager = daemon_for_hotkeys.hotkey_manager.clone();
+            if let Err(e) = hotkey_manager.start().await {
+                error!("❌ Failed to start hotkey manager: {}", e);
+            } else {
+                info!("✅ Hotkey manager started successfully");
+
+                // Start hotkey event handler
+                let peer_manager = daemon_for_hotkeys.peer_manager.clone();
+                let clipboard = daemon_for_hotkeys.clipboard.clone();
+                Self::handle_hotkey_events(&mut hotkey_manager, peer_manager, clipboard).await;
+            }
+        });
+
+        // Start discovery service
+        if let Some(discovery) = &self.discovery {
+            let mut discovery_clone = discovery.clone();
+            tokio::spawn(async move {
+                info!("🔍 Starting discovery service...");
+                if let Err(e) = discovery_clone.run().await {
+                    error!("❌ Discovery service error: {}", e);
+                } else {
+                    info!("✅ Discovery service started successfully");
+                }
+            });
+        } else {
+            error!("❌ Discovery service not available");
+            return Err(crate::FileshareError::Unknown(
+                "Discovery service not available".to_string(),
+            ));
+        }
+
+        // Start peer manager
+        let peer_manager = self.peer_manager.clone();
+        let settings = self.settings.clone();
+        let clipboard = self.clipboard.clone();
+        tokio::spawn(async move {
+            if let Err(e) = Self::run_peer_manager(peer_manager, settings, clipboard).await {
+                error!("❌ Peer manager error: {}", e);
+            }
+        });
+
+        info!("✅ All background services started successfully");
+        Ok(())
+    }
+
+    // Keep the existing run method for non-Tauri usage (takes ownership)
     pub async fn run(mut self) -> Result<()> {
         info!("🚀 Starting Fileshare Daemon...");
         info!("📱 Device ID: {}", self.settings.device.id);
