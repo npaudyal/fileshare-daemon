@@ -1,14 +1,13 @@
 use crate::{config::Settings, network::protocol::*, FileshareError, Result};
 use std::collections::HashMap;
-use std::fs::File;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
-// Add this new type for sending messages to peers
-pub type MessageSender = mpsc::UnboundedSender<(Uuid, Message)>;
+// Direct sender to peer connections (bypasses message loop)
+pub type DirectPeerSender = Arc<dyn Fn(Uuid, Message) -> Result<()> + Send + Sync>;
 
 #[derive(Debug)]
 pub struct FileTransfer {
@@ -20,8 +19,8 @@ pub struct FileTransfer {
     pub status: TransferStatus,
     pub bytes_transferred: u64,
     pub chunks_received: Vec<bool>,
-    pub file_handle: Option<File>,
-    pub received_data: Vec<u8>, // NEW: Store all received data in memory first
+    pub file_handle: Option<std::fs::File>,
+    pub received_data: Vec<u8>,
 }
 
 #[derive(Debug, Clone)]
@@ -43,7 +42,7 @@ pub enum TransferStatus {
 pub struct FileTransferManager {
     settings: Arc<Settings>,
     active_transfers: HashMap<Uuid, FileTransfer>,
-    message_sender: Option<MessageSender>,
+    direct_sender: Option<DirectPeerSender>,
 }
 
 impl FileTransferManager {
@@ -51,8 +50,13 @@ impl FileTransferManager {
         Ok(Self {
             settings,
             active_transfers: HashMap::new(),
-            message_sender: None,
+            direct_sender: None,
         })
+    }
+
+    // Set the direct sender to peer connections
+    pub fn set_direct_sender(&mut self, sender: DirectPeerSender) {
+        self.direct_sender = Some(sender);
     }
 
     pub async fn send_file_with_target_dir(
@@ -78,7 +82,7 @@ impl FileTransferManager {
             ));
         }
 
-        let metadata = FileMetadata::from_path(&file_path)?.with_target_dir(target_dir); // ADD target_dir here
+        let metadata = FileMetadata::from_path(&file_path)?.with_target_dir(target_dir);
         let transfer_id = Uuid::new_v4();
 
         info!(
@@ -107,42 +111,36 @@ impl FileTransferManager {
             transfer_id, peer_id
         );
 
-        if let Some(ref sender) = self.message_sender {
+        // Send FileOffer DIRECTLY to peer (bypass message loop)
+        if let Some(ref sender) = self.direct_sender {
             let file_offer = Message::new(MessageType::FileOffer {
                 transfer_id,
                 metadata: metadata.clone(),
             });
 
             info!(
-                "🚀 SEND_FILE: About to send FileOffer {} to peer {}",
+                "🚀 SEND_FILE: Sending FileOffer {} DIRECTLY to peer {}",
                 transfer_id, peer_id
             );
 
-            if let Err(e) = sender.send((peer_id, file_offer)) {
-                error!("Failed to send file offer: {}", e);
+            if let Err(e) = sender(peer_id, file_offer) {
+                error!("Failed to send file offer directly: {}", e);
                 self.active_transfers.remove(&transfer_id);
-                return Err(FileshareError::Transfer(format!(
-                    "Failed to send file offer: {}",
-                    e
-                )));
+                return Err(e);
             }
 
             info!(
-                "🚀 SEND_FILE: FileOffer {} sent to message channel for peer {}",
+                "🚀 SEND_FILE: FileOffer {} sent DIRECTLY to peer {}",
                 transfer_id, peer_id
             );
         } else {
             self.active_transfers.remove(&transfer_id);
             return Err(FileshareError::Transfer(
-                "Message sender not configured".to_string(),
+                "Direct sender not configured".to_string(),
             ));
         }
 
         Ok(())
-    }
-
-    pub fn set_message_sender(&mut self, sender: MessageSender) {
-        self.message_sender = Some(sender);
     }
 
     pub async fn send_file(&mut self, peer_id: Uuid, file_path: PathBuf) -> Result<()> {
@@ -216,14 +214,14 @@ impl FileTransferManager {
             )
         };
 
-        let message_sender = self
-            .message_sender
+        let direct_sender = self
+            .direct_sender
             .clone()
-            .ok_or_else(|| FileshareError::Transfer("Message sender not configured".to_string()))?;
+            .ok_or_else(|| FileshareError::Transfer("Direct sender not configured".to_string()))?;
 
         tokio::spawn(async move {
             if let Err(e) =
-                Self::send_file_chunks(message_sender, peer_id, transfer_id, file_path, chunk_size)
+                Self::send_file_chunks(direct_sender, peer_id, transfer_id, file_path, chunk_size)
                     .await
             {
                 error!("Failed to send file chunks: {}", e);
@@ -234,7 +232,7 @@ impl FileTransferManager {
     }
 
     async fn send_file_chunks(
-        message_sender: MessageSender,
+        direct_sender: DirectPeerSender,
         peer_id: Uuid,
         transfer_id: Uuid,
         file_path: PathBuf,
@@ -248,17 +246,13 @@ impl FileTransferManager {
         );
         info!("Reading file: {:?}", file_path);
 
-        // FIXED: Read the entire file into memory first, then send chunks
+        // Read the entire file into memory first, then send chunks
         let file_data = std::fs::read(&file_path).map_err(|e| {
             error!("Failed to read file {:?}: {}", file_path, e);
             FileshareError::FileOperation(format!("Failed to read file: {}", e))
         })?;
 
         info!("File size: {} bytes", file_data.len());
-        info!(
-            "File content preview: {:?}",
-            String::from_utf8_lossy(&file_data[..std::cmp::min(50, file_data.len())])
-        );
 
         let mut hasher = Sha256::new();
         hasher.update(&file_data);
@@ -282,15 +276,6 @@ impl FileTransferManager {
                 is_last
             );
 
-            // DEBUG: Show actual content being sent
-            let content_preview = String::from_utf8_lossy(&chunk_data);
-            info!("Chunk {} content: '{}'", chunk_index, content_preview);
-            info!(
-                "Chunk {} raw bytes: {:?}",
-                chunk_index,
-                &chunk_data[..std::cmp::min(20, chunk_data.len())]
-            );
-
             let chunk = TransferChunk {
                 index: chunk_index,
                 data: chunk_data,
@@ -299,17 +284,15 @@ impl FileTransferManager {
 
             let message = Message::new(MessageType::FileChunk { transfer_id, chunk });
 
-            if let Err(e) = message_sender.send((peer_id, message)) {
-                error!("Failed to send chunk {}: {}", chunk_index, e);
+            // Send chunk DIRECTLY to peer
+            if let Err(e) = direct_sender(peer_id, message) {
+                error!("Failed to send chunk {} directly: {}", chunk_index, e);
                 let error_msg = Message::new(MessageType::TransferError {
                     transfer_id,
                     error: format!("Failed to send chunk: {}", e),
                 });
-                let _ = message_sender.send((peer_id, error_msg));
-                return Err(FileshareError::Transfer(format!(
-                    "Failed to send chunk: {}",
-                    e
-                )));
+                let _ = direct_sender(peer_id, error_msg);
+                return Err(e);
             }
 
             bytes_sent = chunk_end;
@@ -319,7 +302,7 @@ impl FileTransferManager {
             tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
         }
 
-        // Send completion message
+        // Send completion message DIRECTLY
         let checksum = format!("{:x}", hasher.finalize());
         info!(
             "File transfer complete. Total bytes sent: {}, Checksum: {}",
@@ -331,8 +314,8 @@ impl FileTransferManager {
             checksum,
         });
 
-        if let Err(e) = message_sender.send((peer_id, complete_msg)) {
-            error!("Failed to send transfer complete: {}", e);
+        if let Err(e) = direct_sender(peer_id, complete_msg) {
+            error!("Failed to send transfer complete directly: {}", e);
         } else {
             info!("File transfer {} completed successfully", transfer_id);
         }
@@ -354,7 +337,7 @@ impl FileTransferManager {
         // USE target directory from metadata
         let save_path = self.get_save_path(&metadata.name, metadata.target_dir.as_deref())?;
 
-        // FIXED: Initialize received_data buffer with the expected size
+        // Initialize received_data buffer with the expected size
         let received_data = vec![0u8; metadata.size as usize];
 
         let transfer = FileTransfer {
@@ -411,8 +394,6 @@ impl FileTransferManager {
         Ok(())
     }
 
-    // In file_transfer.rs, replace the handle_file_chunk method:
-
     pub async fn handle_file_chunk(
         &mut self,
         peer_id: Uuid,
@@ -443,18 +424,6 @@ impl FileTransferManager {
             return Ok(());
         }
 
-        // DEBUG: Show what we're receiving
-        let content_preview = String::from_utf8_lossy(&chunk.data);
-        info!(
-            "Received chunk {} content: '{}'",
-            chunk.index, content_preview
-        );
-        info!(
-            "Received chunk {} raw bytes: {:?}",
-            chunk.index,
-            &chunk.data[..std::cmp::min(20, chunk.data.len())]
-        );
-
         let is_complete = {
             let transfer = self.active_transfers.get_mut(&transfer_id).unwrap();
 
@@ -468,7 +437,7 @@ impl FileTransferManager {
                 return Err(FileshareError::Transfer("Transfer not active".to_string()));
             }
 
-            // FIXED: Write chunk data directly to the received_data buffer
+            // Write chunk data directly to the received_data buffer
             let chunk_size = self.settings.transfer.chunk_size as u64;
             let offset = chunk.index * chunk_size;
             let end_offset = offset + chunk.data.len() as u64;
@@ -519,13 +488,13 @@ impl FileTransferManager {
             info!("Transfer {} is complete, finalizing...", transfer_id);
             self.complete_file_transfer(transfer_id).await?;
         } else {
-            // Send acknowledgment
-            if let Some(ref sender) = self.message_sender {
+            // Send acknowledgment DIRECTLY to peer
+            if let Some(ref sender) = self.direct_sender {
                 let ack = Message::new(MessageType::FileChunkAck {
                     transfer_id,
                     chunk_index: chunk.index,
                 });
-                let _ = sender.send((peer_id, ack));
+                let _ = sender(peer_id, ack);
             }
         }
 
@@ -551,39 +520,13 @@ impl FileTransferManager {
         info!("Writing complete file to: {:?}", file_path);
         info!("File data size: {} bytes", file_data.len());
 
-        // DEBUG: Show what we're about to write
-        let content_preview = String::from_utf8_lossy(&file_data);
-        info!(
-            "Complete file content preview: '{}'",
-            &content_preview[..std::cmp::min(100, content_preview.len())]
-        );
-
-        // FIXED: Write the complete file data at once
+        // Write the complete file data at once
         std::fs::write(&file_path, &file_data).map_err(|e| {
             error!("Failed to write file {:?}: {}", file_path, e);
             FileshareError::FileOperation(format!("Failed to write file: {}", e))
         })?;
 
         info!("File written successfully to: {:?}", file_path);
-
-        // Verify the file was written correctly
-        let written_data = std::fs::read(&file_path).map_err(|e| {
-            error!("Failed to read back written file: {}", e);
-            FileshareError::FileOperation(format!("Failed to verify written file: {}", e))
-        })?;
-
-        let written_content = String::from_utf8_lossy(&written_data);
-        info!(
-            "Verification - written file content: '{}'",
-            &written_content[..std::cmp::min(100, written_content.len())]
-        );
-
-        if written_data != file_data {
-            error!("File verification failed - data mismatch!");
-            return Err(FileshareError::Transfer(
-                "File verification failed".to_string(),
-            ));
-        }
 
         // Verify checksum if provided
         if !expected_checksum.is_empty() {
@@ -700,7 +643,6 @@ impl FileTransferManager {
         Ok(save_path)
     }
 
-    // ADD helper method for default save directory
     fn get_default_save_dir(&self) -> PathBuf {
         if let Some(ref temp_dir) = self.settings.transfer.temp_dir {
             temp_dir.clone()
@@ -769,19 +711,5 @@ impl FileTransferManager {
 
     pub fn has_transfer(&self, transfer_id: Uuid) -> bool {
         self.active_transfers.contains_key(&transfer_id)
-    }
-
-    pub fn debug_active_transfers(&self) {
-        info!("=== ACTIVE TRANSFERS DEBUG ===");
-        for (transfer_id, transfer) in &self.active_transfers {
-            info!(
-                "Transfer {}: {:?} -> {:?} (Status: {:?})",
-                transfer_id,
-                transfer.direction,
-                transfer.file_path.file_name().unwrap_or_default(),
-                transfer.status
-            );
-        }
-        info!("=== END TRANSFERS DEBUG ===");
     }
 }

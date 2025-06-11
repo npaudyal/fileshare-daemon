@@ -26,7 +26,12 @@ impl FileshareDaemon {
         let (shutdown_tx, shutdown_rx) = broadcast::channel(1);
 
         // Initialize peer manager
-        let peer_manager = Arc::new(RwLock::new(PeerManager::new(settings.clone()).await?));
+        let mut peer_manager = PeerManager::new(settings.clone()).await?;
+
+        // Set up direct sender for file transfers
+        peer_manager.initialize_file_transfer_sender().await;
+
+        let peer_manager = Arc::new(RwLock::new(peer_manager));
 
         // Initialize discovery service
         let discovery = DiscoveryService::new(
@@ -347,7 +352,7 @@ impl FileshareDaemon {
             }
         });
 
-        // CRITICAL FIX: Simple message processing like the working CLI version
+        // SIMPLIFIED: Process ALL messages the same way (no dual routing)
         let message_pm = peer_manager.clone();
         let message_clipboard = clipboard.clone();
         let message_handle = tokio::spawn(async move {
@@ -357,7 +362,7 @@ impl FileshareDaemon {
 
                 let mut pm = message_pm.write().await;
 
-                // SIMPLE: Process ALL messages the same way (like working version)
+                // Simple message processing - all messages go through handle_message
                 while let Ok((peer_id, message)) = pm.message_rx.try_recv() {
                     if let Err(e) = pm
                         .handle_message(peer_id, message, &message_clipboard)
