@@ -20,9 +20,10 @@ pub struct FileTransfer {
     pub direction: TransferDirection,
     pub status: TransferStatus,
     pub bytes_transferred: u64,
+    pub total_chunks: u64,
     pub chunks_received: Vec<bool>,
     pub file_handle: Option<File>,
-    pub received_data: Vec<u8>, // NEW: Store all received data in memory first
+    pub received_chunks: HashMap<u64, Vec<u8>>, // FIXED: Use HashMap to handle out-of-order chunks
 }
 
 #[derive(Debug, Clone)]
@@ -79,13 +80,17 @@ impl FileTransferManager {
             ));
         }
 
-        let metadata = FileMetadata::from_path(&file_path)?.with_target_dir(target_dir); // ADD target_dir here
+        let metadata = FileMetadata::from_path(&file_path)?.with_target_dir(target_dir);
         let transfer_id = Uuid::new_v4();
 
         info!(
             "🚀 SEND_FILE: Created transfer {} for peer {}, file size: {} bytes",
             transfer_id, peer_id, metadata.size
         );
+
+        // Calculate total chunks
+        let chunk_size = self.settings.transfer.chunk_size as u64;
+        let total_chunks = (metadata.size + chunk_size - 1) / chunk_size;
 
         // Create and store the transfer BEFORE sending the offer
         let transfer = FileTransfer {
@@ -96,16 +101,17 @@ impl FileTransferManager {
             direction: TransferDirection::Outgoing,
             status: TransferStatus::Pending,
             bytes_transferred: 0,
-            chunks_received: Vec::new(),
+            total_chunks,
+            chunks_received: vec![false; total_chunks as usize],
             file_handle: None,
-            received_data: Vec::new(),
+            received_chunks: HashMap::new(),
         };
 
         // Store the transfer first
         self.active_transfers.insert(transfer_id, transfer);
         info!(
-            "🚀 SEND_FILE: Registered outgoing transfer {} for peer {}",
-            transfer_id, peer_id
+            "🚀 SEND_FILE: Registered outgoing transfer {} for peer {} ({} chunks)",
+            transfer_id, peer_id, total_chunks
         );
 
         if let Some(ref sender) = self.message_sender {
@@ -249,7 +255,7 @@ impl FileTransferManager {
         );
         info!("Reading file: {:?}", file_path);
 
-        // FIXED: Read the entire file into memory first, then send chunks
+        // Read the entire file into memory first
         let file_data = std::fs::read(&file_path).map_err(|e| {
             error!("Failed to read file {:?}: {}", file_path, e);
             FileshareError::FileOperation(format!("Failed to read file: {}", e))
@@ -257,7 +263,7 @@ impl FileTransferManager {
 
         info!("File size: {} bytes", file_data.len());
         info!(
-            "File content preview: {:?}",
+            "First 50 bytes: {:?}",
             String::from_utf8_lossy(&file_data[..std::cmp::min(50, file_data.len())])
         );
 
@@ -266,6 +272,12 @@ impl FileTransferManager {
 
         let mut chunk_index = 0u64;
         let mut bytes_sent = 0;
+        let total_chunks = (file_data.len() + chunk_size - 1) / chunk_size;
+
+        info!(
+            "Sending {} chunks of max {} bytes each",
+            total_chunks, chunk_size
+        );
 
         // Send file in chunks
         while bytes_sent < file_data.len() {
@@ -275,21 +287,21 @@ impl FileTransferManager {
             let is_last = chunk_end >= file_data.len();
 
             info!(
-                "Sending chunk {}: bytes {}-{} ({} bytes, is_last: {})",
-                chunk_index,
+                "Sending chunk {}/{}: bytes {}-{} ({} bytes, is_last: {})",
+                chunk_index + 1,
+                total_chunks,
                 chunk_start,
                 chunk_end - 1,
                 chunk_data.len(),
                 is_last
             );
 
-            // DEBUG: Show actual content being sent
-            let content_preview = String::from_utf8_lossy(&chunk_data);
-            info!("Chunk {} content: '{}'", chunk_index, content_preview);
+            // Verify chunk content
+            let content_preview =
+                String::from_utf8_lossy(&chunk_data[..std::cmp::min(20, chunk_data.len())]);
             info!(
-                "Chunk {} raw bytes: {:?}",
-                chunk_index,
-                &chunk_data[..std::cmp::min(20, chunk_data.len())]
+                "Chunk {} content preview: '{}'",
+                chunk_index, content_preview
             );
 
             let chunk = TransferChunk {
@@ -323,8 +335,8 @@ impl FileTransferManager {
         // Send completion message
         let checksum = format!("{:x}", hasher.finalize());
         info!(
-            "File transfer complete. Total bytes sent: {}, Checksum: {}",
-            bytes_sent, checksum
+            "File transfer complete. Total bytes sent: {}, Total chunks: {}, Checksum: {}",
+            bytes_sent, chunk_index, checksum
         );
 
         let complete_msg = Message::new(MessageType::TransferComplete {
@@ -352,11 +364,21 @@ impl FileTransferManager {
             peer_id, metadata.name, metadata.size
         );
 
-        // USE target directory from metadata
+        // Use target directory from metadata
         let save_path = self.get_save_path(&metadata.name, metadata.target_dir.as_deref())?;
 
-        // FIXED: Initialize received_data buffer with the expected size
-        let received_data = vec![0u8; metadata.size as usize];
+        // Calculate total chunks for this file
+        let chunk_size = self.settings.transfer.chunk_size as u64;
+        let total_chunks = if metadata.size == 0 {
+            1
+        } else {
+            (metadata.size + chunk_size - 1) / chunk_size
+        };
+
+        info!(
+            "Expecting {} chunks for file {} (size: {} bytes, chunk_size: {})",
+            total_chunks, metadata.name, metadata.size, chunk_size
+        );
 
         let transfer = FileTransfer {
             id: transfer_id,
@@ -366,14 +388,10 @@ impl FileTransferManager {
             direction: TransferDirection::Incoming,
             status: TransferStatus::Pending,
             bytes_transferred: 0,
-            chunks_received: vec![
-                false;
-                ((metadata.size + self.settings.transfer.chunk_size as u64 - 1)
-                    / self.settings.transfer.chunk_size as u64)
-                    as usize
-            ],
+            total_chunks,
+            chunks_received: vec![false; total_chunks as usize],
             file_handle: None,
-            received_data,
+            received_chunks: HashMap::new(), // Use HashMap for out-of-order chunks
         };
 
         self.active_transfers.insert(transfer_id, transfer);
@@ -412,8 +430,7 @@ impl FileTransferManager {
         Ok(())
     }
 
-    // In file_transfer.rs, replace the handle_file_chunk method:
-
+    // COMPLETELY REWRITTEN: Handle file chunks with proper ordering and assembly
     pub async fn handle_file_chunk(
         &mut self,
         peer_id: Uuid,
@@ -434,9 +451,9 @@ impl FileTransferManager {
             // Only process chunks for INCOMING transfers
             if !matches!(transfer.direction, TransferDirection::Incoming) {
                 warn!(
-                "Ignoring chunk {} for outgoing transfer {} - chunks should only be processed for incoming transfers",
-                chunk.index, transfer_id
-            );
+                    "Ignoring chunk {} for outgoing transfer {} - chunks should only be processed for incoming transfers",
+                    chunk.index, transfer_id
+                );
                 return Ok(());
             }
         } else {
@@ -444,16 +461,12 @@ impl FileTransferManager {
             return Ok(());
         }
 
-        // DEBUG: Show what we're receiving
-        let content_preview = String::from_utf8_lossy(&chunk.data);
+        // Verify chunk content
+        let content_preview =
+            String::from_utf8_lossy(&chunk.data[..std::cmp::min(20, chunk.data.len())]);
         info!(
-            "Received chunk {} content: '{}'",
+            "Received chunk {} content preview: '{}'",
             chunk.index, content_preview
-        );
-        info!(
-            "Received chunk {} raw bytes: {:?}",
-            chunk.index,
-            &chunk.data[..std::cmp::min(20, chunk.data.len())]
         );
 
         let is_complete = {
@@ -469,55 +482,39 @@ impl FileTransferManager {
                 return Err(FileshareError::Transfer("Transfer not active".to_string()));
             }
 
-            // FIXED: Write chunk data directly to the received_data buffer
-            let chunk_size = self.settings.transfer.chunk_size as u64;
-            let offset = chunk.index * chunk_size;
-            let end_offset = offset + chunk.data.len() as u64;
-
-            if end_offset > transfer.received_data.len() as u64 {
+            // Validate chunk index
+            if chunk.index >= transfer.total_chunks {
                 error!(
-                    "Chunk {} extends beyond expected file size. Expected: {}, Got end_offset: {}",
-                    chunk.index,
-                    transfer.received_data.len(),
-                    end_offset
+                    "Chunk index {} exceeds total chunks {} for transfer {}",
+                    chunk.index, transfer.total_chunks, transfer_id
                 );
-                return Err(FileshareError::Transfer("Chunk too large".to_string()));
+                return Err(FileshareError::Transfer("Invalid chunk index".to_string()));
             }
 
-            // Copy chunk data directly into the buffer
-            let start_idx = offset as usize;
-            let end_idx = end_offset as usize;
-            transfer.received_data[start_idx..end_idx].copy_from_slice(&chunk.data);
-
-            info!(
-                "Copied chunk {} to buffer at offset {} (length: {})",
-                chunk.index,
-                offset,
-                chunk.data.len()
-            );
+            // Store chunk data in HashMap (handles out-of-order delivery)
+            transfer.received_chunks.insert(chunk.index, chunk.data);
 
             // Mark chunk as received
-            if chunk.index < transfer.chunks_received.len() as u64 {
+            if (chunk.index as usize) < transfer.chunks_received.len() {
                 transfer.chunks_received[chunk.index as usize] = true;
-                transfer.bytes_transferred += chunk.data.len() as u64;
 
                 let chunks_received_count = transfer.chunks_received.iter().filter(|&&x| x).count();
                 info!(
-                    "Chunk {} marked as received for transfer {} ({}/{} chunks, {} bytes total)",
-                    chunk.index,
-                    transfer_id,
-                    chunks_received_count,
-                    transfer.chunks_received.len(),
-                    transfer.bytes_transferred
+                    "Chunk {} stored for transfer {} ({}/{} chunks received)",
+                    chunk.index, transfer_id, chunks_received_count, transfer.total_chunks
                 );
             }
 
-            // Check if transfer is complete
-            chunk.is_last || transfer.chunks_received.iter().all(|&received| received)
+            // Check if transfer is complete (either is_last flag OR all chunks received)
+            let all_chunks_received = transfer.chunks_received.iter().all(|&received| received);
+            chunk.is_last || all_chunks_received
         };
 
         if is_complete {
-            info!("Transfer {} is complete, finalizing...", transfer_id);
+            info!(
+                "Transfer {} is complete, assembling and writing file...",
+                transfer_id
+            );
             self.complete_file_transfer(transfer_id).await?;
         } else {
             // Send acknowledgment
@@ -533,8 +530,9 @@ impl FileTransferManager {
         Ok(())
     }
 
+    // COMPLETELY REWRITTEN: Assemble chunks in correct order and write file
     async fn complete_file_transfer(&mut self, transfer_id: Uuid) -> Result<()> {
-        let (file_path, expected_checksum, file_data) = {
+        let (file_path, expected_checksum, metadata, received_chunks, total_chunks) = {
             let transfer = self
                 .active_transfers
                 .get_mut(&transfer_id)
@@ -545,21 +543,62 @@ impl FileTransferManager {
             (
                 transfer.file_path.clone(),
                 transfer.metadata.checksum.clone(),
-                transfer.received_data.clone(),
+                transfer.metadata.clone(),
+                transfer.received_chunks.clone(),
+                transfer.total_chunks,
             )
         };
 
-        info!("Writing complete file to: {:?}", file_path);
-        info!("File data size: {} bytes", file_data.len());
-
-        // DEBUG: Show what we're about to write
-        let content_preview = String::from_utf8_lossy(&file_data);
         info!(
-            "Complete file content preview: '{}'",
-            &content_preview[..std::cmp::min(100, content_preview.len())]
+            "Assembling file from {} chunks for transfer {}",
+            total_chunks, transfer_id
         );
 
-        // FIXED: Write the complete file data at once
+        // Assemble chunks in correct order
+        let mut file_data = Vec::new();
+        let mut expected_size = 0;
+
+        for chunk_index in 0..total_chunks {
+            if let Some(chunk_data) = received_chunks.get(&chunk_index) {
+                info!(
+                    "Assembling chunk {} ({} bytes)",
+                    chunk_index,
+                    chunk_data.len()
+                );
+                file_data.extend_from_slice(chunk_data);
+                expected_size += chunk_data.len();
+            } else {
+                error!("Missing chunk {} for transfer {}", chunk_index, transfer_id);
+                return Err(FileshareError::Transfer(format!(
+                    "Missing chunk {} - transfer incomplete",
+                    chunk_index
+                )));
+            }
+        }
+
+        info!("Assembled file: {} bytes total", file_data.len());
+
+        // Verify assembled size matches expected
+        if file_data.len() != metadata.size as usize {
+            error!(
+                "Assembled file size {} doesn't match expected size {} for transfer {}",
+                file_data.len(),
+                metadata.size,
+                transfer_id
+            );
+            return Err(FileshareError::Transfer(
+                "File size mismatch - transfer corrupted".to_string(),
+            ));
+        }
+
+        // Show content preview
+        let content_preview =
+            String::from_utf8_lossy(&file_data[..std::cmp::min(100, file_data.len())]);
+        info!("Assembled file content preview: '{}'", content_preview);
+
+        info!("Writing complete file to: {:?}", file_path);
+
+        // Write the complete file data
         std::fs::write(&file_path, &file_data).map_err(|e| {
             error!("Failed to write file {:?}: {}", file_path, e);
             FileshareError::FileOperation(format!("Failed to write file: {}", e))
@@ -573,18 +612,25 @@ impl FileTransferManager {
             FileshareError::FileOperation(format!("Failed to verify written file: {}", e))
         })?;
 
-        let written_content = String::from_utf8_lossy(&written_data);
-        info!(
-            "Verification - written file content: '{}'",
-            &written_content[..std::cmp::min(100, written_content.len())]
-        );
-
-        if written_data != file_data {
-            error!("File verification failed - data mismatch!");
+        if written_data.len() != file_data.len() {
+            error!(
+                "Written file size mismatch! Expected: {}, Got: {}",
+                file_data.len(),
+                written_data.len()
+            );
             return Err(FileshareError::Transfer(
-                "File verification failed".to_string(),
+                "File write verification failed - size mismatch".to_string(),
             ));
         }
+
+        if written_data != file_data {
+            error!("Written file content mismatch!");
+            return Err(FileshareError::Transfer(
+                "File write verification failed - content mismatch".to_string(),
+            ));
+        }
+
+        info!("File write verification successful!");
 
         // Verify checksum if provided
         if !expected_checksum.is_empty() {
@@ -607,8 +653,10 @@ impl FileTransferManager {
         }
 
         info!(
-            "File transfer {} completed successfully: {:?}",
-            transfer_id, file_path
+            "File transfer {} completed successfully: {:?} ({} bytes)",
+            transfer_id,
+            file_path,
+            file_data.len()
         );
 
         if let Some(transfer) = self.active_transfers.get(&transfer_id) {
@@ -701,7 +749,6 @@ impl FileTransferManager {
         Ok(save_path)
     }
 
-    // ADD helper method for default save directory
     fn get_default_save_dir(&self) -> PathBuf {
         if let Some(ref temp_dir) = self.settings.transfer.temp_dir {
             temp_dir.clone()
@@ -757,7 +804,8 @@ impl FileTransferManager {
             if transfer.metadata.size == 0 {
                 1.0
             } else {
-                transfer.bytes_transferred as f32 / transfer.metadata.size as f32
+                let chunks_received = transfer.chunks_received.iter().filter(|&&x| x).count();
+                chunks_received as f32 / transfer.total_chunks as f32
             }
         })
     }
