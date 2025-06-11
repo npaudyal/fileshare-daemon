@@ -21,6 +21,7 @@ pub struct FileTransfer {
     pub chunks_received: Vec<bool>,
     pub file_handle: Option<std::fs::File>,
     pub received_data: Vec<u8>,
+    pub created_at: std::time::Instant, // NEW: Track when transfer was created
 }
 
 #[derive(Debug, Clone)]
@@ -59,6 +60,26 @@ impl FileTransferManager {
         self.message_sender = Some(sender);
     }
 
+    // NEW: Clean up stale transfers
+    pub fn cleanup_stale_transfers(&mut self) {
+        let now = std::time::Instant::now();
+        let timeout = std::time::Duration::from_secs(300); // 5 minutes
+
+        let initial_count = self.active_transfers.len();
+        self.active_transfers.retain(|transfer_id, transfer| {
+            let is_stale = now.duration_since(transfer.created_at) > timeout;
+            if is_stale {
+                warn!("🧹 Cleaning up stale transfer: {}", transfer_id);
+            }
+            !is_stale
+        });
+
+        let removed_count = initial_count - self.active_transfers.len();
+        if removed_count > 0 {
+            info!("🧹 Cleaned up {} stale transfers", removed_count);
+        }
+    }
+
     pub async fn send_file_with_target_dir(
         &mut self,
         peer_id: Uuid,
@@ -69,6 +90,9 @@ impl FileTransferManager {
             "🚀 SEND_FILE: Starting file transfer to {}: {:?} (target_dir: {:?})",
             peer_id, file_path, target_dir
         );
+
+        // Clean up stale transfers first
+        self.cleanup_stale_transfers();
 
         if !file_path.exists() {
             return Err(FileshareError::FileOperation(
@@ -90,6 +114,28 @@ impl FileTransferManager {
             transfer_id, peer_id, metadata.size
         );
 
+        // FIXED: Check for existing transfer with same file to same peer
+        for (existing_id, existing_transfer) in &self.active_transfers {
+            if existing_transfer.peer_id == peer_id
+                && existing_transfer.file_path == file_path
+                && matches!(existing_transfer.direction, TransferDirection::Outgoing)
+                && !matches!(
+                    existing_transfer.status,
+                    TransferStatus::Completed
+                        | TransferStatus::Error(_)
+                        | TransferStatus::Cancelled
+                )
+            {
+                warn!(
+                    "🚫 Transfer already in progress for this file to this peer: {}",
+                    existing_id
+                );
+                return Err(FileshareError::Transfer(
+                    "Transfer already in progress for this file".to_string(),
+                ));
+            }
+        }
+
         // Create and store the transfer BEFORE sending the offer
         let transfer = FileTransfer {
             id: transfer_id,
@@ -102,6 +148,7 @@ impl FileTransferManager {
             chunks_received: Vec::new(),
             file_handle: None,
             received_data: Vec::new(),
+            created_at: std::time::Instant::now(), // NEW: Track creation time
         };
 
         // Store the transfer first
@@ -244,10 +291,10 @@ impl FileTransferManager {
         use sha2::{Digest, Sha256};
 
         info!(
-            "Starting to send file chunks for transfer {} to peer {}",
+            "🚀 CHUNK_SENDER: Starting to send file chunks for transfer {} to peer {}",
             transfer_id, peer_id
         );
-        info!("Reading file: {:?}", file_path);
+        info!("📄 Reading file: {:?}", file_path);
 
         // Read the entire file into memory first, then send chunks
         let file_data = std::fs::read(&file_path).map_err(|e| {
@@ -255,7 +302,15 @@ impl FileTransferManager {
             FileshareError::FileOperation(format!("Failed to read file: {}", e))
         })?;
 
-        info!("File size: {} bytes", file_data.len());
+        info!(
+            "📊 File size: {} bytes, chunk size: {} bytes",
+            file_data.len(),
+            chunk_size
+        );
+
+        // Calculate expected number of chunks
+        let expected_chunks = (file_data.len() + chunk_size - 1) / chunk_size;
+        info!("📦 Expected chunks: {}", expected_chunks);
 
         let mut hasher = Sha256::new();
         hasher.update(&file_data);
@@ -271,12 +326,8 @@ impl FileTransferManager {
             let is_last = chunk_end >= file_data.len();
 
             info!(
-                "Sending chunk {}: bytes {}-{} ({} bytes, is_last: {})",
-                chunk_index,
-                chunk_start,
-                chunk_end - 1,
-                chunk_data.len(),
-                is_last
+                "📤 CHUNK_SENDER: Sending chunk {} for transfer {}: bytes {}-{} ({} bytes, is_last: {})",
+                chunk_index, transfer_id, chunk_start, chunk_end - 1, chunk_data.len(), is_last
             );
 
             let chunk = TransferChunk {
@@ -289,7 +340,10 @@ impl FileTransferManager {
 
             // Send through normal message channel (not direct)
             if let Err(e) = message_sender.send((peer_id, message)) {
-                error!("Failed to send chunk {}: {}", chunk_index, e);
+                error!(
+                    "❌ CHUNK_SENDER: Failed to send chunk {}: {}",
+                    chunk_index, e
+                );
                 let error_msg = Message::new(MessageType::TransferError {
                     transfer_id,
                     error: format!("Failed to send chunk: {}", e),
@@ -311,8 +365,8 @@ impl FileTransferManager {
         // Send completion message through normal channel
         let checksum = format!("{:x}", hasher.finalize());
         info!(
-            "File transfer complete. Total bytes sent: {}, Checksum: {}",
-            bytes_sent, checksum
+            "✅ CHUNK_SENDER: File transfer complete for {}. Total bytes sent: {}, Total chunks: {}, Checksum: {}",
+            transfer_id, bytes_sent, chunk_index, checksum
         );
 
         let complete_msg = Message::new(MessageType::TransferComplete {
@@ -321,9 +375,12 @@ impl FileTransferManager {
         });
 
         if let Err(e) = message_sender.send((peer_id, complete_msg)) {
-            error!("Failed to send transfer complete: {}", e);
+            error!("❌ CHUNK_SENDER: Failed to send transfer complete: {}", e);
         } else {
-            info!("File transfer {} completed successfully", transfer_id);
+            info!(
+                "✅ CHUNK_SENDER: File transfer {} completed successfully",
+                transfer_id
+            );
         }
 
         Ok(())
@@ -336,15 +393,36 @@ impl FileTransferManager {
         metadata: FileMetadata,
     ) -> Result<()> {
         info!(
-            "Received file offer from {}: {} ({} bytes)",
+            "📥 RECEIVER: Received file offer from {}: {} ({} bytes)",
             peer_id, metadata.name, metadata.size
         );
+
+        // Clean up stale transfers first
+        self.cleanup_stale_transfers();
+
+        // FIXED: Check if transfer already exists
+        if self.active_transfers.contains_key(&transfer_id) {
+            warn!(
+                "⚠️ RECEIVER: Transfer {} already exists, ignoring duplicate offer",
+                transfer_id
+            );
+            return Ok(());
+        }
 
         // Use target directory from metadata
         let save_path = self.get_save_path(&metadata.name, metadata.target_dir.as_deref())?;
 
         // Initialize received_data buffer with the expected size
         let received_data = vec![0u8; metadata.size as usize];
+
+        // Calculate expected number of chunks
+        let expected_chunks = ((metadata.size + self.settings.transfer.chunk_size as u64 - 1)
+            / self.settings.transfer.chunk_size as u64) as usize;
+
+        info!(
+            "📦 RECEIVER: Transfer {} expects {} chunks of max {} bytes each",
+            transfer_id, expected_chunks, self.settings.transfer.chunk_size
+        );
 
         let transfer = FileTransfer {
             id: transfer_id,
@@ -354,20 +432,19 @@ impl FileTransferManager {
             direction: TransferDirection::Incoming,
             status: TransferStatus::Pending,
             bytes_transferred: 0,
-            chunks_received: vec![
-                false;
-                ((metadata.size + self.settings.transfer.chunk_size as u64 - 1)
-                    / self.settings.transfer.chunk_size as u64)
-                    as usize
-            ],
+            chunks_received: vec![false; expected_chunks],
             file_handle: None,
             received_data,
+            created_at: std::time::Instant::now(), // NEW: Track creation time
         };
 
         self.active_transfers.insert(transfer_id, transfer);
         self.accept_file_transfer(transfer_id).await?;
 
-        info!("File offer accepted for transfer {}", transfer_id);
+        info!(
+            "✅ RECEIVER: File offer accepted for transfer {}",
+            transfer_id
+        );
         Ok(())
     }
 
@@ -393,7 +470,7 @@ impl FileTransferManager {
         transfer.status = TransferStatus::Active;
 
         info!(
-            "Accepted file transfer {} - will save to {:?}",
+            "✅ RECEIVER: Accepted file transfer {} - will save to {:?}",
             transfer_id, transfer.file_path
         );
 
@@ -407,7 +484,7 @@ impl FileTransferManager {
         chunk: TransferChunk,
     ) -> Result<()> {
         info!(
-            "Received chunk {} for transfer {} ({} bytes, is_last: {})",
+            "📥 RECEIVER: Received chunk {} for transfer {} ({} bytes, is_last: {})",
             chunk.index,
             transfer_id,
             chunk.data.len(),
@@ -420,13 +497,16 @@ impl FileTransferManager {
             // Only process chunks for INCOMING transfers
             if !matches!(transfer.direction, TransferDirection::Incoming) {
                 warn!(
-                "Ignoring chunk {} for outgoing transfer {} - chunks should only be processed for incoming transfers",
-                chunk.index, transfer_id
-            );
+                    "⚠️ RECEIVER: Ignoring chunk {} for outgoing transfer {} - chunks should only be processed for incoming transfers",
+                    chunk.index, transfer_id
+                );
                 return Ok(());
             }
         } else {
-            warn!("Received chunk for unknown transfer {}", transfer_id);
+            warn!(
+                "⚠️ RECEIVER: Received chunk for unknown transfer {}",
+                transfer_id
+            );
             return Ok(());
         }
 
@@ -443,55 +523,79 @@ impl FileTransferManager {
                 return Err(FileshareError::Transfer("Transfer not active".to_string()));
             }
 
-            // Write chunk data directly to the received_data buffer
+            // FIXED: Better chunk validation
             let chunk_size = self.settings.transfer.chunk_size as u64;
-            let offset = chunk.index * chunk_size;
-            let end_offset = offset + chunk.data.len() as u64;
+            let expected_offset = chunk.index * chunk_size;
+            let actual_end_offset = expected_offset + chunk.data.len() as u64;
+            let expected_file_size = transfer.received_data.len() as u64;
 
-            if end_offset > transfer.received_data.len() as u64 {
+            // Enhanced validation with better error messages
+            if chunk.index >= transfer.chunks_received.len() as u64 {
                 error!(
-                    "Chunk {} extends beyond expected file size. Expected: {}, Got end_offset: {}",
-                    chunk.index,
-                    transfer.received_data.len(),
-                    end_offset
+                    "❌ RECEIVER: Chunk index {} out of bounds for transfer {}. Expected chunks: {}, file size: {} bytes",
+                    chunk.index, transfer_id, transfer.chunks_received.len(), expected_file_size
                 );
-                return Err(FileshareError::Transfer("Chunk too large".to_string()));
+                return Err(FileshareError::Transfer(format!(
+                    "Chunk index {} out of bounds (expected max {})",
+                    chunk.index,
+                    transfer.chunks_received.len() - 1
+                )));
+            }
+
+            if actual_end_offset > expected_file_size {
+                error!(
+                    "❌ RECEIVER: Chunk {} extends beyond expected file size for transfer {}",
+                    chunk.index, transfer_id
+                );
+                error!("   Expected file size: {} bytes", expected_file_size);
+                error!(
+                    "   Chunk offset: {} + {} = {} bytes",
+                    expected_offset,
+                    chunk.data.len(),
+                    actual_end_offset
+                );
+                error!("   Chunk size setting: {} bytes", chunk_size);
+                return Err(FileshareError::Transfer(format!(
+                    "Chunk {} too large: offset {} + size {} = {} exceeds file size {}",
+                    chunk.index,
+                    expected_offset,
+                    chunk.data.len(),
+                    actual_end_offset,
+                    expected_file_size
+                )));
             }
 
             // Copy chunk data directly into the buffer
-            let start_idx = offset as usize;
-            let end_idx = end_offset as usize;
+            let start_idx = expected_offset as usize;
+            let end_idx = actual_end_offset as usize;
             transfer.received_data[start_idx..end_idx].copy_from_slice(&chunk.data);
 
             info!(
-                "Copied chunk {} to buffer at offset {} (length: {})",
+                "✅ RECEIVER: Copied chunk {} to buffer at offset {} (length: {})",
                 chunk.index,
-                offset,
+                expected_offset,
                 chunk.data.len()
             );
 
             // Mark chunk as received
-            if chunk.index < transfer.chunks_received.len() as u64 {
-                transfer.chunks_received[chunk.index as usize] = true;
-                transfer.bytes_transferred += chunk.data.len() as u64;
+            transfer.chunks_received[chunk.index as usize] = true;
+            transfer.bytes_transferred += chunk.data.len() as u64;
 
-                let chunks_received_count = transfer.chunks_received.iter().filter(|&&x| x).count();
-                info!(
-                    "Chunk {} marked as received for transfer {} ({}/{} chunks, {} bytes total)",
-                    chunk.index,
-                    transfer_id,
-                    chunks_received_count,
-                    transfer.chunks_received.len(),
-                    transfer.bytes_transferred
-                );
-            }
+            let chunks_received_count = transfer.chunks_received.iter().filter(|&&x| x).count();
+            info!(
+                "📊 RECEIVER: Chunk {} marked as received for transfer {} ({}/{} chunks, {} bytes total)",
+                chunk.index, transfer_id, chunks_received_count, transfer.chunks_received.len(), transfer.bytes_transferred
+            );
 
             // Check if transfer is complete
             chunk.is_last || transfer.chunks_received.iter().all(|&received| received)
         };
 
         if is_complete {
-            info!("Transfer {} is complete, finalizing...", transfer_id);
+            info!(
+                "🎉 RECEIVER: Transfer {} is complete, finalizing...",
+                transfer_id
+            );
             self.complete_file_transfer(transfer_id).await?;
         } else {
             // Send acknowledgment through normal message channel
@@ -523,8 +627,8 @@ impl FileTransferManager {
             )
         };
 
-        info!("Writing complete file to: {:?}", file_path);
-        info!("File data size: {} bytes", file_data.len());
+        info!("📝 RECEIVER: Writing complete file to: {:?}", file_path);
+        info!("📊 RECEIVER: File data size: {} bytes", file_data.len());
 
         // Write the complete file data at once
         std::fs::write(&file_path, &file_data).map_err(|e| {
@@ -532,14 +636,14 @@ impl FileTransferManager {
             FileshareError::FileOperation(format!("Failed to write file: {}", e))
         })?;
 
-        info!("File written successfully to: {:?}", file_path);
+        info!("✅ RECEIVER: File written successfully to: {:?}", file_path);
 
         // Verify checksum if provided
         if !expected_checksum.is_empty() {
             let calculated_checksum = self.calculate_file_checksum(&file_path)?;
             if calculated_checksum != expected_checksum {
                 error!(
-                    "Checksum mismatch for transfer {}: expected {}, got {}",
+                    "❌ RECEIVER: Checksum mismatch for transfer {}: expected {}, got {}",
                     transfer_id, expected_checksum, calculated_checksum
                 );
 
@@ -550,12 +654,15 @@ impl FileTransferManager {
                     "File integrity check failed".to_string(),
                 ));
             } else {
-                info!("Checksum verified for transfer {}", transfer_id);
+                info!(
+                    "✅ RECEIVER: Checksum verified for transfer {}",
+                    transfer_id
+                );
             }
         }
 
         info!(
-            "File transfer {} completed successfully: {:?}",
+            "🎉 RECEIVER: File transfer {} completed successfully: {:?}",
             transfer_id, file_path
         );
 
@@ -574,7 +681,7 @@ impl FileTransferManager {
         transfer_id: Uuid,
         _checksum: String,
     ) -> Result<()> {
-        info!("Transfer {} completed by peer", transfer_id);
+        info!("✅ Transfer {} completed by peer", transfer_id);
         let transfer = self.active_transfers.get_mut(&transfer_id);
         if let Some(transfer) = transfer {
             transfer.status = TransferStatus::Completed;
@@ -594,7 +701,7 @@ impl FileTransferManager {
         transfer_id: Uuid,
         error: String,
     ) -> Result<()> {
-        error!("Transfer {} failed: {}", transfer_id, error);
+        error!("❌ Transfer {} failed: {}", transfer_id, error);
         if let Some(transfer) = self.active_transfers.get_mut(&transfer_id) {
             transfer.status = TransferStatus::Error(error);
         }
@@ -717,5 +824,19 @@ impl FileTransferManager {
 
     pub fn has_transfer(&self, transfer_id: Uuid) -> bool {
         self.active_transfers.contains_key(&transfer_id)
+    }
+
+    pub fn debug_active_transfers(&self) {
+        info!("=== ACTIVE TRANSFERS DEBUG ===");
+        for (transfer_id, transfer) in &self.active_transfers {
+            info!(
+                "Transfer {}: {:?} -> {:?} (Status: {:?})",
+                transfer_id,
+                transfer.direction,
+                transfer.file_path.file_name().unwrap_or_default(),
+                transfer.status
+            );
+        }
+        info!("=== END TRANSFERS DEBUG ===");
     }
 }
