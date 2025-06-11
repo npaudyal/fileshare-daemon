@@ -1,9 +1,7 @@
 // Prevents additional console window on Windows in release
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-use fileshare_daemon::{
-    clipboard::ClipboardManager, config::Settings, hotkeys::HotkeyEvent, service::FileshareDaemon,
-};
+use fileshare_daemon::{config::Settings, service::FileshareDaemon};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tauri::{
@@ -176,122 +174,6 @@ struct AppState {
     settings: Arc<RwLock<Settings>>,
     daemon_ref: Arc<Mutex<Option<Arc<RwLock<fileshare_daemon::network::PeerManager>>>>>,
     device_manager: Arc<RwLock<DeviceManager>>,
-}
-
-// Test commands for debugging
-#[tauri::command]
-async fn test_hotkey_system() -> Result<String, String> {
-    info!("🧪 Starting comprehensive hotkey system test...");
-
-    tokio::task::spawn_blocking(|| run_hotkey_diagnostics())
-        .await
-        .map_err(|e| format!("Test spawn error: {}", e))
-}
-
-#[tauri::command]
-async fn test_isolated_hotkey() -> Result<String, String> {
-    tokio::task::spawn_blocking(|| isolated_hotkey_test())
-        .await
-        .map_err(|e| format!("Spawn error: {}", e))
-}
-
-fn run_hotkey_diagnostics() -> String {
-    use global_hotkey::{
-        hotkey::{Code, HotKey, Modifiers},
-        GlobalHotKeyEvent, GlobalHotKeyManager,
-    };
-
-    let mut results = Vec::new();
-    results.push("🧪 HOTKEY DIAGNOSTICS STARTING".to_string());
-    results.push(format!("Platform: {}", std::env::consts::OS));
-    results.push(format!("Architecture: {}", std::env::consts::ARCH));
-
-    // Test 1: Manager Creation
-    results.push("\n--- TEST 1: HOTKEY MANAGER CREATION ---".to_string());
-    let manager = match GlobalHotKeyManager::new() {
-        Ok(manager) => {
-            results.push("✅ GlobalHotKeyManager created successfully".to_string());
-            manager
-        }
-        Err(e) => {
-            results.push(format!("❌ Failed to create GlobalHotKeyManager: {}", e));
-            return results.join("\n");
-        }
-    };
-
-    // Test simple hotkeys
-    results.push("\n--- TEST 2: SIMPLE HOTKEY TEST ---".to_string());
-    let simple_hotkeys = vec![
-        ("F11", HotKey::new(None, Code::F11)),
-        (
-            "Ctrl+Alt+F11",
-            HotKey::new(Some(Modifiers::CONTROL | Modifiers::ALT), Code::F11),
-        ),
-        (
-            "Ctrl+Alt+Y",
-            HotKey::new(Some(Modifiers::CONTROL | Modifiers::ALT), Code::KeyY),
-        ),
-        (
-            "Ctrl+Alt+I",
-            HotKey::new(Some(Modifiers::CONTROL | Modifiers::ALT), Code::KeyI),
-        ),
-    ];
-
-    let mut registered = Vec::new();
-    for (name, hotkey) in &simple_hotkeys {
-        match manager.register(*hotkey) {
-            Ok(()) => {
-                results.push(format!("✅ Registered: {} (ID: {})", name, hotkey.id()));
-                registered.push((name, *hotkey));
-            }
-            Err(e) => {
-                results.push(format!("❌ Failed: {} - {}", name, e));
-            }
-        }
-    }
-
-    // Cleanup
-    for (name, hotkey) in &registered {
-        let _ = manager.unregister(*hotkey);
-        results.push(format!("Cleaned up: {}", name));
-    }
-
-    results.join("\n")
-}
-
-fn isolated_hotkey_test() -> String {
-    use global_hotkey::{
-        hotkey::{Code, HotKey},
-        GlobalHotKeyManager,
-    };
-
-    let mut results = Vec::new();
-    results.push("🔬 ISOLATED HOTKEY TEST".to_string());
-
-    let manager = match GlobalHotKeyManager::new() {
-        Ok(m) => {
-            results.push("✅ Fresh manager created".to_string());
-            m
-        }
-        Err(e) => {
-            results.push(format!("❌ Fresh manager failed: {}", e));
-            return results.join("\n");
-        }
-    };
-
-    let basic_hotkey = HotKey::new(None, Code::F9);
-
-    match manager.register(basic_hotkey) {
-        Ok(()) => {
-            results.push("✅ F9 registered successfully!".to_string());
-            let _ = manager.unregister(basic_hotkey);
-        }
-        Err(e) => {
-            results.push(format!("❌ Even F9 failed: {}", e));
-        }
-    }
-
-    results.join("\n")
 }
 
 // Enhanced device discovery with metadata
@@ -870,7 +752,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with_env_filter("fileshare_daemon=debug,fileshare_daemon::network::discovery=debug")
         .init();
 
-    info!("🚀 Starting Fileshare Daemon with Fixed Windows Hotkeys");
+    info!("🚀 Starting Fileshare Daemon with Enhanced Device Management");
 
     let settings = Settings::load(None).map_err(|e| format!("Failed to load settings: {}", e))?;
     info!("📋 Configuration loaded: {:?}", settings.device.name);
@@ -906,8 +788,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             update_app_settings,
             export_settings,
             import_settings,
-            test_hotkey_system,
-            test_isolated_hotkey,
             quit_app,
             hide_window
         ])
@@ -976,11 +856,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     .build(app)?;
             }
 
-            // CRITICAL FIX: Initialize hotkeys and daemon with proper thread coordination
+            // Start daemon
             let app_handle = app.handle().clone();
             tokio::spawn(async move {
-                if let Err(e) = setup_hotkeys_and_daemon(app_handle).await {
-                    error!("❌ Failed to setup hotkeys and daemon: {}", e);
+                info!("🚀 Starting daemon with improved hotkey handling...");
+                if let Err(e) = start_daemon(app_handle).await {
+                    error!("❌ Failed to start daemon: {}", e);
                 }
             });
 
@@ -992,484 +873,34 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-// NEW: Separate function to handle hotkey and daemon setup with proper thread coordination
-async fn setup_hotkeys_and_daemon(
-    app_handle: tauri::AppHandle,
-) -> Result<(), Box<dyn std::error::Error>> {
-    info!("🔧 Setting up hotkeys and daemon with proper thread coordination...");
+async fn start_daemon(app_handle: tauri::AppHandle) -> Result<(), Box<dyn std::error::Error>> {
+    info!("🔧 Starting background daemon with platform-specific hotkeys...");
 
     let state: tauri::State<AppState> = app_handle.state();
+
     let settings = {
         let settings_lock = state.settings.read().await;
         settings_lock.clone()
     };
 
-    // 1. FIRST: Initialize hotkeys with proper thread coordination
-    let (hotkey_event_tx, mut hotkey_event_rx) = tokio::sync::mpsc::unbounded_channel();
-
-    // Set up hotkeys with platform-specific thread handling
-    if let Err(e) = setup_global_hotkeys(hotkey_event_tx.clone()).await {
-        error!("❌ Failed to setup hotkeys: {}", e);
-        return Err(e);
-    }
-
-    // Give hotkeys time to initialize
-    tokio::time::sleep(tokio::time::Duration::from_millis(1000)).await;
-
-    // 2. THEN: Start the daemon
-    let daemon = FileshareDaemon::new(settings.clone())
+    let daemon = FileshareDaemon::new(settings)
         .await
         .map_err(|e| format!("Failed to create daemon: {}", e))?;
 
     let peer_manager_ref = daemon.peer_manager.clone();
     {
         let mut daemon_ref = state.daemon_ref.lock().await;
-        *daemon_ref = Some(peer_manager_ref.clone());
+        *daemon_ref = Some(peer_manager_ref);
     }
 
     info!("✅ Daemon created, starting services...");
 
-    // 3. Start daemon services
-    let daemon_handle = tokio::spawn(async move {
+    tokio::spawn(async move {
         if let Err(e) = daemon.run().await {
             error!("❌ Daemon run error: {}", e);
         }
     });
 
-    // 4. Handle hotkey events with clipboard manager
-    let clipboard_manager = ClipboardManager::new(settings.device.id);
-    let hotkey_handler = tokio::spawn(async move {
-        while let Some(event) = hotkey_event_rx.recv().await {
-            match event {
-                HotkeyEvent::CopyFiles => {
-                    info!("📋 Copy hotkey triggered");
-                    if let Err(e) =
-                        handle_copy_operation(clipboard_manager.clone(), peer_manager_ref.clone())
-                            .await
-                    {
-                        error!("❌ Copy operation failed: {}", e);
-                    }
-                }
-                HotkeyEvent::PasteFiles => {
-                    info!("📁 Paste hotkey triggered");
-                    if let Err(e) =
-                        handle_paste_operation(clipboard_manager.clone(), peer_manager_ref.clone())
-                            .await
-                    {
-                        error!("❌ Paste operation failed: {}", e);
-                    }
-                }
-            }
-        }
-    });
-
-    // Wait for any service to finish
-    tokio::select! {
-        _ = daemon_handle => {
-            info!("Daemon finished");
-        }
-        _ = hotkey_handler => {
-            info!("Hotkey handler finished");
-        }
-    }
-
-    info!("✅ Hotkeys and daemon setup completed");
-    Ok(())
-}
-
-// CRITICAL FIX: Platform-specific hotkey setup with proper thread coordination
-async fn setup_global_hotkeys(
-    event_tx: tokio::sync::mpsc::UnboundedSender<HotkeyEvent>,
-) -> Result<(), Box<dyn std::error::Error>> {
-    info!("🎹 Setting up hotkeys with proper thread coordination...");
-
-    #[cfg(target_os = "windows")]
-    {
-        // CRITICAL: On Windows, create manager AND event loop on same thread
-        std::thread::spawn(move || {
-            windows_hotkey_thread(event_tx);
-        });
-    }
-
-    #[cfg(target_os = "macos")]
-    {
-        // On macOS, use main thread (which already has event loop)
-        macos_hotkey_setup(event_tx).await?;
-    }
-
-    #[cfg(target_os = "linux")]
-    {
-        // Linux can use similar approach to Windows
-        std::thread::spawn(move || {
-            linux_hotkey_thread(event_tx);
-        });
-    }
-
-    Ok(())
-}
-
-#[cfg(target_os = "windows")]
-fn windows_hotkey_thread(event_tx: tokio::sync::mpsc::UnboundedSender<HotkeyEvent>) {
-    use global_hotkey::{
-        hotkey::{Code, HotKey, Modifiers},
-        GlobalHotKeyEvent, GlobalHotKeyManager,
-    };
-
-    info!("🎹 Windows hotkey thread started");
-
-    // STEP 1: Create hotkey manager on THIS thread
-    let manager = match GlobalHotKeyManager::new() {
-        Ok(manager) => {
-            info!("✅ Windows hotkey manager created on dedicated thread");
-            manager
-        }
-        Err(e) => {
-            error!("❌ Failed to create Windows hotkey manager: {}", e);
-            return;
-        }
-    };
-
-    // STEP 2: Register hotkeys on THIS thread
-    let copy_hotkey = HotKey::new(Some(Modifiers::CONTROL | Modifiers::ALT), Code::KeyY);
-    let paste_hotkey = HotKey::new(Some(Modifiers::CONTROL | Modifiers::ALT), Code::KeyI);
-
-    if let Err(e) = manager.register(copy_hotkey) {
-        error!("❌ Failed to register copy hotkey: {}", e);
-        return;
-    }
-
-    if let Err(e) = manager.register(paste_hotkey) {
-        error!("❌ Failed to register paste hotkey: {}", e);
-        return;
-    }
-
-    info!("✅ Windows hotkeys registered: Ctrl+Alt+Y (copy), Ctrl+Alt+I (paste)");
-
-    // STEP 3: Run Win32 event loop on THIS SAME thread
-    let receiver = GlobalHotKeyEvent::receiver();
-
-    info!("🎹 Starting Windows event loop on hotkey thread");
-
-    loop {
-        // CRITICAL: Pump Windows messages on the SAME thread as manager creation
-        pump_windows_messages();
-
-        // Check for hotkey events
-        match receiver.try_recv() {
-            Ok(event) => {
-                if event.state == global_hotkey::HotKeyState::Pressed {
-                    info!("🎯 Windows hotkey event: ID={}", event.id);
-
-                    let hotkey_event = if event.id == copy_hotkey.id() {
-                        info!("🎹 Copy hotkey detected on Windows!");
-                        Some(HotkeyEvent::CopyFiles)
-                    } else if event.id == paste_hotkey.id() {
-                        info!("🎹 Paste hotkey detected on Windows!");
-                        Some(HotkeyEvent::PasteFiles)
-                    } else {
-                        None
-                    };
-
-                    if let Some(hotkey_event) = hotkey_event {
-                        if let Err(e) = event_tx.send(hotkey_event) {
-                            error!("❌ Failed to send Windows hotkey event: {}", e);
-                            break;
-                        }
-                    }
-                }
-            }
-            Err(crossbeam_channel::TryRecvError::Empty) => {
-                // No events, continue
-            }
-            Err(crossbeam_channel::TryRecvError::Disconnected) => {
-                warn!("🎹 Windows hotkey receiver disconnected");
-                break;
-            }
-        }
-
-        // Small delay to prevent CPU spinning
-        std::thread::sleep(std::time::Duration::from_millis(10));
-    }
-
-    info!("🎹 Windows hotkey thread ended");
-}
-
-#[cfg(target_os = "macos")]
-async fn macos_hotkey_setup(
-    event_tx: tokio::sync::mpsc::UnboundedSender<HotkeyEvent>,
-) -> Result<(), Box<dyn std::error::Error>> {
-    use global_hotkey::{
-        hotkey::{Code, HotKey, Modifiers},
-        GlobalHotKeyEvent, GlobalHotKeyManager,
-    };
-
-    info!("🎹 Setting up macOS hotkeys on main thread");
-
-    // On macOS, create on main thread (where NSRunLoop is)
-    let manager = GlobalHotKeyManager::new()
-        .map_err(|e| format!("Failed to create macOS hotkey manager: {}", e))?;
-
-    let copy_hotkey = HotKey::new(Some(Modifiers::META | Modifiers::SHIFT), Code::KeyY);
-    let paste_hotkey = HotKey::new(Some(Modifiers::META | Modifiers::SHIFT), Code::KeyI);
-
-    manager.register(copy_hotkey)?;
-    manager.register(paste_hotkey)?;
-
-    info!("✅ macOS hotkeys registered: Cmd+Shift+Y (copy), Cmd+Shift+I (paste)");
-
-    // macOS event handling (simplified since main thread event loop handles it)
-    tokio::spawn(async move {
-        let receiver = GlobalHotKeyEvent::receiver();
-
-        loop {
-            match receiver.recv() {
-                Ok(event) => {
-                    if event.state == global_hotkey::HotKeyState::Pressed {
-                        let hotkey_event = if event.id == copy_hotkey.id() {
-                            info!("🎹 Copy hotkey detected on macOS!");
-                            Some(HotkeyEvent::CopyFiles)
-                        } else if event.id == paste_hotkey.id() {
-                            info!("🎹 Paste hotkey detected on macOS!");
-                            Some(HotkeyEvent::PasteFiles)
-                        } else {
-                            None
-                        };
-
-                        if let Some(hotkey_event) = hotkey_event {
-                            let _ = event_tx.send(hotkey_event);
-                        }
-                    }
-                }
-                Err(_) => break,
-            }
-        }
-    });
-
-    std::mem::forget(manager);
-    Ok(())
-}
-
-#[cfg(target_os = "linux")]
-fn linux_hotkey_thread(event_tx: tokio::sync::mpsc::UnboundedSender<HotkeyEvent>) {
-    use global_hotkey::{
-        hotkey::{Code, HotKey, Modifiers},
-        GlobalHotKeyEvent, GlobalHotKeyManager,
-    };
-
-    info!("🎹 Linux hotkey thread started");
-
-    let manager = match GlobalHotKeyManager::new() {
-        Ok(manager) => {
-            info!("✅ Linux hotkey manager created");
-            manager
-        }
-        Err(e) => {
-            error!("❌ Failed to create Linux hotkey manager: {}", e);
-            return;
-        }
-    };
-
-    let copy_hotkey = HotKey::new(Some(Modifiers::CONTROL | Modifiers::SHIFT), Code::KeyY);
-    let paste_hotkey = HotKey::new(Some(Modifiers::CONTROL | Modifiers::SHIFT), Code::KeyI);
-
-    if let Err(e) = manager.register(copy_hotkey) {
-        error!("❌ Failed to register copy hotkey: {}", e);
-        return;
-    }
-
-    if let Err(e) = manager.register(paste_hotkey) {
-        error!("❌ Failed to register paste hotkey: {}", e);
-        return;
-    }
-
-    info!("✅ Linux hotkeys registered: Ctrl+Shift+Y (copy), Ctrl+Shift+I (paste)");
-
-    let receiver = GlobalHotKeyEvent::receiver();
-
-    loop {
-        match receiver.recv_timeout(std::time::Duration::from_millis(100)) {
-            Ok(event) => {
-                if event.state == global_hotkey::HotKeyState::Pressed {
-                    let hotkey_event = if event.id == copy_hotkey.id() {
-                        info!("🎹 Copy hotkey detected on Linux!");
-                        Some(HotkeyEvent::CopyFiles)
-                    } else if event.id == paste_hotkey.id() {
-                        info!("🎹 Paste hotkey detected on Linux!");
-                        Some(HotkeyEvent::PasteFiles)
-                    } else {
-                        None
-                    };
-
-                    if let Some(hotkey_event) = hotkey_event {
-                        if let Err(e) = event_tx.send(hotkey_event) {
-                            error!("❌ Failed to send Linux hotkey event: {}", e);
-                            break;
-                        }
-                    }
-                }
-            }
-            Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
-                // Normal timeout, continue
-            }
-            Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
-                warn!("🎹 Linux hotkey receiver disconnected");
-                break;
-            }
-        }
-    }
-
-    info!("🎹 Linux hotkey thread ended");
-}
-
-// Windows message pump function
-#[cfg(target_os = "windows")]
-fn pump_windows_messages() {
-    use std::ptr;
-
-    #[repr(C)]
-    struct MSG {
-        hwnd: *mut std::ffi::c_void,
-        message: u32,
-        wparam: usize,
-        lparam: isize,
-        time: u32,
-        pt: (i32, i32),
-    }
-
-    extern "system" {
-        fn PeekMessageW(
-            lpmsg: *mut MSG,
-            hwnd: *mut std::ffi::c_void,
-            wmsgfiltermin: u32,
-            wmsgfiltermax: u32,
-            wremovemsg: u32,
-        ) -> i32;
-        fn TranslateMessage(lpmsg: *const MSG) -> i32;
-        fn DispatchMessageW(lpmsg: *const MSG) -> isize;
-    }
-
-    const PM_REMOVE: u32 = 0x0001;
-
-    unsafe {
-        let mut msg: MSG = std::mem::zeroed();
-
-        // Process all available messages
-        while PeekMessageW(&mut msg, ptr::null_mut(), 0, 0, PM_REMOVE) != 0 {
-            TranslateMessage(&msg);
-            DispatchMessageW(&msg);
-        }
-    }
-}
-
-// Helper functions for hotkey operations
-async fn handle_copy_operation(
-    clipboard: ClipboardManager,
-    peer_manager: Arc<RwLock<fileshare_daemon::network::PeerManager>>,
-) -> Result<(), fileshare_daemon::FileshareError> {
-    info!("📋 Handling copy operation");
-
-    clipboard.copy_selected_file().await?;
-
-    let clipboard_item = {
-        let clipboard_state = clipboard.network_clipboard.read().await;
-        clipboard_state.clone()
-    };
-
-    if let Some(item) = clipboard_item {
-        let peers = {
-            let pm = peer_manager.read().await;
-            pm.get_connected_peers()
-        };
-
-        for peer in peers {
-            let message = fileshare_daemon::network::protocol::Message::new(
-                fileshare_daemon::network::protocol::MessageType::ClipboardUpdate {
-                    file_path: item.file_path.to_string_lossy().to_string(),
-                    source_device: item.source_device,
-                    timestamp: item.timestamp,
-                    file_size: item.file_size,
-                },
-            );
-
-            let mut pm = peer_manager.write().await;
-            if let Err(e) = pm.send_message_to_peer(peer.device_info.id, message).await {
-                warn!(
-                    "❌ Failed to send clipboard update to {}: {}",
-                    peer.device_info.id, e
-                );
-            }
-        }
-
-        let filename = item
-            .file_path
-            .file_name()
-            .unwrap_or_default()
-            .to_string_lossy();
-
-        notify_rust::Notification::new()
-            .summary("File Copied to Network")
-            .body(&format!(
-                "Copied: {} ({})",
-                filename,
-                fileshare_daemon::utils::format_file_size(item.file_size)
-            ))
-            .timeout(notify_rust::Timeout::Milliseconds(3000))
-            .show()
-            .map_err(|e| {
-                fileshare_daemon::FileshareError::Unknown(format!("Notification error: {}", e))
-            })?;
-
-        info!("✅ Copy operation completed successfully");
-    }
-
-    Ok(())
-}
-
-async fn handle_paste_operation(
-    clipboard: ClipboardManager,
-    peer_manager: Arc<RwLock<fileshare_daemon::network::PeerManager>>,
-) -> Result<(), fileshare_daemon::FileshareError> {
-    info!("📁 Handling paste operation");
-
-    if let Some((target_path, source_device)) = clipboard.paste_to_current_location().await? {
-        info!(
-            "📁 Requesting file transfer from device {} to {:?}",
-            source_device, target_path
-        );
-
-        let source_file_path = {
-            let clipboard_state = clipboard.network_clipboard.read().await;
-            clipboard_state
-                .as_ref()
-                .unwrap()
-                .file_path
-                .to_string_lossy()
-                .to_string()
-        };
-
-        let request_id = uuid::Uuid::new_v4();
-        let message = fileshare_daemon::network::protocol::Message::new(
-            fileshare_daemon::network::protocol::MessageType::FileRequest {
-                request_id,
-                file_path: source_file_path,
-                target_path: target_path.to_string_lossy().to_string(),
-            },
-        );
-
-        let mut pm = peer_manager.write().await;
-        pm.send_message_to_peer(source_device, message).await?;
-
-        notify_rust::Notification::new()
-            .summary("File Transfer Starting")
-            .body("Requesting file from source device...")
-            .timeout(notify_rust::Timeout::Milliseconds(3000))
-            .show()
-            .map_err(|e| {
-                fileshare_daemon::FileshareError::Unknown(format!("Notification error: {}", e))
-            })?;
-
-        info!("✅ File request sent to source device");
-    }
-
+    info!("✅ Background daemon started successfully with platform-specific hotkeys");
     Ok(())
 }
