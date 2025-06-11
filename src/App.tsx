@@ -349,7 +349,6 @@ function App() {
                     deviceName={settings?.device_name}
                     onRefresh={handleRefresh}
                     onSelectAll={handleSelectAll}
-                    onClose={() => invoke('hide_window')}
                 />
             </FadeIn>
 

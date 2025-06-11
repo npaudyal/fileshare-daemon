@@ -1,6 +1,6 @@
 import React from 'react';
 import { motion } from 'framer-motion';
-import { Wifi, RefreshCw, CheckSquare } from 'lucide-react';
+import { Wifi, RefreshCw, CheckSquare } from 'lucide-react'; // Remove X import
 
 interface HeaderProps {
     connectionStatus: boolean;
@@ -11,7 +11,6 @@ interface HeaderProps {
     deviceName?: string;
     onRefresh: () => void;
     onSelectAll: () => void;
-    onClose: () => void;
 }
 
 const Header: React.FC<HeaderProps> = ({
@@ -22,10 +21,10 @@ const Header: React.FC<HeaderProps> = ({
     filteredDevicesCount,
     deviceName,
     onRefresh,
-    onSelectAll,
+    onSelectAll
 }) => {
     return (
-        <div className="p-4 border-b border-white/10">
+        <div className="p-4 border-b border-white/10 bg-slate-900/50">
             <div className="flex items-center justify-between">
                 <div className="flex items-center space-x-2">
                     <div className="relative">

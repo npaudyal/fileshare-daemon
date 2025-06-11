@@ -868,10 +868,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         ])
         .setup(|app| {
             let _main_window = WebviewWindowBuilder::new(app, "main", WebviewUrl::default())
-                .title("Fileshare")
-                .inner_size(550.0, 550.0) // Changed to 550x550
+                .title("Fileshare") // This will appear in native title bar
+                .inner_size(550.0, 550.0)
                 .center()
-                .decorations(true) // Changed to true to allow minimize button
+                .decorations(true) // Enable native decorations for each platform
                 .resizable(false)
                 .visible(false)
                 .focused(false)
