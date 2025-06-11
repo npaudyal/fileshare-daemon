@@ -1174,104 +1174,41 @@ async fn setup_global_hotkeys(
         hotkey::{Code, HotKey, Modifiers},
         GlobalHotKeyEvent, GlobalHotKeyManager,
     };
-    use std::sync::atomic::{AtomicBool, Ordering};
-    use std::sync::Arc;
 
-    info!("🎹 Initializing global hotkeys with Windows message pump...");
+    info!("🎹 Testing hotkeys WITHOUT manual message pump in Tauri...");
 
     let manager = GlobalHotKeyManager::new()
         .map_err(|e| format!("Failed to create hotkey manager: {}", e))?;
 
-    // Platform-specific key combinations
-    let (copy_hotkey, paste_hotkey) = if cfg!(target_os = "macos") {
-        (
-            HotKey::new(Some(Modifiers::META | Modifiers::SHIFT), Code::KeyY),
-            HotKey::new(Some(Modifiers::META | Modifiers::SHIFT), Code::KeyI),
-        )
-    } else {
-        // Windows and Linux - use Ctrl+Alt to avoid conflicts
-        (
-            HotKey::new(Some(Modifiers::CONTROL | Modifiers::ALT), Code::KeyY),
-            HotKey::new(Some(Modifiers::CONTROL | Modifiers::ALT), Code::KeyI),
-        )
-    };
+    let copy_hotkey = HotKey::new(Some(Modifiers::CONTROL | Modifiers::ALT), Code::KeyY);
+    let paste_hotkey = HotKey::new(Some(Modifiers::CONTROL | Modifiers::ALT), Code::KeyI);
 
-    // Register hotkeys with retry logic
-    let mut retry_count = 0;
-    while retry_count < 3 {
-        match manager.register(copy_hotkey) {
-            Ok(()) => {
-                info!("✅ Copy hotkey (Ctrl+Alt+Y) registered successfully");
-                break;
-            }
-            Err(e) => {
-                retry_count += 1;
-                error!(
-                    "❌ Failed to register copy hotkey (attempt {}): {}",
-                    retry_count, e
-                );
-                if retry_count < 3 {
-                    tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
-                } else {
-                    return Err(
-                        format!("Failed to register copy hotkey after 3 attempts: {}", e).into(),
-                    );
-                }
-            }
-        }
-    }
+    // Register hotkeys
+    manager
+        .register(copy_hotkey)
+        .map_err(|e| format!("Copy hotkey registration failed: {}", e))?;
+    manager
+        .register(paste_hotkey)
+        .map_err(|e| format!("Paste hotkey registration failed: {}", e))?;
 
-    retry_count = 0;
-    while retry_count < 3 {
-        match manager.register(paste_hotkey) {
-            Ok(()) => {
-                info!("✅ Paste hotkey (Ctrl+Alt+I) registered successfully");
-                break;
-            }
-            Err(e) => {
-                retry_count += 1;
-                error!(
-                    "❌ Failed to register paste hotkey (attempt {}): {}",
-                    retry_count, e
-                );
-                if retry_count < 3 {
-                    tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
-                } else {
-                    return Err(
-                        format!("Failed to register paste hotkey after 3 attempts: {}", e).into(),
-                    );
-                }
-            }
-        }
-    }
+    info!("✅ Hotkeys registered, testing if Tauri's event loop handles messages...");
 
-    info!("🎹 Starting Windows-compatible hotkey event listener...");
-
-    // CRITICAL FIX: Use blocking thread with Windows message pump
-    let is_running = Arc::new(AtomicBool::new(true));
-    let is_running_clone = is_running.clone();
-
+    // Simple event listener WITHOUT manual message pumping
     std::thread::spawn(move || {
         let receiver = GlobalHotKeyEvent::receiver();
+        info!("🎹 Simple hotkey listener started (no manual message pump)");
 
-        info!("🎹 Hotkey listener thread started with message pump");
-
-        while is_running_clone.load(Ordering::SeqCst) {
-            // CRITICAL: Pump Windows messages first
-            #[cfg(target_os = "windows")]
-            pump_windows_messages();
-
-            // Then check for hotkey events
-            match receiver.try_recv() {
+        loop {
+            match receiver.recv_timeout(std::time::Duration::from_millis(100)) {
                 Ok(event) => {
                     if event.state == global_hotkey::HotKeyState::Pressed {
-                        info!("🎹 Hotkey event received: ID={}", event.id);
+                        info!("🎯 TAURI EVENT DETECTED: ID={}", event.id);
 
                         let hotkey_event = if event.id == copy_hotkey.id() {
-                            info!("🎹 Copy hotkey detected!");
+                            info!("🎹 Copy hotkey in Tauri!");
                             Some(HotkeyEvent::CopyFiles)
                         } else if event.id == paste_hotkey.id() {
-                            info!("🎹 Paste hotkey detected!");
+                            info!("🎹 Paste hotkey in Tauri!");
                             Some(HotkeyEvent::PasteFiles)
                         } else {
                             None
@@ -1285,26 +1222,18 @@ async fn setup_global_hotkeys(
                         }
                     }
                 }
-                Err(crossbeam_channel::TryRecvError::Empty) => {
-                    // No events, continue
+                Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
+                    // Normal timeout, continue
                 }
-                Err(crossbeam_channel::TryRecvError::Disconnected) => {
-                    warn!("🎹 Hotkey event receiver disconnected");
+                Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
+                    warn!("🎹 Hotkey receiver disconnected");
                     break;
                 }
             }
-
-            // Small delay to prevent CPU spinning
-            std::thread::sleep(std::time::Duration::from_millis(10));
         }
-
-        info!("🎹 Hotkey listener thread stopped");
     });
 
-    // Keep the manager alive by preventing it from being dropped
     std::mem::forget(manager);
-
-    info!("✅ Hotkey system initialized successfully with message pump");
     Ok(())
 }
 
