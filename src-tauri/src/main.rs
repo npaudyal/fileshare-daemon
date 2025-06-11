@@ -74,15 +74,6 @@ async fn get_network_metrics(_state: tauri::State<'_, AppState>) -> Result<Netwo
 }
 
 #[tauri::command]
-async fn test_hotkey_system() -> Result<String, String> {
-    info!("🧪 Starting comprehensive hotkey system test...");
-
-    tokio::task::spawn_blocking(|| run_hotkey_diagnostics())
-        .await
-        .map_err(|e| format!("Test spawn error: {}", e))
-}
-
-#[tauri::command]
 async fn update_app_settings(
     settings: AppSettings,
     state: tauri::State<'_, AppState>,
@@ -104,30 +95,6 @@ async fn update_app_settings(
         .map_err(|e| format!("Failed to save settings: {}", e))?;
 
     Ok(())
-}
-
-#[tauri::command]
-async fn check_main_hotkey_status() -> Result<String, String> {
-    info!("🔍 Checking main app hotkey status...");
-
-    // This will help us see if the main hotkey system is running
-    Ok(format!(
-        "Main hotkey system status:\n\
-        - Platform: {}\n\
-        - Expected hotkeys: Ctrl+Alt+Y (copy), Ctrl+Alt+I (paste)\n\
-        - Check the console logs when you press these keys\n\
-        - If you see 'Copy hotkey triggered' or 'Paste hotkey triggered' in logs, events are working\n\
-        - If not, the event loop isn't receiving messages",
-        std::env::consts::OS
-    ))
-}
-
-#[tauri::command]
-async fn test_isolated_hotkey() -> Result<String, String> {
-    // Run in a completely separate task
-    tokio::task::spawn_blocking(|| isolated_hotkey_test())
-        .await
-        .map_err(|e| format!("Spawn error: {}", e))
 }
 
 #[tauri::command]
@@ -209,6 +176,122 @@ struct AppState {
     settings: Arc<RwLock<Settings>>,
     daemon_ref: Arc<Mutex<Option<Arc<RwLock<fileshare_daemon::network::PeerManager>>>>>,
     device_manager: Arc<RwLock<DeviceManager>>,
+}
+
+// Test commands for debugging
+#[tauri::command]
+async fn test_hotkey_system() -> Result<String, String> {
+    info!("🧪 Starting comprehensive hotkey system test...");
+
+    tokio::task::spawn_blocking(|| run_hotkey_diagnostics())
+        .await
+        .map_err(|e| format!("Test spawn error: {}", e))
+}
+
+#[tauri::command]
+async fn test_isolated_hotkey() -> Result<String, String> {
+    tokio::task::spawn_blocking(|| isolated_hotkey_test())
+        .await
+        .map_err(|e| format!("Spawn error: {}", e))
+}
+
+fn run_hotkey_diagnostics() -> String {
+    use global_hotkey::{
+        hotkey::{Code, HotKey, Modifiers},
+        GlobalHotKeyEvent, GlobalHotKeyManager,
+    };
+
+    let mut results = Vec::new();
+    results.push("🧪 HOTKEY DIAGNOSTICS STARTING".to_string());
+    results.push(format!("Platform: {}", std::env::consts::OS));
+    results.push(format!("Architecture: {}", std::env::consts::ARCH));
+
+    // Test 1: Manager Creation
+    results.push("\n--- TEST 1: HOTKEY MANAGER CREATION ---".to_string());
+    let manager = match GlobalHotKeyManager::new() {
+        Ok(manager) => {
+            results.push("✅ GlobalHotKeyManager created successfully".to_string());
+            manager
+        }
+        Err(e) => {
+            results.push(format!("❌ Failed to create GlobalHotKeyManager: {}", e));
+            return results.join("\n");
+        }
+    };
+
+    // Test simple hotkeys
+    results.push("\n--- TEST 2: SIMPLE HOTKEY TEST ---".to_string());
+    let simple_hotkeys = vec![
+        ("F11", HotKey::new(None, Code::F11)),
+        (
+            "Ctrl+Alt+F11",
+            HotKey::new(Some(Modifiers::CONTROL | Modifiers::ALT), Code::F11),
+        ),
+        (
+            "Ctrl+Alt+Y",
+            HotKey::new(Some(Modifiers::CONTROL | Modifiers::ALT), Code::KeyY),
+        ),
+        (
+            "Ctrl+Alt+I",
+            HotKey::new(Some(Modifiers::CONTROL | Modifiers::ALT), Code::KeyI),
+        ),
+    ];
+
+    let mut registered = Vec::new();
+    for (name, hotkey) in &simple_hotkeys {
+        match manager.register(*hotkey) {
+            Ok(()) => {
+                results.push(format!("✅ Registered: {} (ID: {})", name, hotkey.id()));
+                registered.push((name, *hotkey));
+            }
+            Err(e) => {
+                results.push(format!("❌ Failed: {} - {}", name, e));
+            }
+        }
+    }
+
+    // Cleanup
+    for (name, hotkey) in &registered {
+        let _ = manager.unregister(*hotkey);
+        results.push(format!("Cleaned up: {}", name));
+    }
+
+    results.join("\n")
+}
+
+fn isolated_hotkey_test() -> String {
+    use global_hotkey::{
+        hotkey::{Code, HotKey},
+        GlobalHotKeyManager,
+    };
+
+    let mut results = Vec::new();
+    results.push("🔬 ISOLATED HOTKEY TEST".to_string());
+
+    let manager = match GlobalHotKeyManager::new() {
+        Ok(m) => {
+            results.push("✅ Fresh manager created".to_string());
+            m
+        }
+        Err(e) => {
+            results.push(format!("❌ Fresh manager failed: {}", e));
+            return results.join("\n");
+        }
+    };
+
+    let basic_hotkey = HotKey::new(None, Code::F9);
+
+    match manager.register(basic_hotkey) {
+        Ok(()) => {
+            results.push("✅ F9 registered successfully!".to_string());
+            let _ = manager.unregister(basic_hotkey);
+        }
+        Err(e) => {
+            results.push(format!("❌ Even F9 failed: {}", e));
+        }
+    }
+
+    results.join("\n")
 }
 
 // Enhanced device discovery with metadata
@@ -787,7 +870,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with_env_filter("fileshare_daemon=debug,fileshare_daemon::network::discovery=debug")
         .init();
 
-    info!("🚀 Starting Fileshare Daemon with Enhanced Device Management and Fixed Windows Hotkeys");
+    info!("🚀 Starting Fileshare Daemon with Fixed Windows Hotkeys");
 
     let settings = Settings::load(None).map_err(|e| format!("Failed to load settings: {}", e))?;
     info!("📋 Configuration loaded: {:?}", settings.device.name);
@@ -814,9 +897,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             bulk_device_action,
             connect_to_peer,
             disconnect_from_peer,
-            test_isolated_hotkey,
-            check_main_hotkey_status,
-            test_hotkey_system,
             get_device_stats,
             get_app_settings,
             get_connection_status,
@@ -826,6 +906,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             update_app_settings,
             export_settings,
             import_settings,
+            test_hotkey_system,
+            test_isolated_hotkey,
             quit_app,
             hide_window
         ])
@@ -894,7 +976,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     .build(app)?;
             }
 
-            // CRITICAL FIX: Initialize hotkeys and daemon on main thread
+            // CRITICAL FIX: Initialize hotkeys and daemon with proper thread coordination
             let app_handle = app.handle().clone();
             tokio::spawn(async move {
                 if let Err(e) = setup_hotkeys_and_daemon(app_handle).await {
@@ -910,178 +992,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-fn isolated_hotkey_test() -> String {
-    use global_hotkey::{
-        hotkey::{Code, HotKey},
-        GlobalHotKeyManager,
-    };
-
-    let mut results = Vec::new();
-    results.push("🔬 ISOLATED HOTKEY TEST".to_string());
-
-    // Try to create a completely fresh manager
-    let manager = match GlobalHotKeyManager::new() {
-        Ok(m) => {
-            results.push("✅ Fresh manager created".to_string());
-            m
-        }
-        Err(e) => {
-            results.push(format!("❌ Fresh manager failed: {}", e));
-            return results.join("\n");
-        }
-    };
-
-    // Try the most basic hotkey possible
-    let basic_hotkey = HotKey::new(None, Code::F9); // Just F9, no modifiers
-
-    match manager.register(basic_hotkey) {
-        Ok(()) => {
-            results.push("✅ F9 registered successfully!".to_string());
-            results.push("This means basic hotkey registration CAN work".to_string());
-
-            // Clean up
-            if let Err(e) = manager.unregister(basic_hotkey) {
-                results.push(format!("❌ Failed to unregister F9: {}", e));
-            }
-        }
-        Err(e) => {
-            results.push(format!("❌ Even F9 failed: {}", e));
-            results.push("This is a fundamental system issue".to_string());
-        }
-    }
-
-    results.join("\n")
-}
-
-fn run_hotkey_diagnostics() -> String {
-    use global_hotkey::{
-        hotkey::{Code, HotKey, Modifiers},
-        GlobalHotKeyEvent, GlobalHotKeyManager,
-    };
-
-    let mut results = Vec::new();
-    results.push("🧪 HOTKEY DIAGNOSTICS STARTING".to_string());
-    results.push(format!("Platform: {}", std::env::consts::OS));
-    results.push(format!("Architecture: {}", std::env::consts::ARCH));
-
-    // Test 1: Manager Creation with detailed error info
-    results.push("\n--- TEST 1: HOTKEY MANAGER CREATION ---".to_string());
-    let manager = match GlobalHotKeyManager::new() {
-        Ok(manager) => {
-            results.push("✅ GlobalHotKeyManager created successfully".to_string());
-            manager
-        }
-        Err(e) => {
-            results.push(format!("❌ Failed to create GlobalHotKeyManager: {}", e));
-            results.push(format!("Error type: {:?}", e));
-            return results.join("\n");
-        }
-    };
-
-    // Test 2: Try the SIMPLEST possible hotkey first
-    results.push("\n--- TEST 2: ULTRA-SIMPLE HOTKEY TEST ---".to_string());
-
-    let simple_hotkeys = vec![
-        ("F11 only", HotKey::new(None, Code::F11)),
-        ("F12 only", HotKey::new(None, Code::F12)),
-        ("Alt+F11", HotKey::new(Some(Modifiers::ALT), Code::F11)),
-        ("Ctrl+F11", HotKey::new(Some(Modifiers::CONTROL), Code::F11)),
-    ];
-
-    let mut any_success = false;
-
-    for (name, hotkey) in &simple_hotkeys {
-        match manager.register(*hotkey) {
-            Ok(()) => {
-                results.push(format!(
-                    "✅ SUCCESS: {} registered (ID: {})",
-                    name,
-                    hotkey.id()
-                ));
-                any_success = true;
-
-                // Immediately unregister to avoid conflicts
-                if let Err(e) = manager.unregister(*hotkey) {
-                    results.push(format!("❌ Failed to unregister {}: {}", name, e));
-                }
-            }
-            Err(e) => {
-                results.push(format!("❌ FAILED: {} - Error: {}", name, e));
-                results.push(format!("   └─ Error details: {:?}", e));
-            }
-        }
-    }
-
-    if !any_success {
-        results.push("\n🚨 CRITICAL: NO HOTKEYS CAN BE REGISTERED AT ALL!".to_string());
-        results.push("This suggests a fundamental Windows/permissions issue.".to_string());
-    }
-
-    // Test 3: Windows-specific diagnostics
-    results.push("\n--- TEST 3: WINDOWS ENVIRONMENT CHECK ---".to_string());
-
-    #[cfg(target_os = "windows")]
-    {
-        unsafe {
-            extern "system" {
-                fn GetCurrentThreadId() -> u32;
-                fn GetCurrentProcessId() -> u32;
-                fn IsDebuggerPresent() -> i32;
-                fn GetLastError() -> u32;
-            }
-
-            let thread_id = GetCurrentThreadId();
-            let process_id = GetCurrentProcessId();
-            let is_debugger = IsDebuggerPresent();
-            let last_error = GetLastError();
-
-            results.push(format!("Thread ID: {}", thread_id));
-            results.push(format!("Process ID: {}", process_id));
-            results.push(format!("Debugger present: {}", is_debugger != 0));
-            results.push(format!("Last Windows error: {}", last_error));
-        }
-    }
-
-    // Test 4: Permission and context checks
-    results.push("\n--- TEST 4: ENVIRONMENT ANALYSIS ---".to_string());
-
-    // Check if we're in a weird thread context
-    let is_main_thread = std::thread::current().name() == Some("main");
-    results.push(format!("Is main thread: {}", is_main_thread));
-    results.push(format!("Thread name: {:?}", std::thread::current().name()));
-
-    // Check working directory
-    if let Ok(cwd) = std::env::current_dir() {
-        results.push(format!("Working directory: {:?}", cwd));
-    }
-
-    // Check if running as admin/elevated
-    #[cfg(target_os = "windows")]
-    {
-        results.push(format!("Checking Windows elevation status..."));
-        // We'll add a simple check
-    }
-
-    results.push("\n🧪 DIAGNOSTICS COMPLETE".to_string());
-
-    if !any_success {
-        results.push("\n🎯 ANALYSIS: FUNDAMENTAL REGISTRATION FAILURE".to_string());
-        results.push("Possible causes:".to_string());
-        results.push("1. Windows permissions/UAC issues".to_string());
-        results.push("2. Antivirus blocking hotkey registration".to_string());
-        results.push("3. Another app has exclusive hotkey access".to_string());
-        results.push("4. Tauri sandboxing interfering with system APIs".to_string());
-        results.push("5. Windows thread context issues".to_string());
-    }
-
-    results.join("\n")
-}
-
-// NEW: Separate function to handle hotkey and daemon setup
+// NEW: Separate function to handle hotkey and daemon setup with proper thread coordination
 async fn setup_hotkeys_and_daemon(
     app_handle: tauri::AppHandle,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    info!("🔧 Setting up hotkeys and daemon...");
+    info!("🔧 Setting up hotkeys and daemon with proper thread coordination...");
 
     let state: tauri::State<AppState> = app_handle.state();
     let settings = {
@@ -1089,17 +1004,16 @@ async fn setup_hotkeys_and_daemon(
         settings_lock.clone()
     };
 
-    // 1. FIRST: Initialize and start hotkeys on a dedicated thread
+    // 1. FIRST: Initialize hotkeys with proper thread coordination
     let (hotkey_event_tx, mut hotkey_event_rx) = tokio::sync::mpsc::unbounded_channel();
 
-    // Initialize hotkey manager on main thread for Windows compatibility
-    let hotkey_handle = tokio::spawn(async move {
-        if let Err(e) = setup_global_hotkeys(hotkey_event_tx).await {
-            error!("❌ Failed to setup hotkeys: {}", e);
-        }
-    });
+    // Set up hotkeys with platform-specific thread handling
+    if let Err(e) = setup_global_hotkeys(hotkey_event_tx.clone()).await {
+        error!("❌ Failed to setup hotkeys: {}", e);
+        return Err(e);
+    }
 
-    // Give Windows time to properly register hotkeys
+    // Give hotkeys time to initialize
     tokio::time::sleep(tokio::time::Duration::from_millis(1000)).await;
 
     // 2. THEN: Start the daemon
@@ -1157,17 +1071,131 @@ async fn setup_hotkeys_and_daemon(
         _ = hotkey_handler => {
             info!("Hotkey handler finished");
         }
-        _ = hotkey_handle => {
-            info!("Hotkey setup finished");
-        }
     }
 
     info!("✅ Hotkeys and daemon setup completed");
     Ok(())
 }
 
-// NEW: Windows-optimized hotkey setup
+// CRITICAL FIX: Platform-specific hotkey setup with proper thread coordination
 async fn setup_global_hotkeys(
+    event_tx: tokio::sync::mpsc::UnboundedSender<HotkeyEvent>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    info!("🎹 Setting up hotkeys with proper thread coordination...");
+
+    #[cfg(target_os = "windows")]
+    {
+        // CRITICAL: On Windows, create manager AND event loop on same thread
+        std::thread::spawn(move || {
+            windows_hotkey_thread(event_tx);
+        });
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        // On macOS, use main thread (which already has event loop)
+        macos_hotkey_setup(event_tx).await?;
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        // Linux can use similar approach to Windows
+        std::thread::spawn(move || {
+            linux_hotkey_thread(event_tx);
+        });
+    }
+
+    Ok(())
+}
+
+#[cfg(target_os = "windows")]
+fn windows_hotkey_thread(event_tx: tokio::sync::mpsc::UnboundedSender<HotkeyEvent>) {
+    use global_hotkey::{
+        hotkey::{Code, HotKey, Modifiers},
+        GlobalHotKeyEvent, GlobalHotKeyManager,
+    };
+
+    info!("🎹 Windows hotkey thread started");
+
+    // STEP 1: Create hotkey manager on THIS thread
+    let manager = match GlobalHotKeyManager::new() {
+        Ok(manager) => {
+            info!("✅ Windows hotkey manager created on dedicated thread");
+            manager
+        }
+        Err(e) => {
+            error!("❌ Failed to create Windows hotkey manager: {}", e);
+            return;
+        }
+    };
+
+    // STEP 2: Register hotkeys on THIS thread
+    let copy_hotkey = HotKey::new(Some(Modifiers::CONTROL | Modifiers::ALT), Code::KeyY);
+    let paste_hotkey = HotKey::new(Some(Modifiers::CONTROL | Modifiers::ALT), Code::KeyI);
+
+    if let Err(e) = manager.register(copy_hotkey) {
+        error!("❌ Failed to register copy hotkey: {}", e);
+        return;
+    }
+
+    if let Err(e) = manager.register(paste_hotkey) {
+        error!("❌ Failed to register paste hotkey: {}", e);
+        return;
+    }
+
+    info!("✅ Windows hotkeys registered: Ctrl+Alt+Y (copy), Ctrl+Alt+I (paste)");
+
+    // STEP 3: Run Win32 event loop on THIS SAME thread
+    let receiver = GlobalHotKeyEvent::receiver();
+
+    info!("🎹 Starting Windows event loop on hotkey thread");
+
+    loop {
+        // CRITICAL: Pump Windows messages on the SAME thread as manager creation
+        pump_windows_messages();
+
+        // Check for hotkey events
+        match receiver.try_recv() {
+            Ok(event) => {
+                if event.state == global_hotkey::HotKeyState::Pressed {
+                    info!("🎯 Windows hotkey event: ID={}", event.id);
+
+                    let hotkey_event = if event.id == copy_hotkey.id() {
+                        info!("🎹 Copy hotkey detected on Windows!");
+                        Some(HotkeyEvent::CopyFiles)
+                    } else if event.id == paste_hotkey.id() {
+                        info!("🎹 Paste hotkey detected on Windows!");
+                        Some(HotkeyEvent::PasteFiles)
+                    } else {
+                        None
+                    };
+
+                    if let Some(hotkey_event) = hotkey_event {
+                        if let Err(e) = event_tx.send(hotkey_event) {
+                            error!("❌ Failed to send Windows hotkey event: {}", e);
+                            break;
+                        }
+                    }
+                }
+            }
+            Err(crossbeam_channel::TryRecvError::Empty) => {
+                // No events, continue
+            }
+            Err(crossbeam_channel::TryRecvError::Disconnected) => {
+                warn!("🎹 Windows hotkey receiver disconnected");
+                break;
+            }
+        }
+
+        // Small delay to prevent CPU spinning
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+
+    info!("🎹 Windows hotkey thread ended");
+}
+
+#[cfg(target_os = "macos")]
+async fn macos_hotkey_setup(
     event_tx: tokio::sync::mpsc::UnboundedSender<HotkeyEvent>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use global_hotkey::{
@@ -1175,60 +1203,44 @@ async fn setup_global_hotkeys(
         GlobalHotKeyEvent, GlobalHotKeyManager,
     };
 
-    info!("🎹 Testing hotkeys WITHOUT manual message pump in Tauri...");
+    info!("🎹 Setting up macOS hotkeys on main thread");
 
+    // On macOS, create on main thread (where NSRunLoop is)
     let manager = GlobalHotKeyManager::new()
-        .map_err(|e| format!("Failed to create hotkey manager: {}", e))?;
+        .map_err(|e| format!("Failed to create macOS hotkey manager: {}", e))?;
 
-    let copy_hotkey = HotKey::new(Some(Modifiers::CONTROL | Modifiers::ALT), Code::KeyY);
-    let paste_hotkey = HotKey::new(Some(Modifiers::CONTROL | Modifiers::ALT), Code::KeyI);
+    let copy_hotkey = HotKey::new(Some(Modifiers::META | Modifiers::SHIFT), Code::KeyY);
+    let paste_hotkey = HotKey::new(Some(Modifiers::META | Modifiers::SHIFT), Code::KeyI);
 
-    // Register hotkeys
-    manager
-        .register(copy_hotkey)
-        .map_err(|e| format!("Copy hotkey registration failed: {}", e))?;
-    manager
-        .register(paste_hotkey)
-        .map_err(|e| format!("Paste hotkey registration failed: {}", e))?;
+    manager.register(copy_hotkey)?;
+    manager.register(paste_hotkey)?;
 
-    info!("✅ Hotkeys registered, testing if Tauri's event loop handles messages...");
+    info!("✅ macOS hotkeys registered: Cmd+Shift+Y (copy), Cmd+Shift+I (paste)");
 
-    // Simple event listener WITHOUT manual message pumping
-    std::thread::spawn(move || {
+    // macOS event handling (simplified since main thread event loop handles it)
+    tokio::spawn(async move {
         let receiver = GlobalHotKeyEvent::receiver();
-        info!("🎹 Simple hotkey listener started (no manual message pump)");
 
         loop {
-            match receiver.recv_timeout(std::time::Duration::from_millis(100)) {
+            match receiver.recv() {
                 Ok(event) => {
                     if event.state == global_hotkey::HotKeyState::Pressed {
-                        info!("🎯 TAURI EVENT DETECTED: ID={}", event.id);
-
                         let hotkey_event = if event.id == copy_hotkey.id() {
-                            info!("🎹 Copy hotkey in Tauri!");
+                            info!("🎹 Copy hotkey detected on macOS!");
                             Some(HotkeyEvent::CopyFiles)
                         } else if event.id == paste_hotkey.id() {
-                            info!("🎹 Paste hotkey in Tauri!");
+                            info!("🎹 Paste hotkey detected on macOS!");
                             Some(HotkeyEvent::PasteFiles)
                         } else {
                             None
                         };
 
                         if let Some(hotkey_event) = hotkey_event {
-                            if let Err(e) = event_tx.send(hotkey_event) {
-                                error!("❌ Failed to send hotkey event: {}", e);
-                                break;
-                            }
+                            let _ = event_tx.send(hotkey_event);
                         }
                     }
                 }
-                Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
-                    // Normal timeout, continue
-                }
-                Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
-                    warn!("🎹 Hotkey receiver disconnected");
-                    break;
-                }
+                Err(_) => break,
             }
         }
     });
@@ -1237,6 +1249,79 @@ async fn setup_global_hotkeys(
     Ok(())
 }
 
+#[cfg(target_os = "linux")]
+fn linux_hotkey_thread(event_tx: tokio::sync::mpsc::UnboundedSender<HotkeyEvent>) {
+    use global_hotkey::{
+        hotkey::{Code, HotKey, Modifiers},
+        GlobalHotKeyEvent, GlobalHotKeyManager,
+    };
+
+    info!("🎹 Linux hotkey thread started");
+
+    let manager = match GlobalHotKeyManager::new() {
+        Ok(manager) => {
+            info!("✅ Linux hotkey manager created");
+            manager
+        }
+        Err(e) => {
+            error!("❌ Failed to create Linux hotkey manager: {}", e);
+            return;
+        }
+    };
+
+    let copy_hotkey = HotKey::new(Some(Modifiers::CONTROL | Modifiers::SHIFT), Code::KeyY);
+    let paste_hotkey = HotKey::new(Some(Modifiers::CONTROL | Modifiers::SHIFT), Code::KeyI);
+
+    if let Err(e) = manager.register(copy_hotkey) {
+        error!("❌ Failed to register copy hotkey: {}", e);
+        return;
+    }
+
+    if let Err(e) = manager.register(paste_hotkey) {
+        error!("❌ Failed to register paste hotkey: {}", e);
+        return;
+    }
+
+    info!("✅ Linux hotkeys registered: Ctrl+Shift+Y (copy), Ctrl+Shift+I (paste)");
+
+    let receiver = GlobalHotKeyEvent::receiver();
+
+    loop {
+        match receiver.recv_timeout(std::time::Duration::from_millis(100)) {
+            Ok(event) => {
+                if event.state == global_hotkey::HotKeyState::Pressed {
+                    let hotkey_event = if event.id == copy_hotkey.id() {
+                        info!("🎹 Copy hotkey detected on Linux!");
+                        Some(HotkeyEvent::CopyFiles)
+                    } else if event.id == paste_hotkey.id() {
+                        info!("🎹 Paste hotkey detected on Linux!");
+                        Some(HotkeyEvent::PasteFiles)
+                    } else {
+                        None
+                    };
+
+                    if let Some(hotkey_event) = hotkey_event {
+                        if let Err(e) = event_tx.send(hotkey_event) {
+                            error!("❌ Failed to send Linux hotkey event: {}", e);
+                            break;
+                        }
+                    }
+                }
+            }
+            Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
+                // Normal timeout, continue
+            }
+            Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
+                warn!("🎹 Linux hotkey receiver disconnected");
+                break;
+            }
+        }
+    }
+
+    info!("🎹 Linux hotkey thread ended");
+}
+
+// Windows message pump function
 #[cfg(target_os = "windows")]
 fn pump_windows_messages() {
     use std::ptr;
@@ -1274,11 +1359,6 @@ fn pump_windows_messages() {
             DispatchMessageW(&msg);
         }
     }
-}
-
-#[cfg(not(target_os = "windows"))]
-fn pump_windows_messages() {
-    // No-op on non-Windows platforms
 }
 
 // Helper functions for hotkey operations
