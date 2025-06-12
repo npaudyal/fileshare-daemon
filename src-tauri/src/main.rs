@@ -7,7 +7,7 @@ use std::sync::Arc;
 use tauri::{
     menu::{Menu, MenuItem},
     tray::{MouseButton, TrayIconBuilder, TrayIconEvent},
-    Manager, WebviewUrl, WebviewWindowBuilder,
+    Manager, Theme, WebviewUrl, WebviewWindowBuilder,
 };
 use tokio::sync::{Mutex, RwLock};
 use tracing::{error, info, warn};
@@ -869,12 +869,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .setup(|app| {
             let _main_window = WebviewWindowBuilder::new(app, "main", WebviewUrl::default())
                 .title("Fileshare") // This will appear in native title bar
-                .inner_size(550.0, 550.0)
+                .inner_size(700.0, 700.0)
                 .center()
-                .decorations(true) // Enable native decorations for each platform
+                .decorations(true)
                 .resizable(false)
                 .visible(false)
                 .focused(false)
+                .shadow(true)
                 .build()?;
 
             info!("🪟 Main window created and hidden");

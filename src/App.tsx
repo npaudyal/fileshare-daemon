@@ -362,7 +362,7 @@ function App() {
             </SlideIn>
 
             {/* Content */}
-            <div className="p-4 max-h-[400px] overflow-y-auto">
+            <div className="p-4 min-h-[475px] overflow-y-auto">
                 <AnimatePresence mode="wait">
                     {activeTab === 'devices' && (
                         <FadeIn key="devices">
