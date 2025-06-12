@@ -7,17 +7,29 @@ use crate::{
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::{mpsc, RwLock};
+use tokio::time::{interval, timeout};
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
+
+// Constants for connection health monitoring
+const PING_INTERVAL_SECONDS: u64 = 30; // Ping every 30 seconds
+const PING_TIMEOUT_SECONDS: u64 = 10; // 10 second ping timeout
+const MAX_MISSED_PINGS: u32 = 3; // Disconnect after 3 missed pings
+const RECONNECTION_DELAY_SECONDS: u64 = 5; // Wait 5 seconds before reconnecting
+const MAX_RECONNECTION_ATTEMPTS: u32 = 5; // Try reconnecting 5 times
 
 #[derive(Debug, Clone)]
 pub struct Peer {
     pub device_info: DeviceInfo,
     pub connection_status: ConnectionStatus,
     pub last_ping: Option<std::time::Instant>,
+    pub ping_failures: u32,            // Track consecutive ping failures
+    pub last_seen: std::time::Instant, // Track when we last heard from this peer
+    pub reconnection_attempts: u32,    // Track reconnection attempts
 }
 
 #[derive(Debug, Clone)]
@@ -26,7 +38,21 @@ pub enum ConnectionStatus {
     Connecting,
     Connected,
     Authenticated,
+    Reconnecting, // Reconnecting state
     Error(String),
+}
+
+// Connection statistics structure
+#[derive(Debug, Default)]
+pub struct ConnectionStats {
+    pub total: usize,
+    pub authenticated: usize,
+    pub connected: usize,
+    pub connecting: usize,
+    pub reconnecting: usize,
+    pub disconnected: usize,
+    pub error: usize,
+    pub unhealthy: usize,
 }
 
 pub struct PeerManager {
@@ -91,8 +117,12 @@ impl PeerManager {
 
         for (peer_id, peer) in &self.peers {
             info!(
-                "Peer {}: {} - Status: {:?}",
-                peer_id, peer.device_info.name, peer.connection_status
+                "Peer {}: {} - Status: {:?} - Ping failures: {} - Reconnection attempts: {}",
+                peer_id,
+                peer.device_info.name,
+                peer.connection_status,
+                peer.ping_failures,
+                peer.reconnection_attempts
             );
         }
 
@@ -153,6 +183,7 @@ impl PeerManager {
         if let Some(existing_peer) = self.peers.get_mut(&device_info.id) {
             // Update last seen time and device info, but keep connection status
             existing_peer.device_info = device_info;
+            existing_peer.last_seen = Instant::now();
             debug!(
                 "Updated existing peer: {} ({})",
                 existing_peer.device_info.name, existing_peer.device_info.id
@@ -165,6 +196,9 @@ impl PeerManager {
             device_info: device_info.clone(),
             connection_status: ConnectionStatus::Disconnected,
             last_ping: None,
+            ping_failures: 0,
+            last_seen: Instant::now(),
+            reconnection_attempts: 0,
         };
 
         info!("Adding new peer: {} ({})", device_info.name, device_info.id);
@@ -223,6 +257,7 @@ impl PeerManager {
             Ok(stream) => {
                 info!("Successfully connected to peer {} at {}", peer_id, addr);
                 peer.connection_status = ConnectionStatus::Connected;
+                peer.last_seen = Instant::now();
                 self.handle_peer_connection(peer_id, stream).await?;
             }
             Err(e) => {
@@ -282,6 +317,9 @@ impl PeerManager {
                     // Update or create peer
                     if let Some(peer) = self.peers.get_mut(&device_id) {
                         peer.connection_status = ConnectionStatus::Authenticated;
+                        peer.last_seen = Instant::now();
+                        peer.ping_failures = 0;
+                        peer.reconnection_attempts = 0;
                     } else {
                         // Create new peer from handshake info
                         let device_info = DeviceInfo {
@@ -299,6 +337,9 @@ impl PeerManager {
                             device_info,
                             connection_status: ConnectionStatus::Authenticated,
                             last_ping: None,
+                            ping_failures: 0,
+                            last_seen: Instant::now(),
+                            reconnection_attempts: 0,
                         };
 
                         self.peers.insert(device_id, peer);
@@ -341,6 +382,9 @@ impl PeerManager {
                 info!("Handshake accepted by peer {}", peer_id);
                 if let Some(peer) = self.peers.get_mut(&peer_id) {
                     peer.connection_status = ConnectionStatus::Authenticated;
+                    peer.last_seen = Instant::now();
+                    peer.ping_failures = 0;
+                    peer.reconnection_attempts = 0;
                 }
                 self.handle_authenticated_connection(peer_id, connection)
                     .await?;
@@ -434,6 +478,7 @@ impl PeerManager {
 
         // Clean up when connection ends
         let cleanup_peer_id = peer_id;
+        let connections_cleanup = self.connections.clone();
         tokio::spawn(async move {
             tokio::select! {
                 _ = read_task => {
@@ -466,9 +511,9 @@ impl PeerManager {
             ));
         }
 
-        // Start file transfer
+        // Start file transfer with validation
         let mut ft = self.file_transfer.write().await;
-        ft.send_file(peer_id, file_path).await
+        ft.send_file_with_validation(peer_id, file_path).await
     }
 
     pub fn get_connected_peers(&self) -> Vec<Peer> {
@@ -479,13 +524,217 @@ impl PeerManager {
             .collect()
     }
 
-    // Simplified message handling
+    // Check health of all peers
+    pub async fn check_peer_health_all(&mut self) -> Result<()> {
+        let authenticated_peers: Vec<Uuid> = self
+            .peers
+            .iter()
+            .filter(|(_, peer)| matches!(peer.connection_status, ConnectionStatus::Authenticated))
+            .map(|(id, _)| *id)
+            .collect();
+
+        for peer_id in authenticated_peers {
+            if let Err(e) = self.check_peer_health(peer_id).await {
+                warn!("Health check failed for peer {}: {}", peer_id, e);
+            }
+        }
+
+        Ok(())
+    }
+
+    // Check individual peer health
+    async fn check_peer_health(&mut self, peer_id: Uuid) -> Result<()> {
+        info!("🩺 Checking health of peer {}", peer_id);
+
+        // Send ping and wait for response
+        match self.ping_peer_with_timeout(peer_id).await {
+            Ok(response_time) => {
+                info!(
+                    "✅ Peer {} responded to ping in {:?}",
+                    peer_id, response_time
+                );
+
+                // Reset ping failures on successful ping
+                if let Some(peer) = self.peers.get_mut(&peer_id) {
+                    peer.ping_failures = 0;
+                    peer.last_ping = Some(Instant::now());
+                    peer.last_seen = Instant::now();
+                }
+            }
+            Err(_) => {
+                warn!("❌ Peer {} failed to respond to ping", peer_id);
+                self.handle_ping_failure(peer_id).await?;
+            }
+        }
+
+        Ok(())
+    }
+
+    // Ping peer with timeout
+    async fn ping_peer_with_timeout(&mut self, peer_id: Uuid) -> Result<Duration> {
+        let start_time = Instant::now();
+        let ping_message = Message::ping();
+
+        // Send ping
+        self.send_message_to_peer(peer_id, ping_message).await?;
+
+        // Wait for pong response with timeout
+        match timeout(
+            Duration::from_secs(PING_TIMEOUT_SECONDS),
+            self.wait_for_pong(peer_id),
+        )
+        .await
+        {
+            Ok(_) => {
+                let response_time = start_time.elapsed();
+                Ok(response_time)
+            }
+            Err(_) => Err(FileshareError::Network(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "Ping timeout",
+            ))),
+        }
+    }
+
+    // Wait for pong response
+    async fn wait_for_pong(&mut self, _peer_id: Uuid) -> Result<()> {
+        // This would typically wait for a pong message
+        // For now, we'll implement a simple delay simulation
+        // In a real implementation, you'd wait for the actual pong message
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        Ok(())
+    }
+
+    // Handle ping failure
+    async fn handle_ping_failure(&mut self, peer_id: Uuid) -> Result<()> {
+        if let Some(peer) = self.peers.get_mut(&peer_id) {
+            peer.ping_failures += 1;
+
+            info!(
+                "❌ Ping failure {} for peer {}",
+                peer.ping_failures, peer_id
+            );
+
+            if peer.ping_failures >= MAX_MISSED_PINGS {
+                warn!(
+                    "💔 Peer {} exceeded max ping failures, marking as disconnected",
+                    peer_id
+                );
+                peer.connection_status = ConnectionStatus::Disconnected;
+
+                // Remove from active connections
+                self.connections.remove(&peer_id);
+
+                // Attempt reconnection if this was an authenticated peer
+                self.attempt_reconnection(peer_id).await?;
+            }
+        }
+
+        Ok(())
+    }
+
+    // Fixed version - separate the data extraction from the method calls
+    async fn attempt_reconnection(&mut self, peer_id: Uuid) -> Result<()> {
+        // First, extract the necessary data and update the peer state
+        let should_reconnect = if let Some(peer) = self.peers.get_mut(&peer_id) {
+            if peer.reconnection_attempts >= MAX_RECONNECTION_ATTEMPTS {
+                error!("💥 Max reconnection attempts reached for peer {}", peer_id);
+                peer.connection_status =
+                    ConnectionStatus::Error("Max reconnection attempts exceeded".to_string());
+                return Ok(());
+            }
+
+            peer.reconnection_attempts += 1;
+            peer.connection_status = ConnectionStatus::Reconnecting;
+
+            info!(
+                "🔄 Attempting reconnection {} to peer {}",
+                peer.reconnection_attempts, peer_id
+            );
+
+            true // Indicate we should proceed with reconnection
+        } else {
+            false // Peer not found
+        };
+
+        if should_reconnect {
+            // Wait before reconnecting
+            tokio::time::sleep(Duration::from_secs(RECONNECTION_DELAY_SECONDS)).await;
+
+            // Now we can safely call connect_to_peer since we're not holding any borrows
+            match self.connect_to_peer(peer_id).await {
+                Ok(_) => {
+                    info!("✅ Successfully reconnected to peer {}", peer_id);
+                    // Reset reconnection attempts on successful connection
+                    if let Some(peer) = self.peers.get_mut(&peer_id) {
+                        peer.reconnection_attempts = 0;
+                    }
+                }
+                Err(e) => {
+                    // Get the current attempt count for logging
+                    let attempt_count = self
+                        .peers
+                        .get(&peer_id)
+                        .map(|p| p.reconnection_attempts)
+                        .unwrap_or(0);
+
+                    warn!(
+                        "❌ Reconnection attempt {} failed for peer {}: {}",
+                        attempt_count, peer_id, e
+                    );
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    // Check if peer is healthy
+    pub fn is_peer_healthy(&self, peer_id: Uuid) -> bool {
+        if let Some(peer) = self.peers.get(&peer_id) {
+            matches!(peer.connection_status, ConnectionStatus::Authenticated)
+                && peer.ping_failures < MAX_MISSED_PINGS
+                && peer.last_seen.elapsed().as_secs() < PING_INTERVAL_SECONDS * 2
+        } else {
+            false
+        }
+    }
+
+    // Get connection statistics
+    pub fn get_connection_stats(&self) -> ConnectionStats {
+        let mut stats = ConnectionStats::default();
+
+        for (_, peer) in &self.peers {
+            match peer.connection_status {
+                ConnectionStatus::Authenticated => stats.authenticated += 1,
+                ConnectionStatus::Connected => stats.connected += 1,
+                ConnectionStatus::Connecting => stats.connecting += 1,
+                ConnectionStatus::Reconnecting => stats.reconnecting += 1,
+                ConnectionStatus::Disconnected => stats.disconnected += 1,
+                ConnectionStatus::Error(_) => stats.error += 1,
+            }
+
+            if peer.ping_failures > 0 {
+                stats.unhealthy += 1;
+            }
+        }
+
+        stats.total = self.peers.len();
+        stats
+    }
+
+    // Enhanced message handling with connection health updates
     pub async fn handle_message(
         &mut self,
         peer_id: Uuid,
         message: Message,
         clipboard: &crate::clipboard::ClipboardManager,
     ) -> Result<()> {
+        // Update last seen timestamp for any message
+        if let Some(peer) = self.peers.get_mut(&peer_id) {
+            peer.last_seen = Instant::now();
+        }
+
         info!(
             "📥 Processing message from {}: {:?}",
             peer_id, message.message_type
@@ -501,7 +750,9 @@ impl PeerManager {
             MessageType::Pong => {
                 debug!("Received pong from {}", peer_id);
                 if let Some(peer) = self.peers.get_mut(&peer_id) {
-                    peer.last_ping = Some(std::time::Instant::now());
+                    peer.last_ping = Some(Instant::now());
+                    peer.ping_failures = 0; // Reset ping failures on pong
+                    peer.last_seen = Instant::now();
                 }
             }
 

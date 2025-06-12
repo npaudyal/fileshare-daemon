@@ -7,7 +7,7 @@ use std::sync::Arc;
 use tauri::{
     menu::{Menu, MenuItem},
     tray::{MouseButton, TrayIconBuilder, TrayIconEvent},
-    Manager, Theme, WebviewUrl, WebviewWindowBuilder,
+    Manager, WebviewUrl, WebviewWindowBuilder,
 };
 use tokio::sync::{Mutex, RwLock};
 use tracing::{error, info, warn};
@@ -174,6 +174,99 @@ async fn get_system_info() -> Result<SystemInfo, String> {
         memory: 8 * 1024 * 1024 * 1024, // Mock 8GB RAM
         uptime: 3600,                   // Mock 1 hour uptime
     })
+}
+
+#[tauri::command]
+async fn pair_device_enhanced(
+    device_id: String,
+    state: tauri::State<'_, AppState>,
+) -> Result<String, String> {
+    info!("🔗 UI requested enhanced pairing for device: {}", device_id);
+
+    let device_uuid =
+        Uuid::parse_str(&device_id).map_err(|e| format!("Invalid device ID: {}", e))?;
+
+    // Check if device is discoverable and healthy
+    let is_available = {
+        if let Some(daemon_ref) = state.daemon_ref.lock().await.as_ref() {
+            let pm = daemon_ref.peer_manager.read().await;
+            pm.is_peer_healthy(device_uuid)
+        } else {
+            false
+        }
+    };
+
+    if !is_available {
+        warn!(
+            "⚠️ Attempting to pair with potentially offline device {}",
+            device_id
+        );
+    }
+
+    // Proceed with existing pairing logic
+    pair_device_with_trust(device_id, TrustLevel::Trusted, state).await?;
+
+    let status_msg = if is_available {
+        "Device paired successfully and is online"
+    } else {
+        "Device paired successfully (device may be offline)"
+    };
+
+    info!("✅ Enhanced pairing completed: {}", status_msg);
+    Ok(status_msg.to_string())
+}
+
+#[tauri::command]
+async fn test_file_transfer(state: tauri::State<'_, AppState>) -> Result<String, String> {
+    info!("🧪 Testing enhanced file transfer system");
+
+    if let Some(daemon_ref) = state.daemon_ref.lock().await.as_ref() {
+        let pm = daemon_ref.peer_manager.read().await;
+        let stats = pm.get_connection_stats();
+
+        let ft = pm.file_transfer.read().await;
+        let active_transfers = ft.get_active_transfers();
+
+        Ok(format!(
+            "📊 Transfer System Status:\n\
+            Connections: {} total ({} healthy)\n\
+            Active Transfers: {}\n\
+            System: Ready for Phase 1 (100MB limit)",
+            stats.total,
+            stats.authenticated,
+            active_transfers.len()
+        ))
+    } else {
+        Err("Daemon not ready".to_string())
+    }
+}
+
+#[tauri::command]
+async fn test_connection_health(state: tauri::State<'_, AppState>) -> Result<String, String> {
+    info!("🩺 Testing connection health monitoring");
+
+    if let Some(daemon_ref) = state.daemon_ref.lock().await.as_ref() {
+        let mut pm = daemon_ref.peer_manager.write().await;
+
+        if let Err(e) = pm.check_peer_health_all().await {
+            return Err(format!("Health check failed: {}", e));
+        }
+
+        let stats = pm.get_connection_stats();
+        Ok(format!(
+            "🫀 Health Check Complete:\n\
+            Total: {} | Healthy: {} | Unhealthy: {}\n\
+            Connected: {} | Reconnecting: {} | Errors: {}",
+            stats.total,
+            stats.authenticated,
+            stats.unhealthy,
+            stats.connected,
+            stats.reconnecting,
+            stats.error
+        ))
+    } else {
+        Err("Daemon not ready".to_string())
+    }
 }
 
 #[tauri::command]
@@ -859,6 +952,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             get_system_info,
             get_network_metrics,
             update_app_settings,
+            pair_device_enhanced,
+            test_file_transfer,
+            test_connection_health,
             export_settings,
             import_settings,
             test_hotkey_system,

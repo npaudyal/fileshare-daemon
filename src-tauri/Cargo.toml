@@ -20,7 +20,7 @@ serde_json = "1.0"
 chrono = { version = "0.4", features = ["serde"] }
 
 # Your existing dependencies (cleaned up)
-tokio = { version = "1.0", features = ["full", "process"] }
+tokio = { version = "1.0", features = ["full", "process", "time"] }
 tokio-util = { version = "0.7", features = ["codec", "net"] }
 mdns = "3.0"
 uuid = { version = "1.0", features = ["v4", "serde"] }
