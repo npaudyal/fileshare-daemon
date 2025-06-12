@@ -92,6 +92,45 @@ impl FileTransferManager {
         self.message_sender = Some(sender);
     }
 
+    pub async fn mark_outgoing_transfer_completed(&mut self, transfer_id: Uuid) -> Result<()> {
+        // First scope: Update the transfer status
+        {
+            if let Some(transfer) = self.active_transfers.get_mut(&transfer_id) {
+                if matches!(transfer.direction, TransferDirection::Outgoing) {
+                    info!(
+                        "✅ SENDER: Marking outgoing transfer {} as completed",
+                        transfer_id
+                    );
+                    transfer.status = TransferStatus::Completed;
+                    transfer.last_activity = Instant::now();
+                } else {
+                    warn!(
+                        "⚠️ Attempted to mark non-outgoing transfer {} as completed",
+                        transfer_id
+                    );
+                    return Ok(());
+                }
+            } else {
+                warn!(
+                    "⚠️ Transfer {} not found when marking as completed",
+                    transfer_id
+                );
+                return Ok(());
+            }
+        } // Mutable borrow ends here
+
+        // Second scope: Show notification with immutable borrow
+        {
+            if let Some(transfer) = self.active_transfers.get(&transfer_id) {
+                if let Err(e) = self.show_transfer_notification(transfer).await {
+                    warn!("Failed to show notification: {}", e);
+                }
+            }
+        }
+
+        Ok(())
+    }
+
     // Phase 1: Validate file size before transfer
     pub fn validate_file_size(&self, file_path: &PathBuf) -> Result<()> {
         let metadata = std::fs::metadata(file_path)

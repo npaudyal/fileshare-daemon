@@ -586,7 +586,7 @@ impl FileshareDaemon {
         Ok(())
     }
 
-    // Enhanced peer manager with health monitoring
+    // Enhanced peer manager with health monitoring - FIXED BORROW CHECKER VERSION
     async fn run_enhanced_peer_manager(
         peer_manager: Arc<RwLock<PeerManager>>,
         settings: Arc<Settings>,
@@ -663,7 +663,7 @@ impl FileshareDaemon {
             }
         });
 
-        // Message processing with enhanced routing
+        // Message processing with enhanced routing - FIXED BORROW CHECKER VERSION
         let message_pm = peer_manager.clone();
         let message_clipboard = clipboard.clone();
         let message_handle = tokio::spawn(async move {
@@ -680,7 +680,7 @@ impl FileshareDaemon {
                         continue;
                     }
 
-                    // Route transfer messages directly
+                    // Route transfer messages directly with FIXED TransferComplete handling
                     match &message.message_type {
                         crate::network::protocol::MessageType::FileOffer {
                             transfer_id, ..
@@ -705,7 +705,40 @@ impl FileshareDaemon {
                             drop(ft);
 
                             if is_outgoing {
-                                if let Err(e) = pm.send_direct_to_connection(peer_id, message).await
+                                // FIXED: Handle TransferComplete specially to mark local completion
+                                if matches!(
+                                    message.message_type,
+                                    crate::network::protocol::MessageType::TransferComplete { .. }
+                                ) {
+                                    info!("🚀 Processing outgoing TransferComplete for transfer {} to peer {}", transfer_id, peer_id);
+
+                                    // FIXED: Clone message before sending to avoid borrow checker issues
+                                    if let Err(e) =
+                                        pm.send_direct_to_connection(peer_id, message.clone()).await
+                                    {
+                                        error!(
+                                            "❌ Failed to send TransferComplete to peer {}: {}",
+                                            peer_id, e
+                                        );
+                                    }
+
+                                    // FIXED: Mark our own outgoing transfer as completed
+                                    {
+                                        let mut ft = pm.file_transfer.write().await;
+                                        if let Err(e) =
+                                            ft.mark_outgoing_transfer_completed(*transfer_id).await
+                                        {
+                                            error!("❌ Failed to mark outgoing transfer {} as completed: {}", transfer_id, e);
+                                        }
+                                    }
+
+                                    continue; // Don't process through normal handle_message
+                                }
+
+                                // For all other outgoing transfer messages, send directly
+                                // FIXED: Clone message before sending
+                                if let Err(e) =
+                                    pm.send_direct_to_connection(peer_id, message.clone()).await
                                 {
                                     error!(
                                         "❌ Failed to send direct message to peer {}: {}",
@@ -740,7 +773,7 @@ impl FileshareDaemon {
         Ok(())
     }
 
-    // Original peer manager method (kept for backward compatibility)
+    // Original peer manager method (kept for backward compatibility) - FIXED BORROW CHECKER VERSION
     async fn run_peer_manager(
         peer_manager: Arc<RwLock<PeerManager>>,
         settings: Arc<Settings>,
@@ -776,7 +809,7 @@ impl FileshareDaemon {
             }
         });
 
-        // Smart routing for outgoing transfer messages
+        // Smart routing for outgoing transfer messages - FIXED BORROW CHECKER VERSION
         let message_pm = peer_manager.clone();
         let message_clipboard = clipboard.clone();
         let message_handle = tokio::spawn(async move {
@@ -787,7 +820,7 @@ impl FileshareDaemon {
                 let mut pm = message_pm.write().await;
 
                 while let Ok((peer_id, message)) = pm.message_rx.try_recv() {
-                    // Route ALL outgoing transfer messages directly to avoid loops
+                    // Route ALL outgoing transfer messages directly to avoid loops - FIXED BORROW CHECKER VERSION
                     match &message.message_type {
                         crate::network::protocol::MessageType::FileOffer {
                             transfer_id, ..
@@ -806,7 +839,9 @@ impl FileshareDaemon {
                                     "🚀 Sending outgoing FileOffer {} directly to peer {}",
                                     transfer_id, peer_id
                                 );
-                                if let Err(e) = pm.send_direct_to_connection(peer_id, message).await
+                                // FIXED: Clone message before sending
+                                if let Err(e) =
+                                    pm.send_direct_to_connection(peer_id, message.clone()).await
                                 {
                                     error!(
                                         "❌ Failed to send FileOffer to peer {}: {}",
@@ -831,7 +866,9 @@ impl FileshareDaemon {
 
                             if is_our_outgoing {
                                 info!("🚀 Sending outgoing FileChunk for transfer {} directly to peer {}", transfer_id, peer_id);
-                                if let Err(e) = pm.send_direct_to_connection(peer_id, message).await
+                                // FIXED: Clone message before sending
+                                if let Err(e) =
+                                    pm.send_direct_to_connection(peer_id, message.clone()).await
                                 {
                                     error!(
                                         "❌ Failed to send FileChunk to peer {}: {}",
@@ -856,14 +893,28 @@ impl FileshareDaemon {
                             };
 
                             if is_our_outgoing {
-                                info!("🚀 Sending outgoing TransferComplete for transfer {} directly to peer {}", transfer_id, peer_id);
-                                if let Err(e) = pm.send_direct_to_connection(peer_id, message).await
+                                info!("🚀 Processing outgoing TransferComplete for transfer {} to peer {}", transfer_id, peer_id);
+
+                                // FIXED: Clone message before sending
+                                if let Err(e) =
+                                    pm.send_direct_to_connection(peer_id, message.clone()).await
                                 {
                                     error!(
                                         "❌ Failed to send TransferComplete to peer {}: {}",
                                         peer_id, e
                                     );
                                 }
+
+                                // FIXED: Mark our own outgoing transfer as completed
+                                {
+                                    let mut ft = pm.file_transfer.write().await;
+                                    if let Err(e) =
+                                        ft.mark_outgoing_transfer_completed(*transfer_id).await
+                                    {
+                                        error!("❌ Failed to mark outgoing transfer {} as completed: {}", transfer_id, e);
+                                    }
+                                }
+
                                 continue; // Don't process locally
                             }
                         }
@@ -883,7 +934,9 @@ impl FileshareDaemon {
 
                             if is_our_outgoing {
                                 info!("🚀 Sending outgoing TransferError for transfer {} directly to peer {}", transfer_id, peer_id);
-                                if let Err(e) = pm.send_direct_to_connection(peer_id, message).await
+                                // FIXED: Clone message before sending
+                                if let Err(e) =
+                                    pm.send_direct_to_connection(peer_id, message.clone()).await
                                 {
                                     error!(
                                         "❌ Failed to send TransferError to peer {}: {}",
