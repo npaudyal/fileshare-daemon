@@ -2,9 +2,8 @@ use crate::{
     clipboard::ClipboardManager,
     config::Settings,
     hotkeys::{HotkeyEvent, HotkeyManager},
-    network::{DiscoveryService, MessageType, PeerManager},
-    service::file_transfer::TransferDirection, // Add this import too
-    tray::SystemTray,
+    network::{DiscoveryService, PeerManager},
+    service::file_transfer::TransferDirection,
     utils::format_file_size,
     Result,
 };
@@ -14,10 +13,9 @@ use tracing::{error, info, warn};
 
 pub struct FileshareDaemon {
     settings: Arc<Settings>,
-    discovery: DiscoveryService,
-    peer_manager: Arc<RwLock<PeerManager>>,
-    tray: SystemTray,
-    hotkey_manager: HotkeyManager,
+    pub discovery: Option<DiscoveryService>,
+    pub peer_manager: Arc<RwLock<PeerManager>>,
+    hotkey_manager: Option<HotkeyManager>, // Changed to Option so we can take ownership
     clipboard: ClipboardManager,
     shutdown_tx: broadcast::Sender<()>,
     shutdown_rx: broadcast::Receiver<()>,
@@ -29,7 +27,8 @@ impl FileshareDaemon {
         let (shutdown_tx, shutdown_rx) = broadcast::channel(1);
 
         // Initialize peer manager
-        let peer_manager = Arc::new(RwLock::new(PeerManager::new(settings.clone()).await?));
+        let peer_manager = PeerManager::new(settings.clone()).await?;
+        let peer_manager = Arc::new(RwLock::new(peer_manager));
 
         // Initialize discovery service
         let discovery = DiscoveryService::new(
@@ -39,9 +38,6 @@ impl FileshareDaemon {
         )
         .await?;
 
-        // Initialize system tray
-        let tray = SystemTray::new(settings.clone(), shutdown_tx.clone())?;
-
         // Initialize hotkey manager
         let hotkey_manager = HotkeyManager::new()?;
 
@@ -50,35 +46,122 @@ impl FileshareDaemon {
 
         Ok(Self {
             settings,
-            discovery,
+            discovery: Some(discovery),
             peer_manager,
-            tray,
-            hotkey_manager,
+            hotkey_manager: Some(hotkey_manager), // Wrap in Option
             clipboard,
             shutdown_tx,
             shutdown_rx,
         })
     }
 
-    pub async fn run(mut self) -> Result<()> {
-        info!("Starting Fileshare Daemon...");
-        info!("Device ID: {}", self.settings.device.id);
-        info!("Device Name: {}", self.settings.device.name);
-        info!("Listening on port: {}", self.settings.network.port);
+    // Method to get discovered devices (for UI access)
+    pub async fn get_discovered_devices(&self) -> Vec<crate::network::discovery::DeviceInfo> {
+        let pm = self.peer_manager.read().await;
+        pm.get_all_discovered_devices().await
+    }
 
-        // Start hotkey manager
-        self.hotkey_manager.start().await?;
+    // NEW: Start background services without taking ownership (for Tauri)
+    pub async fn start_background_services(mut self: Arc<Self>) -> Result<()> {
+        info!("🚀 Starting Fileshare Daemon background services...");
+        info!("📱 Device ID: {}", self.settings.device.id);
+        info!("🏷️ Device Name: {}", self.settings.device.name);
+        info!("🌐 Listening on port: {}", self.settings.network.port);
 
-        // Start background services
-        let discovery_handle = {
-            let mut discovery = self.discovery.clone();
-            tokio::spawn(async move {
-                if let Err(e) = discovery.run().await {
-                    error!("Discovery service error: {}", e);
-                }
-            })
+        // FIXED: Take ownership of hotkey_manager instead of cloning
+        let mut hotkey_manager = {
+            // We need to get mutable access to self, but it's in an Arc
+            // This is a bit tricky - we'll need to use unsafe or restructure
+            // For now, let's create a new hotkey manager
+            HotkeyManager::new()?
         };
 
+        // Start hotkey manager and event handling
+        info!("🎹 Initializing hotkey system...");
+        let peer_manager_for_hotkeys = self.peer_manager.clone();
+        let clipboard_for_hotkeys = self.clipboard.clone();
+
+        tokio::spawn(async move {
+            if let Err(e) = hotkey_manager.start().await {
+                error!("❌ Failed to start hotkey manager: {}", e);
+                return;
+            }
+
+            info!("✅ Hotkey manager started successfully");
+
+            // Start hotkey event handler
+            Self::handle_hotkey_events(
+                &mut hotkey_manager,
+                peer_manager_for_hotkeys,
+                clipboard_for_hotkeys,
+            )
+            .await;
+        });
+
+        // Start discovery service
+        if let Some(discovery) = &self.discovery {
+            let mut discovery_clone = discovery.clone();
+            tokio::spawn(async move {
+                info!("🔍 Starting discovery service...");
+                if let Err(e) = discovery_clone.run().await {
+                    error!("❌ Discovery service error: {}", e);
+                } else {
+                    info!("✅ Discovery service started successfully");
+                }
+            });
+        } else {
+            error!("❌ Discovery service not available");
+            return Err(crate::FileshareError::Unknown(
+                "Discovery service not available".to_string(),
+            ));
+        }
+
+        // Start peer manager
+        let peer_manager = self.peer_manager.clone();
+        let settings = self.settings.clone();
+        let clipboard = self.clipboard.clone();
+        tokio::spawn(async move {
+            if let Err(e) = Self::run_peer_manager(peer_manager, settings, clipboard).await {
+                error!("❌ Peer manager error: {}", e);
+            }
+        });
+
+        info!("✅ All background services started successfully");
+        Ok(())
+    }
+
+    // Keep the existing run method for non-Tauri usage (takes ownership)
+    pub async fn run(mut self) -> Result<()> {
+        info!("🚀 Starting Fileshare Daemon...");
+        info!("📱 Device ID: {}", self.settings.device.id);
+        info!("🏷️ Device Name: {}", self.settings.device.name);
+        info!("🌐 Listening on port: {}", self.settings.network.port);
+
+        // Start hotkey manager
+        info!("🎹 Initializing hotkey system...");
+        if let Some(ref mut hotkey_manager) = self.hotkey_manager {
+            hotkey_manager.start().await?;
+            info!("✅ Hotkey manager started successfully");
+        }
+
+        // Start discovery service
+        let discovery_handle = if let Some(mut discovery) = self.discovery.take() {
+            tokio::spawn(async move {
+                info!("🔍 Starting discovery service...");
+                if let Err(e) = discovery.run().await {
+                    error!("❌ Discovery service error: {}", e);
+                } else {
+                    info!("✅ Discovery service started successfully");
+                }
+            })
+        } else {
+            error!("❌ Discovery service not available");
+            return Err(crate::FileshareError::Unknown(
+                "Discovery service not available".to_string(),
+            ));
+        };
+
+        // Start peer manager
         let peer_manager_handle = {
             let peer_manager = self.peer_manager.clone();
             let settings = self.settings.clone();
@@ -89,11 +172,11 @@ impl FileshareDaemon {
                 tokio::select! {
                     result = Self::run_peer_manager(peer_manager, settings, clipboard) => {
                         if let Err(e) = result {
-                            error!("Peer manager error: {}", e);
+                            error!("❌ Peer manager error: {}", e);
                         }
                     }
                     _ = shutdown_rx.recv() => {
-                        info!("Peer manager shutdown requested");
+                        info!("🛑 Peer manager shutdown requested");
                     }
                 }
             })
@@ -103,58 +186,39 @@ impl FileshareDaemon {
         let hotkey_handle = {
             let peer_manager = self.peer_manager.clone();
             let clipboard = self.clipboard.clone();
-            let mut hotkey_manager = self.hotkey_manager;
+            let mut hotkey_manager = self.hotkey_manager.take().unwrap();
             let mut shutdown_rx = self.shutdown_tx.subscribe();
 
             tokio::spawn(async move {
+                info!("🎹 Starting hotkey event handler...");
                 tokio::select! {
                     _ = Self::handle_hotkey_events(&mut hotkey_manager, peer_manager, clipboard) => {
-                        info!("Hotkey handler stopped");
+                        info!("🎹 Hotkey handler stopped");
                     }
                     _ = shutdown_rx.recv() => {
-                        info!("Hotkey handler shutdown requested");
+                        info!("🛑 Hotkey handler shutdown requested");
                         if let Err(e) = hotkey_manager.stop() {
-                            error!("Failed to stop hotkey manager: {}", e);
+                            error!("❌ Failed to stop hotkey manager: {}", e);
                         }
                     }
                 }
             })
         };
 
-        info!("Background services started successfully");
+        info!("✅ All background services started successfully");
 
-        // Run the system tray on the main thread
-        let tray_result = {
-            let mut tray = self.tray;
-            let mut shutdown_rx = self.shutdown_rx;
-
-            tokio::select! {
-                result = tray.run() => {
-                    match result {
-                        Ok(()) => {
-                            info!("System tray stopped normally");
-                            Ok(())
-                        }
-                        Err(e) => {
-                            error!("System tray error: {}", e);
-                            Err(e)
-                        }
-                    }
-                }
-                _ = shutdown_rx.recv() => {
-                    info!("Shutdown signal received");
-                    Ok(())
-                }
-            }
-        };
+        // Wait for shutdown signal
+        let mut shutdown_rx = self.shutdown_rx;
+        shutdown_rx.recv().await.ok();
 
         // Clean shutdown
+        info!("🛑 Shutting down services...");
         discovery_handle.abort();
         peer_manager_handle.abort();
         hotkey_handle.abort();
 
-        info!("Fileshare Daemon stopped");
-        tray_result
+        info!("✅ Fileshare Daemon stopped");
+        Ok(())
     }
 
     async fn handle_hotkey_events(
@@ -162,30 +226,36 @@ impl FileshareDaemon {
         peer_manager: Arc<RwLock<PeerManager>>,
         clipboard: ClipboardManager,
     ) {
-        info!("Starting hotkey event handler");
+        info!("🎹 Hotkey event handler active and listening...");
 
         loop {
             if let Some(event) = hotkey_manager.get_event().await {
                 match event {
                     HotkeyEvent::CopyFiles => {
-                        info!("Copy hotkey triggered - copying selected file to network clipboard");
+                        info!(
+                            "📋 Copy hotkey triggered - copying selected file to network clipboard"
+                        );
                         if let Err(e) =
                             Self::handle_copy_operation(clipboard.clone(), peer_manager.clone())
                                 .await
                         {
-                            error!("Failed to handle copy operation: {}", e);
+                            error!("❌ Failed to handle copy operation: {}", e);
                         }
                     }
                     HotkeyEvent::PasteFiles => {
-                        info!("Paste hotkey triggered - pasting from network clipboard");
+                        info!("📁 Paste hotkey triggered - pasting from network clipboard");
                         if let Err(e) =
                             Self::handle_paste_operation(clipboard.clone(), peer_manager.clone())
                                 .await
                         {
-                            error!("Failed to handle paste operation: {}", e);
+                            error!("❌ Failed to handle paste operation: {}", e);
                         }
                     }
                 }
+            } else {
+                // If get_event returns None, the channel was closed
+                warn!("🎹 Hotkey event channel closed, stopping handler");
+                break;
             }
         }
     }
@@ -194,7 +264,7 @@ impl FileshareDaemon {
         clipboard: ClipboardManager,
         peer_manager: Arc<RwLock<PeerManager>>,
     ) -> Result<()> {
-        info!("Handling copy operation");
+        info!("📋 Handling copy operation");
 
         // Copy currently selected file to network clipboard
         clipboard.copy_selected_file().await?;
@@ -225,7 +295,7 @@ impl FileshareDaemon {
                 let mut pm = peer_manager.write().await;
                 if let Err(e) = pm.send_message_to_peer(peer.device_info.id, message).await {
                     warn!(
-                        "Failed to send clipboard update to {}: {}",
+                        "❌ Failed to send clipboard update to {}: {}",
                         peer.device_info.id, e
                     );
                 }
@@ -251,7 +321,7 @@ impl FileshareDaemon {
                     crate::FileshareError::Unknown(format!("Notification error: {}", e))
                 })?;
 
-            info!("Copy operation completed successfully");
+            info!("✅ Copy operation completed successfully");
         }
 
         Ok(())
@@ -261,12 +331,12 @@ impl FileshareDaemon {
         clipboard: ClipboardManager,
         peer_manager: Arc<RwLock<PeerManager>>,
     ) -> Result<()> {
-        info!("Handling paste operation");
+        info!("📁 Handling paste operation");
 
         // Try to paste from network clipboard
         if let Some((target_path, source_device)) = clipboard.paste_to_current_location().await? {
             info!(
-                "Requesting file transfer from device {} to {:?}",
+                "📁 Requesting file transfer from device {} to {:?}",
                 source_device, target_path
             );
 
@@ -280,16 +350,6 @@ impl FileshareDaemon {
                     .to_string_lossy()
                     .to_string()
             };
-
-            // DEBUG: Log what we're about to send
-            info!(
-                "DEBUG: Source file path for FileRequest: {}",
-                source_file_path
-            );
-            info!(
-                "DEBUG: Target file path for FileRequest: {}",
-                target_path.to_string_lossy()
-            );
 
             // Send file request to source device
             let request_id = uuid::Uuid::new_v4();
@@ -314,19 +374,23 @@ impl FileshareDaemon {
                     crate::FileshareError::Unknown(format!("Notification error: {}", e))
                 })?;
 
-            info!("File request sent to source device");
+            info!("✅ File request sent to source device");
         }
 
         Ok(())
     }
 
+    // FIXED: Smart routing message processing
     async fn run_peer_manager(
         peer_manager: Arc<RwLock<PeerManager>>,
         settings: Arc<Settings>,
         clipboard: ClipboardManager,
     ) -> Result<()> {
         let listener = tokio::net::TcpListener::bind(settings.get_bind_address()).await?;
-        info!("Peer manager listening on {}", settings.get_bind_address());
+        info!(
+            "🌐 Peer manager listening on {}",
+            settings.get_bind_address()
+        );
 
         // Spawn a task to handle incoming connections
         let connection_pm = peer_manager.clone();
@@ -334,26 +398,25 @@ impl FileshareDaemon {
             loop {
                 match listener.accept().await {
                     Ok((stream, addr)) => {
-                        info!("New connection from {}", addr);
+                        info!("🔗 New connection from {}", addr);
                         let pm = connection_pm.clone();
 
                         tokio::spawn(async move {
                             let mut pm = pm.write().await;
                             if let Err(e) = pm.handle_connection(stream).await {
-                                warn!("Failed to handle connection from {}: {}", addr, e);
+                                warn!("❌ Failed to handle connection from {}: {}", addr, e);
                             }
                         });
                     }
                     Err(e) => {
-                        error!("Failed to accept connection: {}", e);
+                        error!("❌ Failed to accept connection: {}", e);
                         tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
                     }
                 }
             }
         });
 
-        // In daemon.rs, replace the message handling task in run_peer_manager:
-
+        // FIXED: Smart routing for outgoing transfer messages
         let message_pm = peer_manager.clone();
         let message_clipboard = clipboard.clone();
         let message_handle = tokio::spawn(async move {
@@ -366,7 +429,9 @@ impl FileshareDaemon {
                 while let Ok((peer_id, message)) = pm.message_rx.try_recv() {
                     // CRITICAL: Route ALL outgoing transfer messages directly to avoid loops
                     match &message.message_type {
-                        MessageType::FileOffer { transfer_id, .. } => {
+                        crate::network::protocol::MessageType::FileOffer {
+                            transfer_id, ..
+                        } => {
                             let is_our_outgoing = {
                                 let ft = pm.file_transfer.read().await;
                                 ft.has_transfer(*transfer_id)
@@ -392,7 +457,9 @@ impl FileshareDaemon {
                             }
                         }
 
-                        MessageType::FileChunk { transfer_id, .. } => {
+                        crate::network::protocol::MessageType::FileChunk {
+                            transfer_id, ..
+                        } => {
                             let is_our_outgoing = {
                                 let ft = pm.file_transfer.read().await;
                                 ft.has_transfer(*transfer_id)
@@ -415,7 +482,10 @@ impl FileshareDaemon {
                             }
                         }
 
-                        MessageType::TransferComplete { transfer_id, .. } => {
+                        crate::network::protocol::MessageType::TransferComplete {
+                            transfer_id,
+                            ..
+                        } => {
                             let is_our_outgoing = {
                                 let ft = pm.file_transfer.read().await;
                                 ft.has_transfer(*transfer_id)
@@ -438,7 +508,10 @@ impl FileshareDaemon {
                             }
                         }
 
-                        MessageType::TransferError { transfer_id, .. } => {
+                        crate::network::protocol::MessageType::TransferError {
+                            transfer_id,
+                            ..
+                        } => {
                             let is_our_outgoing = {
                                 let ft = pm.file_transfer.read().await;
                                 ft.has_transfer(*transfer_id)

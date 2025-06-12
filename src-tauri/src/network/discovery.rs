@@ -75,20 +75,26 @@ impl DiscoveryService {
     }
 
     async fn run_broadcaster(settings: Arc<Settings>) {
-        info!("Starting discovery broadcaster");
+        info!(
+            "🔊 Starting discovery broadcaster on port {}",
+            settings.network.discovery_port
+        );
+
+        // Add a small delay to ensure network is ready
+        tokio::time::sleep(Duration::from_secs(1)).await;
 
         loop {
             match Self::broadcast_presence(&settings).await {
                 Ok(()) => {
-                    debug!("Successfully broadcasted presence");
+                    debug!("✅ Successfully broadcasted presence");
                 }
                 Err(e) => {
-                    warn!("Failed to broadcast presence: {}", e);
+                    warn!("❌ Failed to broadcast presence: {}", e);
                 }
             }
 
-            // Wait 10 seconds before next broadcast
-            tokio::time::sleep(Duration::from_secs(10)).await;
+            // Wait 5 seconds before next broadcast (reduced for testing)
+            tokio::time::sleep(Duration::from_secs(5)).await;
         }
     }
 
@@ -97,29 +103,37 @@ impl DiscoveryService {
         discovered_devices: Arc<RwLock<HashMap<Uuid, DeviceInfo>>>,
         peer_manager: Arc<RwLock<PeerManager>>,
     ) {
-        info!("Starting discovery listener");
+        info!(
+            "👂 Starting discovery listener on port {}",
+            settings.network.discovery_port
+        );
 
         // Create listener socket
         let bind_addr = format!("0.0.0.0:{}", settings.network.discovery_port);
-        info!("Binding discovery listener to {}", bind_addr);
+        info!("🔌 Binding discovery listener to {}", bind_addr);
 
         let socket = match tokio::net::UdpSocket::bind(&bind_addr).await {
             Ok(socket) => {
-                info!("Discovery listener bound successfully to {}", bind_addr);
+                info!("✅ Discovery listener bound successfully to {}", bind_addr);
                 socket
             }
             Err(e) => {
-                error!("Failed to bind discovery listener to {}: {}", bind_addr, e);
+                error!(
+                    "❌ Failed to bind discovery listener to {}: {}",
+                    bind_addr, e
+                );
                 return;
             }
         };
 
         let mut buf = [0; 2048];
 
+        info!("👂 Discovery listener ready, waiting for packets...");
+
         loop {
             match socket.recv_from(&mut buf).await {
                 Ok((len, addr)) => {
-                    debug!("Received discovery packet from {} ({} bytes)", addr, len);
+                    info!("📦 Received discovery packet from {} ({} bytes)", addr, len);
 
                     let data = String::from_utf8_lossy(&buf[..len]);
                     debug!("Discovery packet content: {}", data);
