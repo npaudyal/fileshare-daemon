@@ -1,7 +1,9 @@
 use crate::{
     config::Settings,
     network::{discovery::DeviceInfo, protocol::*},
-    service::file_transfer::{FileTransferManager, MessageSender, TransferDirection},
+    service::file_transfer::{
+        FileTransferManager, MessageSender, TransferDirection, TransferStatus,
+    },
     FileshareError, Result,
 };
 use std::collections::HashMap;
@@ -870,6 +872,24 @@ impl PeerManager {
                 transfer_id,
                 checksum,
             } => {
+                info!(
+                    "✅ Received TransferComplete for transfer {} from peer {}",
+                    transfer_id, peer_id
+                );
+
+                // Check if we already processed this completion
+                let ft = self.file_transfer.read().await;
+                if let Some(transfer) = ft.active_transfers.get(&transfer_id) {
+                    if matches!(transfer.status, TransferStatus::Completed) {
+                        info!(
+                            "✅ Transfer {} already marked as complete, ignoring duplicate",
+                            transfer_id
+                        );
+                        return Ok(());
+                    }
+                }
+                drop(ft);
+
                 let mut ft = self.file_transfer.write().await;
                 ft.handle_transfer_complete(peer_id, transfer_id, checksum)
                     .await?;

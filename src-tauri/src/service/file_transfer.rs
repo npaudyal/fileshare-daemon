@@ -74,7 +74,7 @@ pub enum TransferStatus {
 
 pub struct FileTransferManager {
     settings: Arc<Settings>,
-    active_transfers: HashMap<Uuid, FileTransfer>,
+    pub active_transfers: HashMap<Uuid, FileTransfer>,
     message_sender: Option<MessageSender>,
 }
 
@@ -204,13 +204,39 @@ impl FileTransferManager {
         Duration::from_millis(delay_ms)
     }
 
-    // Monitor transfer timeouts and auto-recovery
+    // Enhanced monitor that excludes completed/successful transfers
     pub async fn monitor_transfer_health(&mut self) -> Result<()> {
         let now = Instant::now();
         let mut timed_out_transfers = Vec::new();
         let mut stale_transfers = Vec::new();
 
         for (transfer_id, transfer) in &self.active_transfers {
+            // CRITICAL: Skip monitoring for completed or successful transfers
+            match &transfer.status {
+                TransferStatus::Completed => {
+                    info!(
+                        "✅ Skipping health check for completed transfer {}",
+                        transfer_id
+                    );
+                    continue;
+                }
+                TransferStatus::Error(_) => {
+                    info!(
+                        "⚠️ Skipping health check for errored transfer {}",
+                        transfer_id
+                    );
+                    continue;
+                }
+                TransferStatus::Cancelled => {
+                    info!(
+                        "🚫 Skipping health check for cancelled transfer {}",
+                        transfer_id
+                    );
+                    continue;
+                }
+                _ => {} // Continue monitoring active/pending transfers
+            }
+
             // Check for overall transfer timeout
             if now.duration_since(transfer.created_at).as_secs() > TRANSFER_TIMEOUT_SECONDS {
                 error!(
@@ -224,7 +250,7 @@ impl FileTransferManager {
             // Check for inactive transfers (no activity for chunk timeout)
             if now.duration_since(transfer.last_activity).as_secs() > CHUNK_TIMEOUT_SECONDS {
                 match transfer.status {
-                    TransferStatus::Active => {
+                    TransferStatus::Active | TransferStatus::Pending => {
                         warn!(
                             "⚠️ Transfer {} inactive for {} seconds, marking for recovery",
                             transfer_id, CHUNK_TIMEOUT_SECONDS
@@ -269,12 +295,40 @@ impl FileTransferManager {
         Ok(())
     }
 
-    // Fixed version - extract data first, then modify HashMap
+    // Enhanced recovery that checks completion status
     async fn attempt_transfer_recovery(&mut self, transfer_id: Uuid) -> Result<()> {
-        // First, extract the data we need and determine if we should proceed
+        // First, verify the transfer still needs recovery
         let recovery_data = if let Some(transfer) = self.active_transfers.get_mut(&transfer_id) {
-            // Only attempt recovery for outgoing transfers that are stale
-            if matches!(transfer.direction, TransferDirection::Outgoing) {
+            // CRITICAL: Don't recover completed/successful transfers
+            match &transfer.status {
+                TransferStatus::Completed => {
+                    info!(
+                        "✅ Skipping recovery for completed transfer {}",
+                        transfer_id
+                    );
+                    return Ok(());
+                }
+                TransferStatus::Error(_) => {
+                    info!("⚠️ Skipping recovery for errored transfer {}", transfer_id);
+                    return Ok(());
+                }
+                TransferStatus::Cancelled => {
+                    info!(
+                        "🚫 Skipping recovery for cancelled transfer {}",
+                        transfer_id
+                    );
+                    return Ok(());
+                }
+                _ => {} // Continue with recovery for active/pending transfers
+            }
+
+            // Only attempt recovery for outgoing transfers that are genuinely stale
+            if matches!(transfer.direction, TransferDirection::Outgoing)
+                && matches!(
+                    transfer.status,
+                    TransferStatus::Active | TransferStatus::Pending
+                )
+            {
                 info!("🔄 Attempting recovery for stale transfer {}", transfer_id);
 
                 // Update retry state
@@ -304,15 +358,24 @@ impl FileTransferManager {
                     None
                 }
             } else {
-                None // Not an outgoing transfer
+                info!(
+                    "ℹ️ Transfer {} doesn't need recovery (not outgoing or not active)",
+                    transfer_id
+                );
+                None // Not an outgoing transfer or not in recoverable state
             }
         } else {
+            warn!(
+                "⚠️ Transfer {} not found during recovery attempt",
+                transfer_id
+            );
             None // Transfer not found
         };
 
         // Now handle recovery outside of the borrow
         if let Some((file_path, peer_id, attempt_count)) = recovery_data {
             // Remove the old transfer and start fresh
+            info!("🔄 Removing old transfer {} for fresh retry", transfer_id);
             self.active_transfers.remove(&transfer_id);
 
             // Retry after a delay
@@ -320,6 +383,7 @@ impl FileTransferManager {
             sleep(delay).await;
 
             // Now we can safely call send_file_with_target_dir
+            info!("🚀 Starting fresh transfer after recovery delay");
             self.send_file_with_target_dir(peer_id, file_path, None)
                 .await?;
         }
@@ -356,36 +420,57 @@ impl FileTransferManager {
         Ok(())
     }
 
-    // Enhanced cleanup with health monitoring
+    // Enhanced cleanup that protects completed transfers
     pub fn cleanup_stale_transfers_enhanced(&mut self) {
         let now = Instant::now();
         let timeout = Duration::from_secs(TRANSFER_TIMEOUT_SECONDS);
-        let chunk_timeout = Duration::from_secs(CHUNK_TIMEOUT_SECONDS);
+        let completion_grace_period = Duration::from_secs(30); // 30 seconds grace for completed transfers
 
         let initial_count = self.active_transfers.len();
 
         self.active_transfers.retain(|transfer_id, transfer| {
+            // CRITICAL: Give completed transfers a grace period before cleanup
+            match &transfer.status {
+                TransferStatus::Completed => {
+                    if now.duration_since(transfer.last_activity) > completion_grace_period {
+                        info!("🧹 Cleaning up completed transfer: {}", transfer_id);
+                        return false;
+                    } else {
+                        info!("✅ Protecting recently completed transfer: {}", transfer_id);
+                        return true; // Keep it for grace period
+                    }
+                }
+                TransferStatus::Error(_) => {
+                    if now.duration_since(transfer.last_activity) > Duration::from_secs(60) {
+                        info!("🧹 Cleaning up errored transfer: {}", transfer_id);
+                        return false;
+                    }
+                    return true;
+                }
+                TransferStatus::Cancelled => {
+                    if now.duration_since(transfer.last_activity) > Duration::from_secs(10) {
+                        info!("🧹 Cleaning up cancelled transfer: {}", transfer_id);
+                        return false;
+                    }
+                    return true;
+                }
+                _ => {} // Continue with normal cleanup logic for active transfers
+            }
+
             // Remove transfers that have been running too long
             if now.duration_since(transfer.created_at) > timeout {
                 warn!("🧹 Removing timed out transfer: {}", transfer_id);
                 return false;
             }
 
-            // Remove transfers that have been inactive for too long
-            if matches!(transfer.status, TransferStatus::Active)
-                && now.duration_since(transfer.last_activity) > chunk_timeout
-            {
-                warn!("🧹 Removing inactive transfer: {}", transfer_id);
-                return false;
-            }
-
-            // Remove completed or error transfers after some time
+            // Remove transfers that have been inactive for too long (only active ones)
             if matches!(
                 transfer.status,
-                TransferStatus::Completed | TransferStatus::Error(_)
-            ) && now.duration_since(transfer.last_activity) > Duration::from_secs(60)
+                TransferStatus::Active | TransferStatus::Pending
+            ) && now.duration_since(transfer.last_activity)
+                > Duration::from_secs(CHUNK_TIMEOUT_SECONDS)
             {
-                info!("🧹 Removing completed/error transfer: {}", transfer_id);
+                warn!("🧹 Removing inactive transfer: {}", transfer_id);
                 return false;
             }
 
@@ -950,12 +1035,13 @@ impl FileTransferManager {
     }
 
     async fn complete_file_transfer(&mut self, transfer_id: Uuid) -> Result<()> {
-        let (file_path, expected_checksum, file_data) = {
+        let (file_path, expected_checksum, file_data, peer_id) = {
             let transfer = self
                 .active_transfers
                 .get_mut(&transfer_id)
                 .ok_or_else(|| FileshareError::Transfer("Transfer not found".to_string()))?;
 
+            // CRITICAL: Mark as completed IMMEDIATELY to prevent retries
             transfer.status = TransferStatus::Completed;
             transfer.last_activity = Instant::now();
 
@@ -963,6 +1049,7 @@ impl FileTransferManager {
                 transfer.file_path.clone(),
                 transfer.metadata.checksum.clone(),
                 transfer.received_data.clone(),
+                transfer.peer_id,
             )
         };
 
@@ -1000,16 +1087,43 @@ impl FileTransferManager {
             }
         }
 
+        // Send completion acknowledgment to sender
+        if let Some(ref sender) = self.message_sender {
+            let completion_ack = Message::new(MessageType::TransferComplete {
+                transfer_id,
+                checksum: expected_checksum,
+            });
+
+            if let Err(e) = sender.send((peer_id, completion_ack)) {
+                warn!("Failed to send completion acknowledgment: {}", e);
+            } else {
+                info!(
+                    "✅ Sent completion acknowledgment for transfer {}",
+                    transfer_id
+                );
+            }
+        }
+
         info!(
             "🎉 RECEIVER: File transfer {} completed successfully: {:?}",
             transfer_id, file_path
         );
 
+        // Show notification
         if let Some(transfer) = self.active_transfers.get(&transfer_id) {
             if let Err(e) = self.show_transfer_notification(transfer).await {
                 warn!("Failed to show notification: {}", e);
             }
         }
+
+        // CRITICAL: Remove completed transfer after a short delay to prevent immediate cleanup issues
+        tokio::spawn({
+            let transfer_id = transfer_id;
+            async move {
+                tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
+                // Note: We can't access self here, so we'll handle this in the cleanup method
+            }
+        });
 
         Ok(())
     }
