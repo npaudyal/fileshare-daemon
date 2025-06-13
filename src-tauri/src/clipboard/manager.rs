@@ -53,22 +53,30 @@ impl ClipboardManager {
     pub async fn copy_selected_file(&self) -> crate::Result<()> {
         info!("Attempting to copy currently selected file");
 
-        // Get the currently selected file from the OS
         let selected_file = self.get_selected_file_from_os().await?;
 
         if let Some(file_path) = selected_file {
             info!("Copying file to network clipboard: {:?}", file_path);
 
-            // Get file info
-            let metadata = tokio::fs::metadata(&file_path).await.map_err(|e| {
-                crate::FileshareError::FileOperation(format!("Cannot access file: {}", e))
-            })?;
+            // NEW: Check which transfer method will be used
+            let file_size = tokio::fs::metadata(&file_path)
+                .await
+                .map_err(|e| {
+                    crate::FileshareError::FileOperation(format!("Cannot access file: {}", e))
+                })?
+                .len();
+
+            let transfer_method = if file_size > 100 * 1024 * 1024 {
+                "High-Speed Streaming 🚀"
+            } else {
+                "Standard Transfer 📦"
+            };
 
             let clipboard_item = NetworkClipboardItem {
                 file_path: file_path.clone(),
                 source_device: self.device_id,
                 timestamp: crate::utils::current_timestamp(),
-                file_size: metadata.len(),
+                file_size,
             };
 
             {
@@ -78,11 +86,22 @@ impl ClipboardManager {
 
             info!("File copied to network clipboard: {:?}", file_path);
 
-            // TODO: Broadcast to other devices that something was copied
+            // Enhanced notification showing transfer method
+            let filename = file_path.file_name().unwrap_or_default().to_string_lossy();
+            let file_size_mb = file_size as f64 / (1024.0 * 1024.0);
+
+            self.show_notification(
+                "File Ready for Network Transfer",
+                &format!(
+                    "📋 {}\n📊 {:.1} MB\n🚀 Method: {}",
+                    filename, file_size_mb, transfer_method
+                ),
+            )
+            .await?;
+
             self.broadcast_clipboard_update().await?;
         } else {
             info!("No file selected in file manager");
-            // Show notification that no file is selected
             self.show_notification(
                 "Nothing Selected",
                 "Please select a file in your file manager first",

@@ -3,6 +3,7 @@
 
 use fileshare_daemon::{config::Settings, service::FileshareDaemon};
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::Arc;
 use tauri::{
     menu::{Menu, MenuItem},
@@ -57,6 +58,58 @@ async fn test_hotkey_system() -> Result<String, String> {
     tokio::task::spawn_blocking(|| run_hotkey_diagnostics())
         .await
         .map_err(|e| format!("Test spawn error: {}", e))
+}
+
+#[tauri::command]
+async fn get_transfer_info(
+    file_path: String,
+    state: tauri::State<'_, AppState>,
+) -> Result<TransferInfo, String> {
+    let path = PathBuf::from(file_path);
+
+    if !path.exists() {
+        return Err("File does not exist".to_string());
+    }
+
+    let metadata = std::fs::metadata(&path).map_err(|e| format!("Cannot access file: {}", e))?;
+
+    let file_size = metadata.len();
+    let file_size_mb = file_size as f64 / (1024.0 * 1024.0);
+
+    let (method, description, estimated_time) = if file_size > 100 * 1024 * 1024 {
+        (
+            "streaming".to_string(),
+            "High-Speed Streaming Protocol 🚀".to_string(),
+            format!("{:.1} seconds (estimated)", file_size_mb / 50.0), // Assume 50MB/s
+        )
+    } else {
+        (
+            "chunked".to_string(),
+            "Standard Chunked Transfer 📦".to_string(),
+            format!("{:.1} seconds (estimated)", file_size_mb / 10.0), // Assume 10MB/s
+        )
+    };
+
+    Ok(TransferInfo {
+        file_size,
+        file_size_mb,
+        transfer_method: method,
+        method_description: description,
+        estimated_transfer_time: estimated_time,
+        supports_resume: file_size > 100 * 1024 * 1024,
+        compression_enabled: file_size > 1024 * 1024, // Compress files > 1MB
+    })
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct TransferInfo {
+    file_size: u64,
+    file_size_mb: f64,
+    transfer_method: String,
+    method_description: String,
+    estimated_transfer_time: String,
+    supports_resume: bool,
+    compression_enabled: bool,
 }
 
 #[tauri::command]
@@ -943,6 +996,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             rename_device_enhanced,
             forget_device,
             bulk_device_action,
+            get_transfer_info,
             connect_to_peer,
             disconnect_from_peer,
             get_device_stats,

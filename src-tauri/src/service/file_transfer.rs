@@ -1,3 +1,5 @@
+use crate::network::{StreamingConfig, StreamingFileMetadata};
+use crate::service::streaming_transfer::StreamingTransferManager;
 use crate::{config::Settings, network::protocol::*, FileshareError, Result};
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -76,15 +78,113 @@ pub struct FileTransferManager {
     settings: Arc<Settings>,
     pub active_transfers: HashMap<Uuid, FileTransfer>,
     message_sender: Option<MessageSender>,
+    streaming_manager: StreamingTransferManager,
 }
 
 impl FileTransferManager {
     pub async fn new(settings: Arc<Settings>) -> Result<Self> {
+        // Create streaming config from settings
+        let streaming_config = StreamingConfig {
+            base_chunk_size: std::cmp::max(settings.transfer.chunk_size, 256 * 1024), // Min 256KB
+            max_chunk_size: 2 * 1024 * 1024,                                          // 2MB
+            compression_threshold: 1024,
+            memory_limit: 50 * 1024 * 1024,
+            enable_compression: true,
+            compression_level: 1,
+        };
+
         Ok(Self {
             settings,
             active_transfers: HashMap::new(),
             message_sender: None,
+            streaming_manager: StreamingTransferManager::new(streaming_config),
         })
+    }
+
+    pub async fn send_file_streaming(
+        &mut self,
+        peer_id: Uuid,
+        file_path: PathBuf,
+        stream: tokio::net::TcpStream,
+    ) -> Result<()> {
+        // Check file size
+        let file_size = std::fs::metadata(&file_path)
+            .map_err(|e| FileshareError::FileOperation(format!("Cannot access file: {}", e)))?
+            .len();
+
+        info!(
+            "🚀 STREAMING_SEND: Starting streaming transfer for {} ({} MB)",
+            file_path.display(),
+            file_size / (1024 * 1024)
+        );
+
+        if file_size > 100 * 1024 * 1024 {
+            // Use streaming for files > 100MB
+            info!(
+                "✅ Using streaming transfer for large file: {} MB",
+                file_size / (1024 * 1024)
+            );
+
+            // Create transfer record for tracking
+            let transfer_id = uuid::Uuid::new_v4();
+
+            // Show notification that streaming transfer is starting
+            notify_rust::Notification::new()
+                .summary("🚀 High-Speed Transfer Starting")
+                .body(&format!(
+                    "Streaming {} ({:.1} MB) via high-performance protocol",
+                    file_path.file_name().unwrap_or_default().to_string_lossy(),
+                    file_size as f64 / (1024.0 * 1024.0)
+                ))
+                .timeout(notify_rust::Timeout::Milliseconds(3000))
+                .show()
+                .map_err(|e| {
+                    crate::FileshareError::Unknown(format!("Notification error: {}", e))
+                })?;
+
+            // Use the streaming manager
+            self.streaming_manager
+                .start_streaming_transfer(peer_id, file_path, stream)
+                .await?;
+
+            // Show completion notification
+            notify_rust::Notification::new()
+                .summary("✅ High-Speed Transfer Complete")
+                .body("File sent successfully via streaming protocol")
+                .timeout(notify_rust::Timeout::Milliseconds(3000))
+                .show()
+                .map_err(|e| {
+                    crate::FileshareError::Unknown(format!("Notification error: {}", e))
+                })?;
+
+            Ok(())
+        } else {
+            // Use existing chunked transfer for smaller files
+            info!(
+                "📦 Using chunked transfer for small file: {} MB",
+                file_size / (1024 * 1024)
+            );
+            self.send_file_with_target_dir(peer_id, file_path, None)
+                .await
+        }
+    }
+
+    // NEW: Add a method to detect if a transfer should use streaming
+    pub fn should_use_streaming(&self, file_path: &PathBuf) -> bool {
+        if let Ok(metadata) = std::fs::metadata(file_path) {
+            metadata.len() > 100 * 1024 * 1024 // 100MB threshold
+        } else {
+            false
+        }
+    }
+
+    // NEW: Add method for UI to check transfer method
+    pub async fn get_transfer_method(&self, file_path: &PathBuf) -> String {
+        if self.should_use_streaming(file_path) {
+            "High-Speed Streaming".to_string()
+        } else {
+            "Standard Chunked".to_string()
+        }
     }
 
     // Set the message sender (replaces DirectPeerSender)

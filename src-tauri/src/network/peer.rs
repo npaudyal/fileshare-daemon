@@ -1,9 +1,7 @@
 use crate::{
     config::Settings,
     network::{discovery::DeviceInfo, protocol::*},
-    service::file_transfer::{
-        FileTransferManager, MessageSender, TransferDirection, TransferStatus,
-    },
+    service::file_transfer::{FileTransferManager, TransferStatus},
     FileshareError, Result,
 };
 use std::collections::HashMap;
@@ -13,7 +11,7 @@ use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::{mpsc, RwLock};
-use tokio::time::{interval, timeout};
+use tokio::time::timeout;
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
@@ -949,6 +947,10 @@ impl PeerManager {
             return Ok(());
         }
 
+        // Check file size to determine transfer method
+        let file_size = std::fs::metadata(&file_path)?.len();
+        let use_streaming = file_size > 100 * 1024 * 1024; // 100MB threshold
+
         // Accept the request
         let response = Message::new(MessageType::FileRequestResponse {
             request_id,
@@ -961,20 +963,64 @@ impl PeerManager {
         }
 
         info!(
-            "File request accepted, starting file transfer to peer {} for file: {:?}",
-            peer_id, file_path
+            "File request accepted, starting {} transfer for file: {:?} ({} MB)",
+            if use_streaming {
+                "STREAMING"
+            } else {
+                "CHUNKED"
+            },
+            file_path,
+            file_size / (1024 * 1024)
         );
 
-        // Extract target directory
-        let target_dir = Self::extract_target_directory(&target_path);
+        // NEW: Choose transfer method based on file size
+        if use_streaming {
+            self.initiate_streaming_transfer(peer_id, file_path, target_path)
+                .await?;
+        } else {
+            // Use existing chunked transfer for smaller files
+            let target_dir = Self::extract_target_directory(&target_path);
+            let mut ft = self.file_transfer.write().await;
+            ft.send_file_with_target_dir(peer_id, file_path, target_dir)
+                .await?;
+        }
 
-        info!("Target directory extracted: {:?}", target_dir);
+        Ok(())
+    }
 
-        // Start file transfer with target directory
+    // NEW: Initiate streaming transfer
+    async fn initiate_streaming_transfer(
+        &mut self,
+        peer_id: Uuid,
+        file_path: PathBuf,
+        _target_path: PathBuf,
+    ) -> Result<()> {
+        info!("🚀 Initiating streaming transfer to peer {}", peer_id);
+
+        // Get peer connection info
+        let peer_addr = {
+            let peer = self
+                .peers
+                .get(&peer_id)
+                .ok_or_else(|| FileshareError::Unknown("Peer not found".to_string()))?;
+            peer.device_info.addr
+        };
+
+        // Create dedicated streaming connection
+        let stream = tokio::net::TcpStream::connect(peer_addr)
+            .await
+            .map_err(|e| FileshareError::Network(e))?;
+
+        info!("✅ Connected to peer {} for streaming transfer", peer_id);
+
+        // Use the streaming transfer manager
         let mut ft = self.file_transfer.write().await;
-        ft.send_file_with_target_dir(peer_id, file_path, target_dir)
-            .await?;
+        if let Err(e) = ft.send_file_streaming(peer_id, file_path, stream).await {
+            error!("❌ Streaming transfer failed: {}", e);
+            return Err(e);
+        }
 
+        info!("✅ Streaming transfer initiated successfully");
         Ok(())
     }
 

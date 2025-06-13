@@ -1,3 +1,4 @@
+use crate::network::streaming_protocol::*;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use uuid::Uuid;
@@ -67,6 +68,30 @@ pub enum MessageType {
     TransferError {
         transfer_id: Uuid,
         error: String,
+    },
+    StreamingFileOffer {
+        transfer_id: Uuid,
+        metadata: StreamingFileMetadata,
+    },
+    StreamingFileOfferResponse {
+        transfer_id: Uuid,
+        accepted: bool,
+        reason: Option<String>,
+        suggested_config: Option<StreamingConfig>,
+    },
+
+    // Raw streaming data is sent separately, not through this message system
+    // Only control messages go through the regular protocol
+    StreamingTransferComplete {
+        transfer_id: Uuid,
+        bytes_transferred: u64,
+        chunks_received: u64,
+        file_hash: String,
+    },
+    StreamingTransferError {
+        transfer_id: Uuid,
+        error: String,
+        chunk_index: Option<u64>,
     },
 
     // Control
