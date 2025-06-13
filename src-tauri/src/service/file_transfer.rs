@@ -78,7 +78,7 @@ pub struct FileTransferManager {
     settings: Arc<Settings>,
     pub active_transfers: HashMap<Uuid, FileTransfer>,
     message_sender: Option<MessageSender>,
-    streaming_manager: StreamingTransferManager,
+    pub streaming_manager: StreamingTransferManager,
 }
 
 impl FileTransferManager {
@@ -117,6 +117,29 @@ impl FileTransferManager {
             file_size as f64 / (1024.0 * 1024.0)
         );
 
+        // Create transfer ID and metadata
+        let transfer_id = uuid::Uuid::new_v4();
+
+        // Create streaming metadata
+        let metadata = self.create_streaming_metadata(&file_path).await?;
+
+        // Send StreamingFileOffer through regular message channel first
+        if let Some(ref sender) = self.message_sender {
+            let offer_message = crate::network::protocol::Message::new(
+                crate::network::protocol::MessageType::StreamingFileOffer {
+                    transfer_id,
+                    metadata: metadata.clone(),
+                },
+            );
+
+            sender.send((peer_id, offer_message)).map_err(|e| {
+                error!("❌ Failed to send streaming offer: {}", e);
+                FileshareError::Transfer(format!("Failed to send streaming offer: {}", e))
+            })?;
+
+            info!("✅ STREAMING_SEND: Sent StreamingFileOffer, waiting for response...");
+        }
+
         // Show notification that streaming transfer is starting
         notify_rust::Notification::new()
             .summary("🚀 High-Speed Transfer Starting")
@@ -129,29 +152,60 @@ impl FileTransferManager {
             .show()
             .map_err(|e| crate::FileshareError::Unknown(format!("Notification error: {}", e)))?;
 
-        // Use the streaming manager regardless of file size (let it optimize)
-        let transfer_id = self
+        // Wait a moment for the offer response (simplified for now)
+        tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+
+        // Start the actual streaming transfer
+        let transfer_result = self
             .streaming_manager
             .start_streaming_transfer(peer_id, file_path.clone(), stream)
             .await?;
 
         info!(
             "✅ STREAMING_SEND: Transfer {} initiated successfully",
-            transfer_id
+            transfer_result
         );
 
-        // Show completion notification
-        notify_rust::Notification::new()
-            .summary("✅ High-Speed Transfer Complete")
-            .body(&format!(
-                "Successfully sent {} using streaming protocol",
-                file_path.file_name().unwrap_or_default().to_string_lossy()
-            ))
-            .timeout(notify_rust::Timeout::Milliseconds(3000))
-            .show()
-            .map_err(|e| crate::FileshareError::Unknown(format!("Notification error: {}", e)))?;
-
         Ok(())
+    }
+
+    // NEW: Create streaming metadata helper
+    async fn create_streaming_metadata(
+        &self,
+        file_path: &PathBuf,
+    ) -> Result<crate::network::StreamingFileMetadata> {
+        let file = std::fs::File::open(file_path)
+            .map_err(|e| FileshareError::FileOperation(format!("Cannot open file: {}", e)))?;
+
+        let metadata = file
+            .metadata()
+            .map_err(|e| FileshareError::FileOperation(format!("Cannot get metadata: {}", e)))?;
+
+        let file_size = metadata.len();
+        let chunk_size = 256 * 1024; // 256KB chunks
+        let estimated_chunks = (file_size + chunk_size as u64 - 1) / chunk_size as u64;
+
+        let name = file_path
+            .file_name()
+            .ok_or_else(|| FileshareError::FileOperation("Invalid filename".to_string()))?
+            .to_string_lossy()
+            .to_string();
+
+        Ok(crate::network::StreamingFileMetadata {
+            name,
+            size: file_size,
+            modified: metadata
+                .modified()
+                .ok()
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_secs()),
+            mime_type: None,
+            target_dir: None, // Will be set by receiver
+            suggested_chunk_size: chunk_size,
+            supports_compression: true,
+            estimated_chunks,
+            file_hash: "streaming_placeholder".to_string(),
+        })
     }
 
     // NEW: Add a method to detect if a transfer should use streaming

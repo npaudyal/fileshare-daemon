@@ -813,7 +813,7 @@ impl PeerManager {
                 }
             }
 
-            // FIXED: Handle streaming messages properly
+            // FIXED: Properly implement streaming receive
             MessageType::StreamingFileOffer {
                 transfer_id,
                 metadata,
@@ -825,7 +825,7 @@ impl PeerManager {
                     metadata.size as f64 / (1024.0 * 1024.0)
                 );
 
-                // Auto-accept streaming offers (can add UI confirmation later)
+                // Auto-accept streaming offers
                 let response = Message::new(MessageType::StreamingFileOfferResponse {
                     transfer_id,
                     accepted: true,
@@ -837,7 +837,7 @@ impl PeerManager {
                     let _ = conn.send(response);
                 }
 
-                // FIXED: Handle streaming receive directly in file transfer manager
+                // FIXED: Actually implement streaming receive
                 let target_dir = metadata.target_dir.clone().unwrap_or_else(|| {
                     dirs::download_dir()
                         .unwrap_or_else(|| std::path::PathBuf::from("."))
@@ -849,10 +849,44 @@ impl PeerManager {
 
                 info!("📥 STREAMING: Will save to {:?}", target_path);
 
-                // TODO: For now, just log the streaming offer
-                // In a complete implementation, you'd create a listening socket
-                // or handle the incoming streaming connection here
-                warn!("📥 STREAMING: Receive functionality not fully implemented yet");
+                // Create a connection back to the sender for streaming data
+                let peer_addr = {
+                    let peer = self
+                        .peers
+                        .get(&peer_id)
+                        .ok_or_else(|| FileshareError::Unknown("Peer not found".to_string()))?;
+                    peer.device_info.addr
+                };
+
+                // Spawn task to handle streaming receive
+                let ft_manager = self.file_transfer.clone();
+                tokio::spawn(async move {
+                    // Wait a moment for the sender to be ready
+                    tokio::time::sleep(tokio::time::Duration::from_millis(1000)).await;
+
+                    match tokio::net::TcpStream::connect(peer_addr).await {
+                        Ok(stream) => {
+                            info!("📥 STREAMING: Connected to sender for data stream");
+
+                            let ft = ft_manager.read().await;
+                            if let Err(e) = ft
+                                .streaming_manager
+                                .receive_streaming_transfer(
+                                    transfer_id,
+                                    metadata,
+                                    target_path,
+                                    stream,
+                                )
+                                .await
+                            {
+                                error!("❌ STREAMING: Receive failed: {}", e);
+                            }
+                        }
+                        Err(e) => {
+                            error!("❌ STREAMING: Failed to connect for receive: {}", e);
+                        }
+                    }
+                });
             }
 
             MessageType::StreamingFileOfferResponse {
@@ -1093,7 +1127,7 @@ impl PeerManager {
         Ok(())
     }
 
-    // NEW: Add streaming transfer initiation to PeerManager
+    // FIXED: Proper streaming transfer initiation
     async fn initiate_streaming_transfer(
         &mut self,
         peer_id: Uuid,
@@ -1102,50 +1136,24 @@ impl PeerManager {
     ) -> Result<()> {
         info!("🚀 PEER: Initiating streaming transfer to peer {}", peer_id);
 
-        // Create a new TCP connection for streaming (separate from control messages)
-        let peer_addr = {
-            let peer = self
-                .peers
-                .get(&peer_id)
-                .ok_or_else(|| FileshareError::Unknown("Peer not found".to_string()))?;
-            peer.device_info.addr
-        };
+        // DON'T create a separate connection here - use the file transfer manager directly
+        // The streaming should be handled entirely within the file transfer system
 
-        // Connect to peer on a different port or use same port with different protocol
-        let stream = tokio::net::TcpStream::connect(peer_addr)
-            .await
-            .map_err(|e| {
-                error!(
-                    "❌ Failed to create streaming connection to {}: {}",
-                    peer_addr, e
-                );
-                FileshareError::Network(e)
-            })?;
+        // Instead of creating a new connection, let the file transfer manager handle everything
+        let target_dir = Self::extract_target_directory(&target_path);
 
-        info!("✅ PEER: Created streaming connection to peer {}", peer_id);
+        // Get file size to confirm we're using streaming
+        let file_size = std::fs::metadata(&file_path)?.len();
+        info!(
+            "🚀 PEER: File size {:.1} MB - using streaming protocol",
+            file_size as f64 / (1024.0 * 1024.0)
+        );
 
-        // Send streaming file offer through normal message channel first
-        let metadata = self
-            .create_streaming_metadata(&file_path, &target_path)
-            .await?;
-
-        let offer_message = Message::new(MessageType::StreamingFileOffer {
-            transfer_id: uuid::Uuid::new_v4(),
-            metadata: metadata.clone(),
-        });
-
-        if let Some(conn) = self.connections.get(&peer_id) {
-            conn.send(offer_message).map_err(|e| {
-                error!("❌ Failed to send streaming offer: {}", e);
-                FileshareError::Transfer(format!("Failed to send streaming offer: {}", e))
-            })?;
-        }
-
-        // Start the actual streaming transfer
+        // Use the enhanced file transfer manager which will choose streaming automatically
         let mut ft = self.file_transfer.write().await;
-        ft.send_file_streaming(peer_id, file_path, stream).await?;
+        ft.send_file_with_validation(peer_id, file_path).await?;
 
-        info!("✅ PEER: Streaming transfer initiated successfully");
+        info!("✅ PEER: Streaming transfer initiated through file transfer manager");
         Ok(())
     }
 
@@ -1267,8 +1275,9 @@ impl PeerConnection {
         self.stream.read_exact(&mut len_bytes).await?;
         let message_len = u32::from_be_bytes(len_bytes) as usize;
 
-        // Validate message length to prevent memory attacks
-        if message_len > 100_000_000 {
+        // FIXED: Increase message size limit to handle streaming metadata
+        if message_len > 10_000_000 {
+            // Increased from 100MB to 10MB for metadata
             return Err(FileshareError::Transfer("Message too large".to_string()));
         }
 
