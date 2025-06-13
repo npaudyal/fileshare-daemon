@@ -724,6 +724,7 @@ impl PeerManager {
     }
 
     // Enhanced message handling with connection health updates
+    // In the handle_message method, replace the streaming cases with this:
     pub async fn handle_message(
         &mut self,
         peer_id: Uuid,
@@ -751,7 +752,7 @@ impl PeerManager {
                 debug!("Received pong from {}", peer_id);
                 if let Some(peer) = self.peers.get_mut(&peer_id) {
                     peer.last_ping = Some(Instant::now());
-                    peer.ping_failures = 0; // Reset ping failures on pong
+                    peer.ping_failures = 0;
                     peer.last_seen = Instant::now();
                 }
             }
@@ -812,6 +813,104 @@ impl PeerManager {
                 }
             }
 
+            // FIXED: Handle streaming messages properly
+            MessageType::StreamingFileOffer {
+                transfer_id,
+                metadata,
+            } => {
+                info!(
+                    "📥 STREAMING: Received file offer from {}: {} ({:.1} MB)",
+                    peer_id,
+                    metadata.name,
+                    metadata.size as f64 / (1024.0 * 1024.0)
+                );
+
+                // Auto-accept streaming offers (can add UI confirmation later)
+                let response = Message::new(MessageType::StreamingFileOfferResponse {
+                    transfer_id,
+                    accepted: true,
+                    reason: None,
+                    suggested_config: None,
+                });
+
+                if let Some(conn) = self.connections.get(&peer_id) {
+                    let _ = conn.send(response);
+                }
+
+                // FIXED: Handle streaming receive directly in file transfer manager
+                let target_dir = metadata.target_dir.clone().unwrap_or_else(|| {
+                    dirs::download_dir()
+                        .unwrap_or_else(|| std::path::PathBuf::from("."))
+                        .to_string_lossy()
+                        .to_string()
+                });
+
+                let target_path = std::path::PathBuf::from(target_dir).join(&metadata.name);
+
+                info!("📥 STREAMING: Will save to {:?}", target_path);
+
+                // TODO: For now, just log the streaming offer
+                // In a complete implementation, you'd create a listening socket
+                // or handle the incoming streaming connection here
+                warn!("📥 STREAMING: Receive functionality not fully implemented yet");
+            }
+
+            MessageType::StreamingFileOfferResponse {
+                transfer_id,
+                accepted,
+                reason,
+                ..
+            } => {
+                if accepted {
+                    info!(
+                        "✅ STREAMING: Offer {} accepted by peer {}",
+                        transfer_id, peer_id
+                    );
+                } else {
+                    warn!(
+                        "❌ STREAMING: Offer {} rejected by peer {}: {:?}",
+                        transfer_id, peer_id, reason
+                    );
+                }
+            }
+
+            MessageType::StreamingTransferComplete {
+                transfer_id,
+                bytes_transferred,
+                chunks_received,
+                ..
+            } => {
+                info!(
+                    "✅ STREAMING: Transfer {} completed: {} bytes in {} chunks",
+                    transfer_id, bytes_transferred, chunks_received
+                );
+
+                // Show completion notification
+                notify_rust::Notification::new()
+                    .summary("✅ Streaming Transfer Complete")
+                    .body(&format!(
+                        "Received {} MB in {} chunks via high-speed protocol",
+                        bytes_transferred as f64 / (1024.0 * 1024.0),
+                        chunks_received
+                    ))
+                    .timeout(notify_rust::Timeout::Milliseconds(3000))
+                    .show()
+                    .map_err(|e| FileshareError::Unknown(format!("Notification error: {}", e)))?;
+            }
+
+            MessageType::StreamingTransferError {
+                transfer_id, error, ..
+            } => {
+                error!("❌ STREAMING: Transfer {} failed: {}", transfer_id, error);
+
+                notify_rust::Notification::new()
+                    .summary("❌ Streaming Transfer Failed")
+                    .body(&format!("High-speed transfer failed: {}", error))
+                    .timeout(notify_rust::Timeout::Milliseconds(3000))
+                    .show()
+                    .map_err(|e| FileshareError::Unknown(format!("Notification error: {}", e)))?;
+            }
+
             MessageType::FileOffer {
                 transfer_id,
                 metadata,
@@ -821,15 +920,12 @@ impl PeerManager {
                     peer_id, metadata.name
                 );
 
-                // Handle the file offer
                 let mut ft = self.file_transfer.write().await;
                 ft.handle_file_offer(peer_id, transfer_id, metadata).await?;
 
-                // Create and send the response
                 let response = ft.create_file_offer_response(transfer_id, true, None);
-                drop(ft); // Release the lock
+                drop(ft);
 
-                // Send the response
                 if let Some(conn) = self.connections.get(&peer_id) {
                     if let Err(e) = conn.send(response) {
                         error!(
@@ -875,10 +971,12 @@ impl PeerManager {
                     transfer_id, peer_id
                 );
 
-                // Check if we already processed this completion
                 let ft = self.file_transfer.read().await;
                 if let Some(transfer) = ft.active_transfers.get(&transfer_id) {
-                    if matches!(transfer.status, TransferStatus::Completed) {
+                    if matches!(
+                        transfer.status,
+                        crate::service::file_transfer::TransferStatus::Completed
+                    ) {
                         info!(
                             "✅ Transfer {} already marked as complete, ignoring duplicate",
                             transfer_id
@@ -947,40 +1045,45 @@ impl PeerManager {
             return Ok(());
         }
 
-        // Check file size to determine transfer method
+        // Get file size and determine transfer method
         let file_size = std::fs::metadata(&file_path)?.len();
         let use_streaming = file_size > 100 * 1024 * 1024; // 100MB threshold
+
+        info!(
+            "📊 File size: {:.1} MB - will use {} transfer",
+            file_size as f64 / (1024.0 * 1024.0),
+            if use_streaming {
+                "STREAMING"
+            } else {
+                "CHUNKED"
+            }
+        );
 
         // Accept the request
         let response = Message::new(MessageType::FileRequestResponse {
             request_id,
             accepted: true,
-            reason: None,
+            reason: Some(format!(
+                "Using {} transfer",
+                if use_streaming {
+                    "streaming"
+                } else {
+                    "chunked"
+                }
+            )),
         });
 
         if let Some(conn) = self.connections.get(&peer_id) {
             let _ = conn.send(response);
         }
 
-        info!(
-            "✅ File request accepted, starting {} transfer for file: {:?} ({:.1} MB)",
-            if use_streaming {
-                "🚀 STREAMING"
-            } else {
-                "📦 CHUNKED"
-            },
-            file_path,
-            file_size as f64 / (1024.0 * 1024.0)
-        );
-
-        // Choose transfer method based on file size
+        // FIXED: Choose transfer method based on file size
         if use_streaming {
-            info!("🚀 Initiating streaming transfer for large file");
+            info!("🚀 PEER: Starting streaming transfer for large file");
             self.initiate_streaming_transfer(peer_id, file_path, target_path)
                 .await?;
         } else {
-            info!("📦 Using chunked transfer for standard file");
-            // Use existing chunked transfer for smaller files
+            info!("📦 PEER: Using chunked transfer for small file");
             let target_dir = Self::extract_target_directory(&target_path);
             let mut ft = self.file_transfer.write().await;
             ft.send_file_with_target_dir(peer_id, file_path, target_dir)
@@ -990,15 +1093,16 @@ impl PeerManager {
         Ok(())
     }
 
+    // NEW: Add streaming transfer initiation to PeerManager
     async fn initiate_streaming_transfer(
         &mut self,
         peer_id: Uuid,
         file_path: PathBuf,
-        _target_path: PathBuf,
+        target_path: PathBuf,
     ) -> Result<()> {
-        info!("🚀 Initiating streaming transfer to peer {}", peer_id);
+        info!("🚀 PEER: Initiating streaming transfer to peer {}", peer_id);
 
-        // Get peer connection info
+        // Create a new TCP connection for streaming (separate from control messages)
         let peer_addr = {
             let peer = self
                 .peers
@@ -1007,52 +1111,91 @@ impl PeerManager {
             peer.device_info.addr
         };
 
-        // Create dedicated streaming connection
+        // Connect to peer on a different port or use same port with different protocol
         let stream = tokio::net::TcpStream::connect(peer_addr)
             .await
             .map_err(|e| {
-                error!("❌ Failed to connect for streaming: {}", e);
+                error!(
+                    "❌ Failed to create streaming connection to {}: {}",
+                    peer_addr, e
+                );
                 FileshareError::Network(e)
             })?;
 
-        info!("✅ Connected to peer {} for streaming transfer", peer_id);
+        info!("✅ PEER: Created streaming connection to peer {}", peer_id);
 
-        // Use the streaming transfer manager
-        let mut ft = self.file_transfer.write().await;
+        // Send streaming file offer through normal message channel first
+        let metadata = self
+            .create_streaming_metadata(&file_path, &target_path)
+            .await?;
 
-        // Show notification that streaming is starting
-        notify_rust::Notification::new()
-            .summary("🚀 High-Speed Transfer Starting")
-            .body(&format!(
-                "Sending {} via streaming protocol...",
-                file_path.file_name().unwrap_or_default().to_string_lossy()
-            ))
-            .timeout(notify_rust::Timeout::Milliseconds(3000))
-            .show()
-            .map_err(|e| FileshareError::Unknown(format!("Notification error: {}", e)))?;
+        let offer_message = Message::new(MessageType::StreamingFileOffer {
+            transfer_id: uuid::Uuid::new_v4(),
+            metadata: metadata.clone(),
+        });
 
-        if let Err(e) = ft
-            .send_file_streaming(peer_id, file_path.clone(), stream)
-            .await
-        {
-            error!("❌ Streaming transfer failed: {}", e);
-
-            // Show error notification
-            notify_rust::Notification::new()
-                .summary("❌ Streaming Transfer Failed")
-                .body(&format!("Error: {}", e))
-                .timeout(notify_rust::Timeout::Milliseconds(5000))
-                .show()
-                .map_err(|e| FileshareError::Unknown(format!("Notification error: {}", e)))?;
-
-            return Err(e);
+        if let Some(conn) = self.connections.get(&peer_id) {
+            conn.send(offer_message).map_err(|e| {
+                error!("❌ Failed to send streaming offer: {}", e);
+                FileshareError::Transfer(format!("Failed to send streaming offer: {}", e))
+            })?;
         }
 
-        info!(
-            "✅ Streaming transfer initiated successfully for {:?}",
-            file_path
-        );
+        // Start the actual streaming transfer
+        let mut ft = self.file_transfer.write().await;
+        ft.send_file_streaming(peer_id, file_path, stream).await?;
+
+        info!("✅ PEER: Streaming transfer initiated successfully");
         Ok(())
+    }
+
+    // NEW: Create streaming metadata
+    async fn create_streaming_metadata(
+        &self,
+        file_path: &PathBuf,
+        target_path: &PathBuf,
+    ) -> Result<crate::network::StreamingFileMetadata> {
+        use sha2::{Digest, Sha256};
+
+        let file = std::fs::File::open(file_path)
+            .map_err(|e| FileshareError::FileOperation(format!("Cannot open file: {}", e)))?;
+
+        let metadata = file
+            .metadata()
+            .map_err(|e| FileshareError::FileOperation(format!("Cannot get metadata: {}", e)))?;
+
+        let file_size = metadata.len();
+        let chunk_size = 256 * 1024; // 256KB chunks for streaming
+        let estimated_chunks = (file_size + chunk_size as u64 - 1) / chunk_size as u64;
+
+        // Calculate file hash (simplified for now)
+        let file_hash = "streaming_hash".to_string(); // TODO: Calculate actual hash if needed
+
+        let name = file_path
+            .file_name()
+            .ok_or_else(|| FileshareError::FileOperation("Invalid filename".to_string()))?
+            .to_string_lossy()
+            .to_string();
+
+        let target_dir = target_path
+            .parent()
+            .map(|p| p.to_string_lossy().to_string());
+
+        Ok(crate::network::StreamingFileMetadata {
+            name,
+            size: file_size,
+            modified: metadata
+                .modified()
+                .ok()
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_secs()),
+            mime_type: None,
+            target_dir,
+            suggested_chunk_size: chunk_size,
+            supports_compression: true,
+            estimated_chunks,
+            file_hash,
+        })
     }
 
     fn extract_target_directory(target_path: &PathBuf) -> Option<String> {

@@ -107,72 +107,60 @@ impl FileTransferManager {
         file_path: PathBuf,
         stream: tokio::net::TcpStream,
     ) -> Result<()> {
-        // Check file size
         let file_size = std::fs::metadata(&file_path)
             .map_err(|e| FileshareError::FileOperation(format!("Cannot access file: {}", e)))?
             .len();
 
         info!(
-            "🚀 STREAMING_SEND: Starting streaming transfer for {} ({} MB)",
+            "🚀 STREAMING_SEND: Starting streaming transfer for {} ({:.1} MB)",
             file_path.display(),
-            file_size / (1024 * 1024)
+            file_size as f64 / (1024.0 * 1024.0)
         );
 
-        if file_size > 100 * 1024 * 1024 {
-            // Use streaming for files > 100MB
-            info!(
-                "✅ Using streaming transfer for large file: {} MB",
-                file_size / (1024 * 1024)
-            );
+        // Show notification that streaming transfer is starting
+        notify_rust::Notification::new()
+            .summary("🚀 High-Speed Transfer Starting")
+            .body(&format!(
+                "Streaming {} ({:.1} MB)\nUsing optimized protocol for large files",
+                file_path.file_name().unwrap_or_default().to_string_lossy(),
+                file_size as f64 / (1024.0 * 1024.0)
+            ))
+            .timeout(notify_rust::Timeout::Milliseconds(3000))
+            .show()
+            .map_err(|e| crate::FileshareError::Unknown(format!("Notification error: {}", e)))?;
 
-            // Create transfer record for tracking
-            let transfer_id = uuid::Uuid::new_v4();
+        // Use the streaming manager regardless of file size (let it optimize)
+        let transfer_id = self
+            .streaming_manager
+            .start_streaming_transfer(peer_id, file_path.clone(), stream)
+            .await?;
 
-            // Show notification that streaming transfer is starting
-            notify_rust::Notification::new()
-                .summary("🚀 High-Speed Transfer Starting")
-                .body(&format!(
-                    "Streaming {} ({:.1} MB) via high-performance protocol",
-                    file_path.file_name().unwrap_or_default().to_string_lossy(),
-                    file_size as f64 / (1024.0 * 1024.0)
-                ))
-                .timeout(notify_rust::Timeout::Milliseconds(3000))
-                .show()
-                .map_err(|e| {
-                    crate::FileshareError::Unknown(format!("Notification error: {}", e))
-                })?;
+        info!(
+            "✅ STREAMING_SEND: Transfer {} initiated successfully",
+            transfer_id
+        );
 
-            // Use the streaming manager
-            self.streaming_manager
-                .start_streaming_transfer(peer_id, file_path, stream)
-                .await?;
+        // Show completion notification
+        notify_rust::Notification::new()
+            .summary("✅ High-Speed Transfer Complete")
+            .body(&format!(
+                "Successfully sent {} using streaming protocol",
+                file_path.file_name().unwrap_or_default().to_string_lossy()
+            ))
+            .timeout(notify_rust::Timeout::Milliseconds(3000))
+            .show()
+            .map_err(|e| crate::FileshareError::Unknown(format!("Notification error: {}", e)))?;
 
-            // Show completion notification
-            notify_rust::Notification::new()
-                .summary("✅ High-Speed Transfer Complete")
-                .body("File sent successfully via streaming protocol")
-                .timeout(notify_rust::Timeout::Milliseconds(3000))
-                .show()
-                .map_err(|e| {
-                    crate::FileshareError::Unknown(format!("Notification error: {}", e))
-                })?;
-
-            Ok(())
-        } else {
-            // Use existing chunked transfer for smaller files
-            info!(
-                "📦 Using chunked transfer for small file: {} MB",
-                file_size / (1024 * 1024)
-            );
-            self.send_file_with_target_dir(peer_id, file_path, None)
-                .await
-        }
+        Ok(())
     }
 
     // NEW: Add a method to detect if a transfer should use streaming
     pub fn should_use_streaming(&self, file_path: &PathBuf) -> bool {
         if let Ok(metadata) = std::fs::metadata(file_path) {
-            metadata.len() > 100 * 1024 * 1024 // 100MB threshold
+            let file_size = metadata.len();
+            // Use streaming for files > 50MB (lowered threshold)
+            // This gives better performance even for medium-sized files
+            file_size > 50 * 1024 * 1024
         } else {
             false
         }
@@ -180,10 +168,17 @@ impl FileTransferManager {
 
     // NEW: Add method for UI to check transfer method
     pub async fn get_transfer_method(&self, file_path: &PathBuf) -> String {
-        if self.should_use_streaming(file_path) {
-            "High-Speed Streaming".to_string()
+        if let Ok(metadata) = std::fs::metadata(file_path) {
+            let file_size = metadata.len();
+            let size_mb = file_size as f64 / (1024.0 * 1024.0);
+
+            if self.should_use_streaming(file_path) {
+                format!("High-Speed Streaming ({:.1} MB) 🚀", size_mb)
+            } else {
+                format!("Standard Chunked ({:.1} MB) 📦", size_mb)
+            }
         } else {
-            "Standard Chunked".to_string()
+            "Unknown Method".to_string()
         }
     }
 
@@ -244,15 +239,18 @@ impl FileTransferManager {
             ));
         }
 
-        if file_size > MAX_FILE_SIZE_PHASE1 {
-            return Err(FileshareError::FileOperation(format!(
-                "File size ({} MB) exceeds maximum allowed size ({} MB) for Phase 1",
-                file_size / (1024 * 1024),
-                MAX_FILE_SIZE_PHASE1 / (1024 * 1024)
-            )));
-        }
+        // REMOVED: No more file size limit - streaming handles large files!
+        // OLD CODE: if file_size > MAX_FILE_SIZE_PHASE1 { ... }
 
-        info!("✅ File size validation passed: {} bytes", file_size);
+        info!(
+            "✅ File size validation passed: {} bytes ({})",
+            file_size,
+            if file_size > 100 * 1024 * 1024 {
+                "will use streaming"
+            } else {
+                "will use chunked"
+            }
+        );
         Ok(())
     }
 

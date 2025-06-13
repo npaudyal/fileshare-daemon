@@ -383,43 +383,28 @@ impl FileshareDaemon {
                 source_device, target_path
             );
 
-            // Get the source file path and file size from clipboard
+            // Get the source file path and file size for method selection
             let (source_file_path, file_size) = {
                 let clipboard_state = clipboard.network_clipboard.read().await;
                 let item = clipboard_state.as_ref().unwrap();
                 (item.file_path.to_string_lossy().to_string(), item.file_size)
             };
 
-            // FIXED: Determine transfer method based on file size instead of rejecting
-            let (transfer_method, notification_title, notification_body) = if file_size
-                > 100 * 1024 * 1024
-            {
-                (
-                    "streaming",
-                    "🚀 High-Speed Transfer Starting",
-                    format!(
-                        "Large file detected ({:.1} MB)\nUsing streaming protocol for optimal performance",
-                        file_size as f64 / (1024.0 * 1024.0)
-                    )
-                )
+            // FIXED: Choose transfer method based on file size - NO MORE 100MB LIMIT!
+            let (transfer_method, estimated_speed) = if file_size > 100 * 1024 * 1024 {
+                ("High-Speed Streaming 🚀", "50 MB/s")
             } else {
-                (
-                    "chunked",
-                    "📦 Standard Transfer Starting",
-                    format!(
-                        "Transferring {:.1} MB via standard protocol",
-                        file_size as f64 / (1024.0 * 1024.0)
-                    ),
-                )
+                ("Standard Chunked 📦", "10 MB/s")
             };
 
             info!(
-                "🚀 Using {} transfer method for {:.1} MB file",
+                "🚀 Using {} for {:.1} MB file (estimated: {})",
                 transfer_method,
-                file_size as f64 / (1024.0 * 1024.0)
+                file_size as f64 / (1024.0 * 1024.0),
+                estimated_speed
             );
 
-            // Send file request to source device (same for both methods)
+            // Send file request to source device (the source will choose the method)
             let request_id = uuid::Uuid::new_v4();
             let message = crate::network::protocol::Message::new(
                 crate::network::protocol::MessageType::FileRequest {
@@ -437,12 +422,15 @@ impl FileshareDaemon {
 
             match send_result {
                 Ok(()) => {
-                    // Show enhanced notification with transfer method
+                    // Show enhanced notification with method and file details
+                    let file_size_mb = file_size as f64 / (1024.0 * 1024.0);
+
                     notify_rust::Notification::new()
-                        .summary(&notification_title)
+                        .summary("🚀 Transfer Starting")
                         .body(&format!(
-                            "{}\nFrom: {}\nTo: {}",
-                            notification_body,
+                            "Method: {}\nSize: {:.1} MB\nFrom: {}\nTo: {}",
+                            transfer_method,
+                            file_size_mb,
                             source_device
                                 .to_string()
                                 .chars()
@@ -459,10 +447,7 @@ impl FileshareDaemon {
                             crate::FileshareError::Unknown(format!("Notification error: {}", e))
                         })?;
 
-                    info!(
-                        "✅ Enhanced file request sent to source device using {} method",
-                        transfer_method
-                    );
+                    info!("✅ Enhanced file request sent to source device");
                 }
                 Err(e) => {
                     error!("❌ Failed to send file request: {}", e);
