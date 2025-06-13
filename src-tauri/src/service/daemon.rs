@@ -285,14 +285,12 @@ impl FileshareDaemon {
         };
 
         if let Some(item) = clipboard_item {
-            // Validate file size before broadcasting
-            if item.file_size > 100 * 1024 * 1024 {
-                // 100MB limit
-                warn!(
-                    "⚠️ File size {} exceeds Phase 1 limit, broadcasting anyway",
-                    item.file_size
-                );
-            }
+            // Determine transfer method based on file size
+            let (transfer_method, icon) = if item.file_size > 100 * 1024 * 1024 {
+                ("High-Speed Streaming", "🚀")
+            } else {
+                ("Standard Transfer", "📦")
+            };
 
             // Broadcast clipboard update to healthy peers only
             let healthy_peer_ids = {
@@ -324,7 +322,7 @@ impl FileshareDaemon {
                 }
             }
 
-            // Show enhanced success notification
+            // Show enhanced success notification with transfer method
             let filename = item
                 .file_path
                 .file_name()
@@ -333,10 +331,10 @@ impl FileshareDaemon {
             let file_size_mb = item.file_size as f64 / (1024.0 * 1024.0);
 
             notify_rust::Notification::new()
-                .summary("File Copied to Network")
+                .summary("File Ready for Network Transfer")
                 .body(&format!(
-                    "✅ {}\n📦 Size: {:.1} MB\n📡 Shared with {} devices",
-                    filename, file_size_mb, peer_count
+                    "{} {}\n📊 {:.1} MB\n🚀 Method: {}\n📡 Shared with {} devices",
+                    icon, filename, file_size_mb, transfer_method, peer_count
                 ))
                 .timeout(notify_rust::Timeout::Milliseconds(4000))
                 .show()
@@ -385,22 +383,43 @@ impl FileshareDaemon {
                 source_device, target_path
             );
 
-            // Get the source file path and validate size
+            // Get the source file path and file size from clipboard
             let (source_file_path, file_size) = {
                 let clipboard_state = clipboard.network_clipboard.read().await;
                 let item = clipboard_state.as_ref().unwrap();
                 (item.file_path.to_string_lossy().to_string(), item.file_size)
             };
 
-            // Validate file size for Phase 1
-            if file_size > 100 * 1024 * 1024 {
-                return Err(crate::FileshareError::Transfer(format!(
-                    "File size ({:.1} MB) exceeds Phase 1 limit (100 MB)",
-                    file_size as f64 / (1024.0 * 1024.0)
-                )));
-            }
+            // FIXED: Determine transfer method based on file size instead of rejecting
+            let (transfer_method, notification_title, notification_body) = if file_size
+                > 100 * 1024 * 1024
+            {
+                (
+                    "streaming",
+                    "🚀 High-Speed Transfer Starting",
+                    format!(
+                        "Large file detected ({:.1} MB)\nUsing streaming protocol for optimal performance",
+                        file_size as f64 / (1024.0 * 1024.0)
+                    )
+                )
+            } else {
+                (
+                    "chunked",
+                    "📦 Standard Transfer Starting",
+                    format!(
+                        "Transferring {:.1} MB via standard protocol",
+                        file_size as f64 / (1024.0 * 1024.0)
+                    ),
+                )
+            };
 
-            // Send file request to source device
+            info!(
+                "🚀 Using {} transfer method for {:.1} MB file",
+                transfer_method,
+                file_size as f64 / (1024.0 * 1024.0)
+            );
+
+            // Send file request to source device (same for both methods)
             let request_id = uuid::Uuid::new_v4();
             let message = crate::network::protocol::Message::new(
                 crate::network::protocol::MessageType::FileRequest {
@@ -410,7 +429,7 @@ impl FileshareDaemon {
                 },
             );
 
-            // Send the message (extract this into a separate scope to avoid borrow conflicts)
+            // Send the message
             let send_result = {
                 let mut pm = peer_manager.write().await;
                 pm.send_message_to_peer(source_device, message).await
@@ -418,14 +437,12 @@ impl FileshareDaemon {
 
             match send_result {
                 Ok(()) => {
-                    // Show enhanced notification with file details
-                    let file_size_mb = file_size as f64 / (1024.0 * 1024.0);
-
+                    // Show enhanced notification with transfer method
                     notify_rust::Notification::new()
-                        .summary("🚀 Transfer Starting")
+                        .summary(&notification_title)
                         .body(&format!(
-                            "Requesting file ({:.1} MB)\nFrom: {}\nTo: {}",
-                            file_size_mb,
+                            "{}\nFrom: {}\nTo: {}",
+                            notification_body,
                             source_device
                                 .to_string()
                                 .chars()
@@ -442,7 +459,10 @@ impl FileshareDaemon {
                             crate::FileshareError::Unknown(format!("Notification error: {}", e))
                         })?;
 
-                    info!("✅ Enhanced file request sent to source device");
+                    info!(
+                        "✅ Enhanced file request sent to source device using {} method",
+                        transfer_method
+                    );
                 }
                 Err(e) => {
                     error!("❌ Failed to send file request: {}", e);

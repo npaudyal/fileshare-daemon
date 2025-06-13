@@ -963,21 +963,23 @@ impl PeerManager {
         }
 
         info!(
-            "File request accepted, starting {} transfer for file: {:?} ({} MB)",
+            "✅ File request accepted, starting {} transfer for file: {:?} ({:.1} MB)",
             if use_streaming {
-                "STREAMING"
+                "🚀 STREAMING"
             } else {
-                "CHUNKED"
+                "📦 CHUNKED"
             },
             file_path,
-            file_size / (1024 * 1024)
+            file_size as f64 / (1024.0 * 1024.0)
         );
 
-        // NEW: Choose transfer method based on file size
+        // Choose transfer method based on file size
         if use_streaming {
+            info!("🚀 Initiating streaming transfer for large file");
             self.initiate_streaming_transfer(peer_id, file_path, target_path)
                 .await?;
         } else {
+            info!("📦 Using chunked transfer for standard file");
             // Use existing chunked transfer for smaller files
             let target_dir = Self::extract_target_directory(&target_path);
             let mut ft = self.file_transfer.write().await;
@@ -988,7 +990,6 @@ impl PeerManager {
         Ok(())
     }
 
-    // NEW: Initiate streaming transfer
     async fn initiate_streaming_transfer(
         &mut self,
         peer_id: Uuid,
@@ -1009,18 +1010,48 @@ impl PeerManager {
         // Create dedicated streaming connection
         let stream = tokio::net::TcpStream::connect(peer_addr)
             .await
-            .map_err(|e| FileshareError::Network(e))?;
+            .map_err(|e| {
+                error!("❌ Failed to connect for streaming: {}", e);
+                FileshareError::Network(e)
+            })?;
 
         info!("✅ Connected to peer {} for streaming transfer", peer_id);
 
         // Use the streaming transfer manager
         let mut ft = self.file_transfer.write().await;
-        if let Err(e) = ft.send_file_streaming(peer_id, file_path, stream).await {
+
+        // Show notification that streaming is starting
+        notify_rust::Notification::new()
+            .summary("🚀 High-Speed Transfer Starting")
+            .body(&format!(
+                "Sending {} via streaming protocol...",
+                file_path.file_name().unwrap_or_default().to_string_lossy()
+            ))
+            .timeout(notify_rust::Timeout::Milliseconds(3000))
+            .show()
+            .map_err(|e| FileshareError::Unknown(format!("Notification error: {}", e)))?;
+
+        if let Err(e) = ft
+            .send_file_streaming(peer_id, file_path.clone(), stream)
+            .await
+        {
             error!("❌ Streaming transfer failed: {}", e);
+
+            // Show error notification
+            notify_rust::Notification::new()
+                .summary("❌ Streaming Transfer Failed")
+                .body(&format!("Error: {}", e))
+                .timeout(notify_rust::Timeout::Milliseconds(5000))
+                .show()
+                .map_err(|e| FileshareError::Unknown(format!("Notification error: {}", e)))?;
+
             return Err(e);
         }
 
-        info!("✅ Streaming transfer initiated successfully");
+        info!(
+            "✅ Streaming transfer initiated successfully for {:?}",
+            file_path
+        );
         Ok(())
     }
 
