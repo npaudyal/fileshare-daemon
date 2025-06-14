@@ -977,7 +977,7 @@ impl FileTransferManager {
         );
 
         // Clean up stale transfers first
-        self.cleanup_stale_transfers_enhanced();
+        //self.cleanup_stale_transfers_enhanced();
 
         if !file_path.exists() {
             return Err(FileshareError::FileOperation(
@@ -1289,7 +1289,7 @@ impl FileTransferManager {
     );
 
         // Clean up stale transfers first
-        self.cleanup_stale_transfers_enhanced();
+        //self.cleanup_stale_transfers_enhanced();
 
         // Check if transfer already exists
         if self.active_transfers.contains_key(&transfer_id) {
