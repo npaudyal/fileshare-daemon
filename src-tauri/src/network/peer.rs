@@ -71,7 +71,7 @@ pub struct ConnectionStats {
 // ✅ UNIFIED: Single PeerManager with proper connection pooling
 pub struct PeerManager {
     settings: Arc<Settings>,
-    peers: HashMap<Uuid, Peer>,
+    pub peers: HashMap<Uuid, Peer>,
     pub file_transfer: Arc<RwLock<FileTransferManager>>,
     pub message_tx: mpsc::UnboundedSender<(Uuid, Message)>,
     pub message_rx: mpsc::UnboundedReceiver<(Uuid, Message)>,
@@ -195,6 +195,7 @@ impl PeerManager {
             peer.connection_status,
             ConnectionStatus::Connected | ConnectionStatus::Authenticated
         ) {
+            debug!("Peer {} already connected/authenticated", peer_id);
             return Ok(());
         }
 
@@ -206,26 +207,31 @@ impl PeerManager {
             peer_id, addr
         );
 
-        // ✅ FIXED: Use unified connection pool
-        match self.connection_pool.get_connection(peer_id, addr).await {
-            Ok(stream) => {
+        // ✅ FIXED: Create direct connection instead of using pool for control connections
+        match tokio::time::timeout(
+            Duration::from_secs(10),
+            tokio::net::TcpStream::connect(addr),
+        )
+        .await
+        {
+            Ok(Ok(stream)) => {
+                info!("✅ Successfully connected to peer {} at {}", peer_id, addr);
                 peer.connection_status = ConnectionStatus::Connected;
                 peer.last_seen = Instant::now();
 
-                // Extract the stream from Arc
-                let tcp_stream = Arc::try_unwrap(stream).map_err(|_| {
-                    FileshareError::Network(std::io::Error::new(
-                        std::io::ErrorKind::Other,
-                        "Stream is still referenced elsewhere",
-                    ))
-                })?;
+                // Configure for optimal control message performance
+                stream.set_nodelay(true)?;
 
                 // Handle control connection
-                self.handle_control_connection(peer_id, tcp_stream).await?;
+                self.handle_control_connection(peer_id, stream).await?;
             }
-            Err(e) => {
+            Ok(Err(e)) => {
                 warn!("❌ Failed to connect to peer {}: {}", peer_id, e);
                 peer.connection_status = ConnectionStatus::Error(e.to_string());
+            }
+            Err(_) => {
+                warn!("❌ Connection timeout to peer {}", peer_id);
+                peer.connection_status = ConnectionStatus::Error("Connection timeout".to_string());
             }
         }
 
@@ -334,41 +340,72 @@ impl PeerManager {
     ) -> Result<()> {
         let mut connection = PeerConnection::new(stream);
 
-        // Send handshake
+        // Send handshake with timeout
         let handshake =
             Message::handshake(self.settings.device.id, self.settings.device.name.clone());
-        connection.write_message(&handshake).await?;
 
-        // Wait for response
-        match connection.read_message().await? {
-            Message {
-                message_type: MessageType::HandshakeResponse { accepted: true, .. },
-                ..
-            } => {
+        info!("🤝 Sending handshake to peer {}", peer_id);
+
+        tokio::time::timeout(Duration::from_secs(5), connection.write_message(&handshake))
+            .await
+            .map_err(|_| {
+                FileshareError::Network(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "Handshake timeout",
+                ))
+            })?
+            .map_err(|e| {
+                error!("Failed to send handshake to peer {}: {}", peer_id, e);
+                e
+            })?;
+
+        // Wait for response with timeout
+        let response = tokio::time::timeout(Duration::from_secs(5), connection.read_message())
+            .await
+            .map_err(|_| {
+                FileshareError::Network(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "Handshake response timeout",
+                ))
+            })?
+            .map_err(|e| {
+                error!(
+                    "Failed to read handshake response from peer {}: {}",
+                    peer_id, e
+                );
+                e
+            })?;
+
+        match response.message_type {
+            MessageType::HandshakeResponse { accepted: true, .. } => {
                 info!("✅ Control connection authenticated with peer {}", peer_id);
 
                 if let Some(peer) = self.peers.get_mut(&peer_id) {
                     peer.connection_status = ConnectionStatus::Authenticated;
                     peer.last_seen = Instant::now();
+                    peer.ping_failures = 0;
+                    peer.reconnection_attempts = 0;
                 }
 
                 self.handle_authenticated_control_connection(peer_id, connection)
                     .await?;
             }
-            Message {
-                message_type:
-                    MessageType::HandshakeResponse {
-                        accepted: false,
-                        reason,
-                    },
-                ..
+            MessageType::HandshakeResponse {
+                accepted: false,
+                reason,
             } => {
-                warn!(
+                error!(
                     "❌ Control connection rejected by peer {}: {:?}",
                     peer_id, reason
                 );
+                if let Some(peer) = self.peers.get_mut(&peer_id) {
+                    peer.connection_status = ConnectionStatus::Error(
+                        reason.unwrap_or_else(|| "Handshake rejected".to_string()),
+                    );
+                }
             }
             _ => {
+                error!("❌ Invalid handshake response from peer {}", peer_id);
                 return Err(FileshareError::Authentication(
                     "Invalid handshake response".to_string(),
                 ));
