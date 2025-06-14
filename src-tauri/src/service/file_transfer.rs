@@ -529,12 +529,42 @@ impl FileTransferManager {
             )
         };
 
+        // ✅ FIXED: Validate file exists before spawning task
+        if !file_path.exists() {
+            error!("❌ File no longer exists: {:?}", file_path);
+            return Err(FileshareError::FileOperation(format!(
+                "Source file no longer exists: {:?}",
+                file_path
+            )));
+        }
+
+        // ✅ FIXED: Validate file is readable
+        match tokio::fs::File::open(&file_path).await {
+            Ok(_) => {
+                info!("✅ File access validated: {:?}", file_path);
+            }
+            Err(e) => {
+                error!("❌ Cannot access file {:?}: {}", file_path, e);
+                return Err(FileshareError::FileOperation(format!(
+                    "Cannot access source file: {}",
+                    e
+                )));
+            }
+        }
+
         let message_sender = self
             .message_sender
             .clone()
             .ok_or_else(|| FileshareError::Transfer("Message sender not configured".to_string()))?;
 
+        // ✅ FIXED: Clone path for debugging in spawned task
+        let file_path_debug = file_path.clone();
         tokio::spawn(async move {
+            info!(
+                "📦 TASK: Starting chunk transfer for: {:?}",
+                file_path_debug
+            );
+
             if let Err(e) = Self::send_file_chunks_optimized(
                 message_sender,
                 peer_id,
@@ -544,7 +574,10 @@ impl FileTransferManager {
             )
             .await
             {
-                error!("❌ CHUNKED: Failed to send file chunks: {}", e);
+                error!(
+                    "❌ CHUNKED: Failed to send file chunks for {:?}: {}",
+                    file_path_debug, e
+                );
             }
         });
 
@@ -563,16 +596,51 @@ impl FileTransferManager {
         use tokio::io::{AsyncReadExt, BufReader};
 
         info!(
-            "📦 CHUNKED: Starting optimized chunk sending for {}",
-            transfer_id
+            "📦 CHUNKED: Starting optimized chunk sending for {} (file: {:?})",
+            transfer_id, file_path
         );
 
-        let file = tokio::fs::File::open(&file_path)
-            .await
-            .map_err(|e| FileshareError::FileOperation(format!("Cannot open file: {}", e)))?;
+        // ✅ FIXED: Additional validation with better error messages
+        if !file_path.exists() {
+            let error_msg = format!("File disappeared during transfer: {:?}", file_path);
+            error!("❌ {}", error_msg);
+
+            // Send error message to peer
+            let error_message = Message::new(MessageType::TransferError {
+                transfer_id,
+                error: error_msg.clone(),
+            });
+            let _ = message_sender.send((peer_id, error_message));
+
+            return Err(FileshareError::FileOperation(error_msg));
+        }
+
+        let file = tokio::fs::File::open(&file_path).await.map_err(|e| {
+            let error_msg = format!(
+                "Cannot open file {:?}: {} (working dir: {:?})",
+                file_path,
+                e,
+                std::env::current_dir().unwrap_or_default()
+            );
+            error!("❌ {}", error_msg);
+
+            // Send error message to peer
+            let error_message = Message::new(MessageType::TransferError {
+                transfer_id,
+                error: format!("Source file access failed: {}", e),
+            });
+            let _ = message_sender.send((peer_id, error_message));
+
+            FileshareError::FileOperation(error_msg)
+        })?;
 
         let file_size = file.metadata().await?.len();
         let mut reader = BufReader::with_capacity(chunk_size * 2, file);
+
+        info!(
+            "✅ File opened successfully: {:?} ({} bytes)",
+            file_path, file_size
+        );
 
         let mut hasher = Sha256::new();
         let mut chunk_index = 0u64;
