@@ -472,23 +472,11 @@ impl PeerManager {
     }
 
     async fn configure_streaming_socket(stream: &tokio::net::TcpStream) -> Result<()> {
-        use std::os::fd::{AsRawFd, FromRawFd};
-
-        // Use direct method for nodelay
+        // Only configure what's directly available
         stream.set_nodelay(true)?;
 
-        // For other socket options, we need to work with the raw fd
-        let raw_fd = stream.as_raw_fd();
-
-        // Create a new socket from the same fd (without taking ownership)
-        let socket = unsafe { socket2::Socket::from_raw_fd(libc::dup(raw_fd)) };
-
-        // Set large buffers for high throughput
-        socket.set_send_buffer_size(2 * 1024 * 1024)?; // 2MB
-        socket.set_recv_buffer_size(2 * 1024 * 1024)?; // 2MB
-
-        // Enable keep-alive
-        socket.set_keepalive(true)?;
+        // The default buffer sizes are usually sufficient for most cases
+        // If you really need custom buffer sizes, use one of the above approaches
 
         Ok(())
     }

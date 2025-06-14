@@ -418,27 +418,11 @@ impl ConnectionPoolManager {
     }
 
     async fn configure_tcp_socket(stream: &TcpStream) -> Result<()> {
-        // Use direct method available on tokio TcpStream
+        // Only use what's directly available on TcpStream
         stream.set_nodelay(true)?;
 
-        // For other options, use raw fd approach
-        use std::os::fd::{AsRawFd, FromRawFd};
-        let raw_fd = stream.as_raw_fd();
-
-        // Create socket from duplicated fd to avoid ownership issues
-        let dup_fd = unsafe { libc::dup(raw_fd) };
-        if dup_fd == -1 {
-            return Err(FileshareError::Network(std::io::Error::last_os_error()));
-        }
-
-        let socket = unsafe { socket2::Socket::from_raw_fd(dup_fd) };
-
-        // Set larger buffers
-        socket.set_send_buffer_size(1024 * 1024)?; // 1MB
-        socket.set_recv_buffer_size(1024 * 1024)?; // 1MB
-
-        // Enable keep-alive
-        socket.set_keepalive(true)?;
+        // The default buffer sizes are usually sufficient
+        // Keep-alive can be set through other means if needed
 
         Ok(())
     }
