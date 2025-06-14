@@ -397,10 +397,11 @@ impl FileshareDaemon {
             };
 
             // Validate file size for Phase 1
-            if file_size > 100 * 1024 * 1024 {
+            if file_size > 10 * 1024 * 1024 * 1024 {
+                // 10GB limit
                 return Err(crate::FileshareError::Transfer(format!(
-                    "File size ({:.1} MB) exceeds Phase 1 limit (100 MB)",
-                    file_size as f64 / (1024.0 * 1024.0)
+                    "File size ({:.1} GB) exceeds maximum transfer limit (10 GB)",
+                    file_size as f64 / (1024.0 * 1024.0 * 1024.0)
                 )));
             }
 

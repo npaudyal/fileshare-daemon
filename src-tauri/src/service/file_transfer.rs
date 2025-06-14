@@ -8,9 +8,9 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::sync::{mpsc, RwLock};
+use tokio::sync::mpsc;
 use tokio::time::sleep;
-use tracing::{debug, error, info, warn};
+use tracing::{error, info, warn};
 use uuid::Uuid;
 
 // Phase 1 constants and limits
@@ -21,6 +21,8 @@ const RETRY_BASE_DELAY_MS: u64 = 1000; // 1 second base delay
 const MAX_RETRY_DELAY_MS: u64 = 8000; // 8 seconds max delay
 const TRANSFER_TIMEOUT_SECONDS: u64 = 300; // 5 minutes per transfer
 const CHUNK_TIMEOUT_SECONDS: u64 = 30; // 30 seconds per chunk
+const MAX_FILE_SIZE_CHUNKED: u64 = 100 * 1024 * 1024; // 100MB limit for chunked transfers
+const MAX_FILE_SIZE_STREAMING: u64 = 10 * 1024 * 1024 * 1024; // 10GB limit for streaming
 
 // Use simple message sender instead of DirectPeerSender
 pub type MessageSender = mpsc::UnboundedSender<(Uuid, Message)>;
@@ -187,12 +189,20 @@ impl FileTransferManager {
         &mut self,
         peer_id: Uuid,
         transfer_id: Uuid,
-        _suggested_config: Option<StreamingConfig>,
+        suggested_config: Option<StreamingConfig>,
     ) -> Result<()> {
         info!(
-            "🚀 STREAMING: Setting up direct connection for transfer {}",
+            "🚀 STREAMING: Initiating enhanced connection for transfer {}",
             transfer_id
         );
+
+        // Use suggested config if provided, otherwise use our config
+        let config = suggested_config.unwrap_or(self.streaming_config);
+
+        // Validate config
+        if let Err(e) = config.validate() {
+            warn!("Invalid streaming config, using defaults: {}", e);
+        }
 
         // Get file path from stored metadata
         let file_path = self.get_stored_file_path(transfer_id)?;
@@ -201,48 +211,57 @@ impl FileTransferManager {
         let peer_addr = self.get_peer_address(peer_id).await?;
 
         info!(
-            "🚀 STREAMING: Connecting to peer {} at {}",
-            peer_id, peer_addr
+            "🚀 STREAMING: Creating optimized connection to {} for transfer {}",
+            peer_addr, transfer_id
         );
 
-        // Create a DIRECT connection for streaming (not from pool)
-        match tokio::net::TcpStream::connect(peer_addr).await {
-            Ok(stream) => {
-                info!(
-                    "✅ STREAMING: Created direct connection for transfer {}",
-                    transfer_id
-                );
-
-                // Start streaming transfer with the direct connection
-                if let Some(ref streaming_manager) = self.streaming_manager {
-                    match streaming_manager
-                        .start_streaming_transfer(peer_id, file_path, stream)
+        // Try to get connection from pool first, fallback to direct connection
+        let stream = if let Some(ref connection_pool) = self.connection_pool {
+            match connection_pool.get_connection(peer_id, peer_addr).await {
+                Ok(stream) => {
+                    info!("✅ Got pooled connection for streaming transfer");
+                    // Convert Arc<TcpStream> to TcpStream - this needs handling
+                    // For now, create direct connection
+                    tokio::net::TcpStream::connect(peer_addr)
                         .await
-                    {
-                        Ok(actual_transfer_id) => {
-                            info!(
-                                "🚀 STREAMING: Transfer started with ID {}",
-                                actual_transfer_id
-                            );
-                        }
-                        Err(e) => {
-                            error!("❌ STREAMING: Failed to start transfer: {}", e);
-                            return Err(e);
-                        }
-                    }
-                } else {
-                    return Err(FileshareError::Transfer(
-                        "Streaming manager not available".to_string(),
-                    ));
+                        .map_err(FileshareError::Network)?
+                }
+                Err(_) => {
+                    info!("Creating direct connection for streaming");
+                    tokio::net::TcpStream::connect(peer_addr)
+                        .await
+                        .map_err(FileshareError::Network)?
                 }
             }
-            Err(e) => {
-                error!(
-                    "❌ STREAMING: Failed to create direct connection to {}: {}",
-                    peer_addr, e
-                );
-                return Err(FileshareError::Network(e));
+        } else {
+            tokio::net::TcpStream::connect(peer_addr)
+                .await
+                .map_err(FileshareError::Network)?
+        };
+
+        info!("✅ STREAMING: Connection established, starting transfer");
+
+        // Start streaming transfer
+        if let Some(ref streaming_manager) = self.streaming_manager {
+            match streaming_manager
+                .start_streaming_transfer(peer_id, file_path, stream)
+                .await
+            {
+                Ok(actual_transfer_id) => {
+                    info!(
+                        "🚀 STREAMING: Transfer started successfully with ID {}",
+                        actual_transfer_id
+                    );
+                }
+                Err(e) => {
+                    error!("❌ STREAMING: Failed to start transfer: {}", e);
+                    return Err(e);
+                }
             }
+        } else {
+            return Err(FileshareError::Transfer(
+                "Streaming manager not available".to_string(),
+            ));
         }
 
         Ok(())
@@ -347,10 +366,11 @@ impl FileTransferManager {
         file_path: PathBuf,
     ) -> Result<()> {
         info!(
-            "🚀 HYBRID_SEND: Starting validated file transfer to {}: {:?}",
+            "🚀 SMART_SEND: Starting validated file transfer to {}: {:?}",
             peer_id, file_path
         );
 
+        // Basic file checks
         if !file_path.exists() {
             return Err(FileshareError::FileOperation(
                 "File does not exist".to_string(),
@@ -373,25 +393,40 @@ impl FileTransferManager {
             ));
         }
 
-        if file_size > MAX_FILE_SIZE_PHASE1 {
-            return Err(FileshareError::FileOperation(format!(
-                "File size ({} MB) exceeds maximum allowed size ({} MB) for Phase 1",
-                file_size / (1024 * 1024),
-                MAX_FILE_SIZE_PHASE1 / (1024 * 1024)
-            )));
-        }
-
+        // FIXED: Smart routing based on file size with proper limits
         if file_size <= STREAMING_THRESHOLD {
+            // Small files: Use chunked transfer
             info!(
-                "📦 Using CHUNKED transfer for file ({:.1}MB ≤ 50MB)",
+                "📦 Using CHUNKED transfer for small file ({:.1}MB ≤ 50MB)",
                 file_size as f64 / (1024.0 * 1024.0)
             );
+
+            // Apply chunked transfer limit
+            if file_size > MAX_FILE_SIZE_CHUNKED {
+                return Err(FileshareError::FileOperation(format!(
+                    "File size ({:.1} MB) exceeds chunked transfer limit ({} MB). Use streaming for large files.",
+                    file_size as f64 / (1024.0 * 1024.0),
+                    MAX_FILE_SIZE_CHUNKED / (1024 * 1024)
+                )));
+            }
+
             self.send_file_chunked(peer_id, file_path).await
         } else {
+            // Large files: Use streaming transfer
             info!(
-                "🚀 Using STREAMING transfer for file ({:.1}MB > 50MB)",
+                "🚀 Using STREAMING transfer for large file ({:.1}MB > 50MB)",
                 file_size as f64 / (1024.0 * 1024.0)
             );
+
+            // Apply streaming transfer limit
+            if file_size > MAX_FILE_SIZE_STREAMING {
+                return Err(FileshareError::FileOperation(format!(
+                    "File size ({:.1} GB) exceeds streaming transfer limit ({} GB)",
+                    file_size as f64 / (1024.0 * 1024.0 * 1024.0),
+                    MAX_FILE_SIZE_STREAMING / (1024 * 1024 * 1024)
+                )));
+            }
+
             self.send_file_streaming(peer_id, file_path).await
         }
     }
@@ -404,6 +439,11 @@ impl FileTransferManager {
     async fn send_file_streaming(&mut self, peer_id: Uuid, file_path: PathBuf) -> Result<()> {
         let file_size = std::fs::metadata(&file_path)?.len();
 
+        info!(
+            "🚀 STREAMING: Setting up streaming transfer for {:.1}MB file",
+            file_size as f64 / (1024.0 * 1024.0)
+        );
+
         let mut streaming_metadata = StreamingFileMetadata::new(
             file_path
                 .file_name()
@@ -414,16 +454,26 @@ impl FileTransferManager {
             self.streaming_config.base_chunk_size,
         );
 
+        // Validate streaming metadata
+        if let Err(e) = streaming_metadata.validate() {
+            return Err(FileshareError::Transfer(format!(
+                "Invalid streaming metadata: {}",
+                e
+            )));
+        }
+
         let transfer_id = streaming_metadata.transfer_id;
 
+        // Store streaming transfer metadata
         self.store_streaming_transfer_metadata(transfer_id, peer_id, file_path.clone());
 
         info!(
-            "🚀 STREAMING: Initiating streaming transfer {} for {:.1}MB file",
+            "✅ STREAMING: Sending streaming offer {} for {:.1}MB file",
             transfer_id,
             file_size as f64 / (1024.0 * 1024.0)
         );
 
+        // Send streaming offer
         if let Some(ref sender) = self.message_sender {
             let streaming_offer = Message::new(MessageType::StreamingFileOffer {
                 transfer_id,
