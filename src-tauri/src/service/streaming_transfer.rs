@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::{mpsc, oneshot};
-use tracing::info;
+use tracing::{debug, info};
 use uuid::Uuid;
 
 // FIXED: Lock-free progress tracking with message passing
@@ -200,9 +200,9 @@ impl StreamingTransferManager {
     ) {
         let mut active_transfers: HashMap<Uuid, TransferProgress> = HashMap::new();
         let mut completed_stats: HashMap<Uuid, TransferStats> = HashMap::new();
-        let mut cleanup_interval = tokio::time::interval(Duration::from_secs(300)); // 5 minutes
+        let mut cleanup_interval = tokio::time::interval(Duration::from_secs(1800)); // 30 minutes instead of 5
 
-        info!("🔄 StreamingTransferManager background task started");
+        info!("🔄 StreamingTransferManager background task started with conservative cleanup");
 
         loop {
             tokio::select! {
@@ -217,7 +217,14 @@ impl StreamingTransferManager {
                 }
 
                 _ = cleanup_interval.tick() => {
+                    // Only clean up very old completed transfers
+                    let before_count = completed_stats.len();
                     Self::cleanup_old_data(&mut completed_stats);
+                    let after_count = completed_stats.len();
+
+                    if before_count != after_count {
+                        info!("🧹 Streaming cleanup: {} -> {} completed transfers", before_count, after_count);
+                    }
                 }
             }
         }
@@ -674,14 +681,23 @@ impl StreamingTransferManager {
 
     // Utility methods
     fn cleanup_old_data(completed_stats: &mut HashMap<Uuid, TransferStats>) {
-        let cutoff = Instant::now() - Duration::from_secs(3600); // 1 hour
+        let cutoff = Instant::now() - Duration::from_secs(7200); // 2 hours for streaming transfers
         let initial_count = completed_stats.len();
 
-        completed_stats.retain(|_, stats| stats.duration < cutoff.elapsed());
+        completed_stats.retain(|transfer_id, stats| {
+            let should_keep = stats.duration < cutoff.elapsed();
+            if !should_keep {
+                debug!(
+                    "🧹 Cleaning up old streaming transfer stats: {}",
+                    transfer_id
+                );
+            }
+            should_keep
+        });
 
         let removed = initial_count - completed_stats.len();
         if removed > 0 {
-            info!("🧹 Cleaned up {} old transfer records", removed);
+            info!("🧹 Cleaned up {} old streaming transfer records", removed);
         }
     }
 

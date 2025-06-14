@@ -13,14 +13,20 @@ use tokio::time::sleep;
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
-// Phase 1 constants and limits
+// FIXED: Much more generous timeouts for large files
 const MAX_FILE_SIZE_PHASE1: u64 = 100 * 1024 * 1024; // 100MB limit for Phase 1
 const STREAMING_THRESHOLD: u64 = 50 * 1024 * 1024; // 50MB
 const MAX_RETRY_ATTEMPTS: u32 = 3;
-const RETRY_BASE_DELAY_MS: u64 = 1000; // 1 second base delay
-const MAX_RETRY_DELAY_MS: u64 = 8000; // 8 seconds max delay
-const TRANSFER_TIMEOUT_SECONDS: u64 = 300; // 5 minutes per transfer
-const CHUNK_TIMEOUT_SECONDS: u64 = 30; // 30 seconds per chunk
+const RETRY_BASE_DELAY_MS: u64 = 1000;
+const MAX_RETRY_DELAY_MS: u64 = 8000;
+
+// FIXED: Dynamic timeouts based on file size
+const BASE_TRANSFER_TIMEOUT_SECONDS: u64 = 300; // 5 minutes base
+const LARGE_FILE_TRANSFER_TIMEOUT_SECONDS: u64 = 3600; // 1 hour for large files
+const STREAMING_TRANSFER_TIMEOUT_SECONDS: u64 = 7200; // 2 hours for streaming
+const BASE_CHUNK_TIMEOUT_SECONDS: u64 = 30;
+const LARGE_FILE_CHUNK_TIMEOUT_SECONDS: u64 = 120; // 2 minutes for large files
+
 const MAX_FILE_SIZE_CHUNKED: u64 = 100 * 1024 * 1024; // 100MB limit for chunked transfers
 const MAX_FILE_SIZE_STREAMING: u64 = 10 * 1024 * 1024 * 1024; // 10GB limit for streaming
 
@@ -66,6 +72,26 @@ pub struct FileTransfer {
     pub created_at: Instant,
     pub retry_state: RetryState,
     pub last_activity: Instant,
+}
+
+impl Clone for FileTransfer {
+    fn clone(&self) -> Self {
+        Self {
+            id: self.id,
+            peer_id: self.peer_id,
+            metadata: self.metadata.clone(),
+            file_path: self.file_path.clone(),
+            direction: self.direction.clone(),
+            status: self.status.clone(),
+            bytes_transferred: self.bytes_transferred,
+            chunks_received: self.chunks_received.clone(),
+            file_handle: None, // Don't clone the file handle
+            received_data: self.received_data.clone(),
+            created_at: self.created_at,
+            retry_state: self.retry_state.clone(),
+            last_activity: self.last_activity,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -181,6 +207,39 @@ impl FileTransferManager {
             callback(peer_id)
         } else {
             false
+        }
+    }
+
+    fn get_transfer_timeout(&self, transfer_id: Uuid) -> Duration {
+        if let Some(transfer) = self.active_transfers.get(&transfer_id) {
+            let file_size = transfer.metadata.size;
+            
+            if file_size > STREAMING_THRESHOLD {
+                // Large files get much longer timeouts
+                Duration::from_secs(STREAMING_TRANSFER_TIMEOUT_SECONDS)
+            } else if file_size > 10 * 1024 * 1024 { // 10MB
+                Duration::from_secs(LARGE_FILE_TRANSFER_TIMEOUT_SECONDS)
+            } else {
+                Duration::from_secs(BASE_TRANSFER_TIMEOUT_SECONDS)
+            }
+        } else {
+            Duration::from_secs(BASE_TRANSFER_TIMEOUT_SECONDS)
+        }
+    }
+
+    fn get_chunk_timeout(&self, transfer_id: Uuid) -> Duration {
+        if let Some(transfer) = self.active_transfers.get(&transfer_id) {
+            let file_size = transfer.metadata.size;
+            
+            if file_size > STREAMING_THRESHOLD {
+                Duration::from_secs(LARGE_FILE_CHUNK_TIMEOUT_SECONDS * 2) // Even longer for streaming
+            } else if file_size > 10 * 1024 * 1024 {
+                Duration::from_secs(LARGE_FILE_CHUNK_TIMEOUT_SECONDS)
+            } else {
+                Duration::from_secs(BASE_CHUNK_TIMEOUT_SECONDS)
+            }
+        } else {
+            Duration::from_secs(BASE_CHUNK_TIMEOUT_SECONDS)
         }
     }
 
@@ -300,37 +359,38 @@ impl FileTransferManager {
     }
 
     pub async fn mark_outgoing_transfer_completed(&mut self, transfer_id: Uuid) -> Result<()> {
-        {
-            if let Some(transfer) = self.active_transfers.get_mut(&transfer_id) {
-                if matches!(transfer.direction, TransferDirection::Outgoing) {
+        if let Some(transfer) = self.active_transfers.get_mut(&transfer_id) {
+            if matches!(transfer.direction, TransferDirection::Outgoing) {
+                // Only mark as completed if not already completed
+                if !matches!(transfer.status, TransferStatus::Completed) {
                     info!(
-                        "✅ SENDER: Marking outgoing transfer {} as completed",
-                        transfer_id
+                        "✅ SENDER: Marking outgoing transfer {} as completed (file: {}, size: {:.1}MB)",
+                        transfer_id,
+                        transfer.metadata.name,
+                        transfer.metadata.size as f64 / (1024.0 * 1024.0)
                     );
                     transfer.status = TransferStatus::Completed;
                     transfer.last_activity = Instant::now();
+                    
+                    // Show notification
+                    let transfer_clone = transfer.clone();
+                    if let Err(e) = self.show_transfer_notification(&transfer_clone).await {
+                        warn!("Failed to show notification: {}", e);
+                    }
                 } else {
-                    warn!(
-                        "⚠️ Attempted to mark non-outgoing transfer {} as completed",
-                        transfer_id
-                    );
-                    return Ok(());
+                    debug!("Transfer {} already marked as completed", transfer_id);
                 }
             } else {
                 warn!(
-                    "⚠️ Transfer {} not found when marking as completed",
+                    "⚠️ Attempted to mark non-outgoing transfer {} as completed",
                     transfer_id
                 );
-                return Ok(());
             }
-        }
-
-        {
-            if let Some(transfer) = self.active_transfers.get(&transfer_id) {
-                if let Err(e) = self.show_transfer_notification(transfer).await {
-                    warn!("Failed to show notification: {}", e);
-                }
-            }
+        } else {
+            warn!(
+                "⚠️ Transfer {} not found when marking as completed",
+                transfer_id
+            );
         }
 
         Ok(())
@@ -563,48 +623,60 @@ impl FileTransferManager {
             // CRITICAL: Skip monitoring for completed or successful transfers
             match &transfer.status {
                 TransferStatus::Completed => {
-                    info!(
-                        "✅ Skipping health check for completed transfer {}",
-                        transfer_id
-                    );
+                    debug!("✅ Skipping health check for completed transfer {}", transfer_id);
                     continue;
                 }
                 TransferStatus::Error(_) => {
-                    info!(
-                        "⚠️ Skipping health check for errored transfer {}",
-                        transfer_id
-                    );
+                    debug!("⚠️ Skipping health check for errored transfer {}", transfer_id);
                     continue;
                 }
                 TransferStatus::Cancelled => {
-                    info!(
-                        "🚫 Skipping health check for cancelled transfer {}",
-                        transfer_id
-                    );
+                    debug!("🚫 Skipping health check for cancelled transfer {}", transfer_id);
                     continue;
                 }
                 _ => {} // Continue monitoring active/pending transfers
             }
 
+            // FIXED: Use dynamic timeouts
+            let transfer_timeout = self.get_transfer_timeout(*transfer_id);
+            let chunk_timeout = self.get_chunk_timeout(*transfer_id);
+
             // Check for overall transfer timeout
-            if now.duration_since(transfer.created_at).as_secs() > TRANSFER_TIMEOUT_SECONDS {
+            if now.duration_since(transfer.created_at) > transfer_timeout {
                 error!(
-                    "⏰ Transfer {} timed out after {} seconds",
-                    transfer_id, TRANSFER_TIMEOUT_SECONDS
+                    "⏰ Transfer {} timed out after {:.1} minutes (file size: {:.1}MB)",
+                    transfer_id,
+                    transfer_timeout.as_secs_f64() / 60.0,
+                    transfer.metadata.size as f64 / (1024.0 * 1024.0)
                 );
                 timed_out_transfers.push(*transfer_id);
                 continue;
             }
 
-            // Check for inactive transfers (no activity for chunk timeout)
-            if now.duration_since(transfer.last_activity).as_secs() > CHUNK_TIMEOUT_SECONDS {
+            // FIXED: More lenient inactivity check for large files
+            let inactivity_duration = now.duration_since(transfer.last_activity);
+            if inactivity_duration > chunk_timeout {
                 match transfer.status {
                     TransferStatus::Active | TransferStatus::Pending => {
-                        warn!(
-                            "⚠️ Transfer {} inactive for {} seconds, marking for recovery",
-                            transfer_id, CHUNK_TIMEOUT_SECONDS
-                        );
-                        stale_transfers.push(*transfer_id);
+                        // FIXED: Check if transfer is making progress
+                        let progress = transfer.bytes_transferred as f64 / transfer.metadata.size as f64;
+                        
+                        if progress > 0.1 { // If we've made some progress, be more lenient
+                            warn!(
+                                "⚠️ Transfer {} inactive for {:.1}s but has {:.1}% progress, giving more time",
+                                transfer_id,
+                                inactivity_duration.as_secs_f64(),
+                                progress * 100.0
+                            );
+                            // Don't mark as stale if we're making progress
+                        } else {
+                            warn!(
+                                "⚠️ Transfer {} inactive for {:.1}s with minimal progress, marking for recovery",
+                                transfer_id,
+                                inactivity_duration.as_secs_f64()
+                            );
+                            stale_transfers.push(*transfer_id);
+                        }
                     }
                     _ => {} // Ignore non-active transfers
                 }
@@ -616,9 +688,16 @@ impl FileTransferManager {
             self.handle_transfer_timeout(transfer_id).await?;
         }
 
-        // Attempt recovery for stale transfers
+        // FIXED: Be more careful with recovery attempts
         for transfer_id in stale_transfers {
-            self.attempt_transfer_recovery(transfer_id).await?;
+            if let Some(transfer) = self.active_transfers.get(&transfer_id) {
+                if transfer.retry_state.attempt_count < MAX_RETRY_ATTEMPTS {
+                    self.attempt_transfer_recovery(transfer_id).await?;
+                } else {
+                    error!("💥 Transfer {} exceeded max recovery attempts", transfer_id);
+                    self.handle_transfer_timeout(transfer_id).await?;
+                }
+            }
         }
 
         Ok(())
@@ -891,13 +970,18 @@ impl FileTransferManager {
     // Enhanced cleanup that protects completed transfers
     pub fn cleanup_stale_transfers_enhanced(&mut self) {
         let now = Instant::now();
-        let timeout = Duration::from_secs(TRANSFER_TIMEOUT_SECONDS);
-        let completion_grace_period = Duration::from_secs(10); // REDUCED from 30 to 10 seconds
+        let completion_grace_period = Duration::from_secs(30); // Give completed transfers time
+        let error_grace_period = Duration::from_secs(60); // Keep errored transfers longer for debugging
 
         let initial_count = self.active_transfers.len();
 
+        // Calculate timeouts before retain
+        let timeouts: HashMap<Uuid, Duration> = self.active_transfers
+            .iter()
+            .map(|(id, _)| (*id, self.get_transfer_timeout(*id)))
+            .collect();
+
         self.active_transfers.retain(|transfer_id, transfer| {
-            // CRITICAL: Give completed transfers a shorter grace period
             match &transfer.status {
                 TransferStatus::Completed => {
                     let time_since_completion = now.duration_since(transfer.last_activity);
@@ -918,45 +1002,47 @@ impl FileTransferManager {
                     }
                 }
                 TransferStatus::Error(_) => {
-                    if now.duration_since(transfer.last_activity) > Duration::from_secs(30) {
+                    if now.duration_since(transfer.last_activity) > error_grace_period {
                         info!("🧹 Cleaning up errored transfer: {}", transfer_id);
                         return false;
                     }
                     return true;
                 }
                 TransferStatus::Cancelled => {
-                    if now.duration_since(transfer.last_activity) > Duration::from_secs(5) {
+                    if now.duration_since(transfer.last_activity) > Duration::from_secs(10) {
                         info!("🧹 Cleaning up cancelled transfer: {}", transfer_id);
                         return false;
                     }
                     return true;
                 }
-                _ => {} // Continue with normal cleanup logic for active transfers
-            }
+                TransferStatus::Active | TransferStatus::Pending => {
+                    // FIXED: NEVER clean up active transfers based on time alone
+                    // Only clean up if they're truly abandoned (very long inactive + no progress)
+                    let base_timeout = Duration::from_secs(BASE_TRANSFER_TIMEOUT_SECONDS);
+                    let dynamic_timeout = timeouts.get(transfer_id).unwrap_or(&base_timeout);
+                    let inactive_time = now.duration_since(transfer.last_activity);
+                    let total_time = now.duration_since(transfer.created_at);
+                    
+                    // Only clean up if BOTH conditions are met:
+                    // 1. Transfer has been running for much longer than expected
+                    // 2. No activity for a very long time
+                    let should_cleanup = total_time > *dynamic_timeout * 2 && // 2x the normal timeout
+                                       inactive_time > Duration::from_secs(600); // 10 minutes of inactivity
 
-            // Remove transfers that have been running too long
-            if now.duration_since(transfer.created_at) > timeout {
-                warn!("🧹 Removing timed out transfer: {}", transfer_id);
-                return false;
+                    if should_cleanup {
+                        error!(
+                            "🧹 Cleaning up abandoned active transfer: {} (total: {:.1}min, inactive: {:.1}min)",
+                            transfer_id,
+                            total_time.as_secs_f64() / 60.0,
+                            inactive_time.as_secs_f64() / 60.0
+                        );
+                        return false;
+                    }
+                    
+                    return true; // Keep all other active transfers
+                }
+                TransferStatus::Paused => true, // Keep paused transfers
             }
-
-            // Remove transfers that have been inactive for too long (only active ones)
-            if matches!(
-                transfer.status,
-                TransferStatus::Active | TransferStatus::Pending
-            ) && now.duration_since(transfer.last_activity)
-                > Duration::from_secs(CHUNK_TIMEOUT_SECONDS * 2)
-            // Give more time for large transfers
-            {
-                warn!(
-                    "🧹 Removing inactive transfer: {} (inactive for {:.1}s)",
-                    transfer_id,
-                    now.duration_since(transfer.last_activity).as_secs_f64()
-                );
-                return false;
-            }
-
-            true
         });
 
         let removed_count = initial_count - self.active_transfers.len();
@@ -1543,7 +1629,7 @@ impl FileTransferManager {
         Ok(())
     }
     async fn complete_file_transfer(&mut self, transfer_id: Uuid) -> Result<()> {
-        let (file_path, expected_checksum, file_data, peer_id) = {
+        let (file_path, expected_checksum, file_data, peer_id, transfer_clone) = {
             let transfer = self
                 .active_transfers
                 .get_mut(&transfer_id)
@@ -1560,15 +1646,21 @@ impl FileTransferManager {
             transfer.last_activity = Instant::now();
 
             info!(
-                "📝 RECEIVER: Finalizing transfer {} completion",
-                transfer_id
+                "📝 RECEIVER: Finalizing transfer {} completion (file: {}, size: {:.1}MB)",
+                transfer_id,
+                transfer.metadata.name,
+                transfer.metadata.size as f64 / (1024.0 * 1024.0)
             );
+
+            // Get a clone of the transfer for notification before moving data
+            let transfer_clone = transfer.clone();
 
             (
                 transfer.file_path.clone(),
                 transfer.metadata.checksum.clone(),
                 transfer.received_data.clone(),
                 transfer.peer_id,
+                transfer_clone,
             )
         };
 
@@ -1578,6 +1670,12 @@ impl FileTransferManager {
         // Write the complete file data at once
         std::fs::write(&file_path, &file_data).map_err(|e| {
             error!("Failed to write file {:?}: {}", file_path, e);
+            
+            // Mark as failed if write fails
+            if let Some(transfer) = self.active_transfers.get_mut(&transfer_id) {
+                transfer.status = TransferStatus::Error(format!("Write failed: {}", e));
+            }
+            
             FileshareError::FileOperation(format!("Failed to write file: {}", e))
         })?;
 
@@ -1599,10 +1697,7 @@ impl FileTransferManager {
                     "File integrity check failed".to_string(),
                 ));
             } else {
-                info!(
-                    "✅ RECEIVER: Checksum verified for transfer {}",
-                    transfer_id
-                );
+                info!("✅ RECEIVER: Checksum verified for transfer {}", transfer_id);
             }
         }
 
@@ -1616,10 +1711,7 @@ impl FileTransferManager {
             if let Err(e) = sender.send((peer_id, completion_ack)) {
                 warn!("Failed to send completion acknowledgment: {}", e);
             } else {
-                info!(
-                    "✅ Sent completion acknowledgment for transfer {}",
-                    transfer_id
-                );
+                info!("✅ Sent completion acknowledgment for transfer {}", transfer_id);
             }
         }
 
@@ -1628,26 +1720,13 @@ impl FileTransferManager {
             transfer_id, file_path
         );
 
-        // Show notification
-        if let Some(transfer) = self.active_transfers.get(&transfer_id) {
-            if let Err(e) = self.show_transfer_notification(transfer).await {
-                warn!("Failed to show notification: {}", e);
-            }
+        // Show notification using the cloned transfer
+        if let Err(e) = self.show_transfer_notification(&transfer_clone).await {
+            warn!("Failed to show notification: {}", e);
         }
 
-        // FIXED: Schedule proper cleanup
-        let transfer_id_for_cleanup = transfer_id;
-        let active_transfers_ref = &mut self.active_transfers;
-
-        // Remove the transfer after a brief delay to allow final messages
-        tokio::spawn({
-            let transfer_id = transfer_id_for_cleanup;
-            async move {
-                tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
-                // This will be handled by the next cleanup cycle
-                info!("🧹 Transfer {} scheduled for cleanup", transfer_id);
-            }
-        });
+        // DON'T remove the transfer immediately - let cleanup handle it after grace period
+        info!("✅ Transfer {} marked for cleanup after grace period", transfer_id);
 
         Ok(())
     }

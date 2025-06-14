@@ -603,10 +603,10 @@ impl FileshareDaemon {
             settings.get_bind_address()
         );
 
-        // Start connection health monitoring
+        // FIXED: Less frequent health monitoring for large transfers
         let health_pm = peer_manager.clone();
         let health_monitor = tokio::spawn(async move {
-            let mut interval = tokio::time::interval(Duration::from_secs(30));
+            let mut interval = tokio::time::interval(Duration::from_secs(60)); // Increased from 30s
             loop {
                 interval.tick().await;
 
@@ -615,19 +615,18 @@ impl FileshareDaemon {
                     error!("❌ Health monitoring error: {}", e);
                 }
 
-                // Enhanced cleanup with health monitoring
                 let stats = pm.get_connection_stats();
-                info!(
+                debug!(
                     "📊 Connection Stats: {} total, {} healthy, {} unhealthy",
                     stats.total, stats.authenticated, stats.unhealthy
                 );
             }
         });
 
-        // Start file transfer health monitoring
+        // FIXED: Less frequent transfer monitoring
         let transfer_pm = peer_manager.clone();
         let transfer_monitor = tokio::spawn(async move {
-            let mut interval = tokio::time::interval(Duration::from_secs(10));
+            let mut interval = tokio::time::interval(Duration::from_secs(30)); // Increased from 10s
             loop {
                 interval.tick().await;
 
@@ -639,71 +638,40 @@ impl FileshareDaemon {
                     error!("❌ Transfer health monitoring error: {}", e);
                 }
 
-                // Enhanced cleanup
-                ft.cleanup_stale_transfers_enhanced();
-            }
-        });
-
-        // Continue with existing peer manager logic...
-        let connection_pm = peer_manager.clone();
-        let connection_handle = tokio::spawn(async move {
-            loop {
-                match listener.accept().await {
-                    Ok((stream, addr)) => {
-                        info!("🔗 New connection from {}", addr);
-                        let pm = connection_pm.clone();
-
-                        tokio::spawn(async move {
-                            let mut pm = pm.write().await;
-                            if let Err(e) = pm.handle_connection(stream).await {
-                                warn!("❌ Failed to handle connection from {}: {}", addr, e);
-                            }
-                        });
-                    }
-                    Err(e) => {
-                        error!("❌ Failed to accept connection: {}", e);
-                        tokio::time::sleep(Duration::from_secs(1)).await;
+                // FIXED: Much less frequent cleanup
+                let transfer_count = ft.active_transfers.len();
+                if transfer_count > 0 {
+                    debug!("📊 Active transfers: {}", transfer_count);
+                    // Only cleanup if we have many transfers
+                    if transfer_count > 10 {
+                        ft.cleanup_stale_transfers_enhanced();
                     }
                 }
             }
         });
 
-        let streaming_pm = peer_manager.clone();
-        let streaming_monitor = tokio::spawn(async move {
-            let mut interval = tokio::time::interval(Duration::from_secs(5));
-            loop {
-                interval.tick().await;
-
-                let pm = streaming_pm.read().await;
-                let ft = pm.file_transfer.read().await;
-
-                if let Some(streaming_manager) = ft.get_streaming_manager() {
-                    let active_streaming = streaming_manager.get_active_transfers().await;
-                    if !active_streaming.is_empty() {
-                        debug!("📊 Active streaming transfers: {}", active_streaming.len());
-                    }
-                }
-            }
-        });
-
-        // Message processing with enhanced routing - FIXED BORROW CHECKER VERSION
+        // FIXED: Faster message processing to prevent timeouts
         let message_pm = peer_manager.clone();
         let message_clipboard = clipboard.clone();
         let message_handle = tokio::spawn(async move {
-            let mut interval = tokio::time::interval(Duration::from_millis(50)); // Faster processing
+            let mut interval = tokio::time::interval(Duration::from_millis(10)); // Much faster processing
             loop {
                 interval.tick().await;
 
                 let mut pm = message_pm.write().await;
 
+                // Process multiple messages per tick to prevent backlog
+                let mut processed_count = 0;
                 while let Ok((peer_id, message)) = pm.message_rx.try_recv() {
+                    processed_count += 1;
+
                     // Enhanced message routing with health checks
                     if !pm.is_peer_healthy(peer_id) {
                         warn!("⚠️ Dropping message from unhealthy peer {}", peer_id);
                         continue;
                     }
 
-                    // Route transfer messages directly with FIXED TransferComplete handling
+                    // Route transfer messages directly with improved handling
                     match &message.message_type {
                         crate::network::protocol::MessageType::FileOffer {
                             transfer_id, ..
@@ -728,14 +696,12 @@ impl FileshareDaemon {
                             drop(ft);
 
                             if is_outgoing {
-                                // FIXED: Handle TransferComplete specially to mark local completion
                                 if matches!(
                                     message.message_type,
                                     crate::network::protocol::MessageType::TransferComplete { .. }
                                 ) {
                                     info!("🚀 Processing outgoing TransferComplete for transfer {} to peer {}", transfer_id, peer_id);
 
-                                    // FIXED: Clone message before sending to avoid borrow checker issues
                                     if let Err(e) =
                                         pm.send_direct_to_connection(peer_id, message.clone()).await
                                     {
@@ -745,7 +711,7 @@ impl FileshareDaemon {
                                         );
                                     }
 
-                                    // FIXED: Mark our own outgoing transfer as completed
+                                    // Mark our own outgoing transfer as completed
                                     {
                                         let mut ft = pm.file_transfer.write().await;
                                         if let Err(e) =
@@ -754,12 +720,10 @@ impl FileshareDaemon {
                                             error!("❌ Failed to mark outgoing transfer {} as completed: {}", transfer_id, e);
                                         }
                                     }
-
-                                    continue; // Don't process through normal handle_message
+                                    continue;
                                 }
 
-                                // For all other outgoing transfer messages, send directly
-                                // FIXED: Clone message before sending
+                                // Send other outgoing transfer messages directly
                                 if let Err(e) =
                                     pm.send_direct_to_connection(peer_id, message.clone()).await
                                 {
@@ -781,6 +745,39 @@ impl FileshareDaemon {
                     {
                         error!("❌ Error processing message from peer {}: {}", peer_id, e);
                     }
+
+                    // Prevent monopolizing the loop
+                    if processed_count >= 100 {
+                        break;
+                    }
+                }
+
+                if processed_count > 0 {
+                    debug!("📨 Processed {} messages", processed_count);
+                }
+            }
+        });
+
+        // Continue with existing connection handling...
+        let connection_pm = peer_manager.clone();
+        let connection_handle = tokio::spawn(async move {
+            loop {
+                match listener.accept().await {
+                    Ok((stream, addr)) => {
+                        info!("🔗 New connection from {}", addr);
+                        let pm = connection_pm.clone();
+
+                        tokio::spawn(async move {
+                            let mut pm = pm.write().await;
+                            if let Err(e) = pm.handle_connection(stream).await {
+                                warn!("❌ Failed to handle connection from {}: {}", addr, e);
+                            }
+                        });
+                    }
+                    Err(e) => {
+                        error!("❌ Failed to accept connection: {}", e);
+                        tokio::time::sleep(Duration::from_secs(1)).await;
+                    }
                 }
             }
         });
@@ -791,8 +788,6 @@ impl FileshareDaemon {
             _ = message_handle => info!("Message handler stopped"),
             _ = health_monitor => info!("Health monitor stopped"),
             _ = transfer_monitor => info!("Transfer monitor stopped"),
-            _ = streaming_monitor => info!("Streaming monitor stopped"), // NEW
-
         }
 
         Ok(())
