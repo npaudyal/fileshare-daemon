@@ -1,8 +1,6 @@
 use crate::{
     config::Settings,
-    network::{
-        protocol::*, ConnectionPoolManager, PeerManager, StreamingConfig, StreamingFileMetadata,
-    },
+    network::{protocol::*, ConnectionPoolManager, StreamingConfig, StreamingFileMetadata},
     service::StreamingTransferManager,
     FileshareError, Result,
 };
@@ -26,6 +24,10 @@ const CHUNK_TIMEOUT_SECONDS: u64 = 30; // 30 seconds per chunk
 
 // Use simple message sender instead of DirectPeerSender
 pub type MessageSender = mpsc::UnboundedSender<(Uuid, Message)>;
+
+// NEW: Callback types for peer information
+pub type PeerAddressCallback = Arc<dyn Fn(Uuid) -> Option<std::net::SocketAddr> + Send + Sync>;
+pub type PeerConnectedCallback = Arc<dyn Fn(Uuid) -> bool + Send + Sync>;
 
 // Retry state management
 #[derive(Debug, Clone)]
@@ -60,8 +62,8 @@ pub struct FileTransfer {
     pub file_handle: Option<std::fs::File>,
     pub received_data: Vec<u8>,
     pub created_at: Instant,
-    pub retry_state: RetryState, // Enhanced retry tracking
-    pub last_activity: Instant,  // Track last activity for timeouts
+    pub retry_state: RetryState,
+    pub last_activity: Instant,
 }
 
 #[derive(Debug, Clone)]
@@ -90,9 +92,12 @@ pub struct FileTransferManager {
     connection_pool: Option<Arc<ConnectionPoolManager>>,
     streaming_config: StreamingConfig,
 
-    // NEW: Storage for streaming transfer metadata
+    // Storage for streaming transfer metadata
     streaming_transfers: HashMap<Uuid, StreamingTransferInfo>,
-    peer_manager_ref: Option<Arc<RwLock<PeerManager>>>,
+
+    // PRODUCTION: Replace circular reference with callbacks
+    peer_address_callback: Option<PeerAddressCallback>,
+    peer_connected_callback: Option<PeerConnectedCallback>,
 }
 
 #[derive(Debug, Clone)]
@@ -107,23 +112,17 @@ impl FileTransferManager {
     pub async fn new(settings: Arc<Settings>) -> Result<Self> {
         // Create streaming configuration
         let streaming_config = StreamingConfig {
-            base_chunk_size: settings.transfer.chunk_size.max(512 * 1024), // At least 512KB for streaming
-            max_chunk_size: 4 * 1024 * 1024,                               // 4MB max
+            base_chunk_size: settings.transfer.chunk_size.max(512 * 1024),
+            max_chunk_size: 4 * 1024 * 1024,
             compression_threshold: 4096,
-            memory_limit: 200 * 1024 * 1024, // 200MB memory limit
+            memory_limit: 200 * 1024 * 1024,
             enable_compression: true,
-            compression_level: 1, // Fast compression
+            compression_level: 1,
             max_concurrent_chunks: 8,
             adaptive_chunk_sizing: true,
-            zero_copy_threshold: 10 * 1024 * 1024,    // 10MB
-            backpressure_threshold: 50 * 1024 * 1024, // 50MB
+            zero_copy_threshold: 10 * 1024 * 1024,
+            backpressure_threshold: 50 * 1024 * 1024,
         };
-
-        // REMOVE THE CIRCULAR DEPENDENCY - Don't create PeerManager here
-        // let settings = Arc::new(settings); // Not needed anymore
-        // let peer_manager = PeerManager::new(settings.clone()).await?; // REMOVE THIS
-        // let peer_manager = Arc::new(RwLock::new(peer_manager)); // REMOVE THIS
-        // PeerManager::setup_file_transfer_peer_ref(peer_manager.clone()).await; // REMOVE THIS
 
         // Create streaming manager
         let streaming_manager = StreamingTransferManager::new(streaming_config);
@@ -139,17 +138,114 @@ impl FileTransferManager {
             connection_pool: Some(connection_pool),
             streaming_config,
             streaming_transfers: HashMap::new(),
-            peer_manager_ref: None, // Will be set later by PeerManager
+            // PRODUCTION: Initialize callbacks as None
+            peer_address_callback: None,
+            peer_connected_callback: None,
         })
     }
 
-    // Set the message sender (replaces DirectPeerSender)
+    // PRODUCTION: Set callbacks instead of circular references
+    pub fn set_peer_callbacks(
+        &mut self,
+        address_callback: PeerAddressCallback,
+        connected_callback: PeerConnectedCallback,
+    ) {
+        self.peer_address_callback = Some(address_callback);
+        self.peer_connected_callback = Some(connected_callback);
+        info!("📞 Peer callbacks configured for FileTransferManager");
+    }
+
+    // Set the message sender
     pub fn set_message_sender(&mut self, sender: MessageSender) {
         self.message_sender = Some(sender);
     }
 
-    pub fn set_peer_manager_ref(&mut self, peer_manager: Arc<RwLock<PeerManager>>) {
-        self.peer_manager_ref = Some(peer_manager);
+    // PRODUCTION: Use callback to get peer address
+    async fn get_peer_address(&self, peer_id: Uuid) -> Result<std::net::SocketAddr> {
+        if let Some(ref callback) = self.peer_address_callback {
+            callback(peer_id).ok_or_else(|| {
+                FileshareError::Transfer(format!("Peer {} address not found", peer_id))
+            })
+        } else {
+            Err(FileshareError::Transfer(
+                "Peer address callback not configured".to_string(),
+            ))
+        }
+    }
+
+    // PRODUCTION: Use callback to check if peer is connected
+    fn is_peer_connected(&self, peer_id: Uuid) -> bool {
+        if let Some(ref callback) = self.peer_connected_callback {
+            callback(peer_id)
+        } else {
+            false
+        }
+    }
+
+    // PRODUCTION: Update streaming connection initiation
+    pub async fn initiate_streaming_connection(
+        &mut self,
+        peer_id: Uuid,
+        transfer_id: Uuid,
+        _suggested_config: Option<StreamingConfig>,
+    ) -> Result<()> {
+        info!(
+            "🚀 STREAMING: Setting up direct connection for transfer {}",
+            transfer_id
+        );
+
+        // Get file path from stored metadata
+        let file_path = self.get_stored_file_path(transfer_id)?;
+
+        // Use callback to get peer address
+        let peer_addr = self.get_peer_address(peer_id).await?;
+
+        info!(
+            "🚀 STREAMING: Connecting to peer {} at {}",
+            peer_id, peer_addr
+        );
+
+        // Create a DIRECT connection for streaming (not from pool)
+        match tokio::net::TcpStream::connect(peer_addr).await {
+            Ok(stream) => {
+                info!(
+                    "✅ STREAMING: Created direct connection for transfer {}",
+                    transfer_id
+                );
+
+                // Start streaming transfer with the direct connection
+                if let Some(ref streaming_manager) = self.streaming_manager {
+                    match streaming_manager
+                        .start_streaming_transfer(peer_id, file_path, stream)
+                        .await
+                    {
+                        Ok(actual_transfer_id) => {
+                            info!(
+                                "🚀 STREAMING: Transfer started with ID {}",
+                                actual_transfer_id
+                            );
+                        }
+                        Err(e) => {
+                            error!("❌ STREAMING: Failed to start transfer: {}", e);
+                            return Err(e);
+                        }
+                    }
+                } else {
+                    return Err(FileshareError::Transfer(
+                        "Streaming manager not available".to_string(),
+                    ));
+                }
+            }
+            Err(e) => {
+                error!(
+                    "❌ STREAMING: Failed to create direct connection to {}: {}",
+                    peer_addr, e
+                );
+                return Err(FileshareError::Network(e));
+            }
+        }
+
+        Ok(())
     }
 
     fn store_streaming_transfer_metadata(
@@ -185,7 +281,6 @@ impl FileTransferManager {
     }
 
     pub async fn mark_outgoing_transfer_completed(&mut self, transfer_id: Uuid) -> Result<()> {
-        // First scope: Update the transfer status
         {
             if let Some(transfer) = self.active_transfers.get_mut(&transfer_id) {
                 if matches!(transfer.direction, TransferDirection::Outgoing) {
@@ -209,9 +304,8 @@ impl FileTransferManager {
                 );
                 return Ok(());
             }
-        } // Mutable borrow ends here
+        }
 
-        // Second scope: Show notification with immutable borrow
         {
             if let Some(transfer) = self.active_transfers.get(&transfer_id) {
                 if let Err(e) = self.show_transfer_notification(transfer).await {
@@ -223,7 +317,6 @@ impl FileTransferManager {
         Ok(())
     }
 
-    // Phase 1: Validate file size before transfer
     pub fn validate_file_size(&self, file_path: &PathBuf) -> Result<()> {
         let metadata = std::fs::metadata(file_path)
             .map_err(|e| FileshareError::FileOperation(format!("Cannot access file: {}", e)))?;
@@ -248,7 +341,6 @@ impl FileTransferManager {
         Ok(())
     }
 
-    // Enhanced send_file with validation and retry
     pub async fn send_file_with_validation(
         &mut self,
         peer_id: Uuid,
@@ -259,7 +351,6 @@ impl FileTransferManager {
             peer_id, file_path
         );
 
-        // Validate file basics
         if !file_path.exists() {
             return Err(FileshareError::FileOperation(
                 "File does not exist".to_string(),
@@ -290,7 +381,6 @@ impl FileTransferManager {
             )));
         }
 
-        // DECISION LOGIC: Choose transfer method based on file size
         if file_size <= STREAMING_THRESHOLD {
             info!(
                 "📦 Using CHUNKED transfer for file ({:.1}MB ≤ 50MB)",
@@ -307,10 +397,56 @@ impl FileTransferManager {
     }
 
     async fn send_file_chunked(&mut self, peer_id: Uuid, file_path: PathBuf) -> Result<()> {
-        // Use existing chunked implementation
         self.send_file_with_target_dir(peer_id, file_path, None)
             .await
     }
+
+    async fn send_file_streaming(&mut self, peer_id: Uuid, file_path: PathBuf) -> Result<()> {
+        let file_size = std::fs::metadata(&file_path)?.len();
+
+        let mut streaming_metadata = StreamingFileMetadata::new(
+            file_path
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .to_string(),
+            file_size,
+            self.streaming_config.base_chunk_size,
+        );
+
+        let transfer_id = streaming_metadata.transfer_id;
+
+        self.store_streaming_transfer_metadata(transfer_id, peer_id, file_path.clone());
+
+        info!(
+            "🚀 STREAMING: Initiating streaming transfer {} for {:.1}MB file",
+            transfer_id,
+            file_size as f64 / (1024.0 * 1024.0)
+        );
+
+        if let Some(ref sender) = self.message_sender {
+            let streaming_offer = Message::new(MessageType::StreamingFileOffer {
+                transfer_id,
+                metadata: streaming_metadata,
+            });
+
+            sender.send((peer_id, streaming_offer)).map_err(|e| {
+                FileshareError::Transfer(format!("Failed to send streaming offer: {}", e))
+            })?;
+
+            info!(
+                "✅ STREAMING: Streaming offer sent for transfer {}",
+                transfer_id
+            );
+        } else {
+            return Err(FileshareError::Transfer(
+                "Message sender not configured".to_string(),
+            ));
+        }
+
+        Ok(())
+    }
+
     // Fixed version - using loop instead of recursion
     async fn send_file_with_retry(
         &mut self,
@@ -462,136 +598,6 @@ impl FileTransferManager {
         // Start streaming connection setup
         self.initiate_streaming_connection(peer_id, transfer_id, suggested_config)
             .await
-    }
-
-    async fn send_file_streaming(&mut self, peer_id: Uuid, file_path: PathBuf) -> Result<()> {
-        let file_size = std::fs::metadata(&file_path)?.len();
-
-        // Create streaming metadata
-        let mut streaming_metadata = StreamingFileMetadata::new(
-            file_path
-                .file_name()
-                .unwrap_or_default()
-                .to_string_lossy()
-                .to_string(),
-            file_size,
-            self.streaming_config.base_chunk_size,
-        );
-
-        let transfer_id = streaming_metadata.transfer_id;
-
-        // Store the file path mapping for later use
-        self.store_streaming_transfer_metadata(transfer_id, peer_id, file_path.clone());
-
-        info!(
-            "🚀 STREAMING: Initiating streaming transfer {} for {:.1}MB file",
-            transfer_id,
-            file_size as f64 / (1024.0 * 1024.0)
-        );
-
-        // Send streaming offer through regular message channel
-        if let Some(ref sender) = self.message_sender {
-            let streaming_offer = Message::new(MessageType::StreamingFileOffer {
-                transfer_id,
-                metadata: streaming_metadata,
-            });
-
-            sender.send((peer_id, streaming_offer)).map_err(|e| {
-                FileshareError::Transfer(format!("Failed to send streaming offer: {}", e))
-            })?;
-
-            info!(
-                "✅ STREAMING: Streaming offer sent for transfer {}",
-                transfer_id
-            );
-        } else {
-            return Err(FileshareError::Transfer(
-                "Message sender not configured".to_string(),
-            ));
-        }
-
-        Ok(())
-    }
-
-    // NEW: Setup streaming connection - FIXED VERSION
-    pub async fn initiate_streaming_connection(
-        &mut self,
-        peer_id: Uuid,
-        transfer_id: Uuid,
-        _suggested_config: Option<StreamingConfig>,
-    ) -> Result<()> {
-        info!(
-            "🚀 STREAMING: Setting up direct connection for transfer {}",
-            transfer_id
-        );
-
-        // Get file path from stored metadata
-        let file_path = self.get_stored_file_path(transfer_id)?;
-
-        // Get peer address from peer manager
-        let peer_addr = if let Some(ref peer_manager_ref) = self.peer_manager_ref {
-            let peer_manager = peer_manager_ref.read().await;
-            peer_manager
-                .get_peer_address(peer_id)
-                .ok_or_else(|| FileshareError::Transfer("Peer address not found".to_string()))?
-        } else {
-            return Err(FileshareError::Transfer(
-                "Peer manager not available".to_string(),
-            ));
-        };
-
-        info!(
-            "🚀 STREAMING: Connecting to peer {} at {}",
-            peer_id, peer_addr
-        );
-
-        // Create a DIRECT connection for streaming (not from pool)
-        match tokio::net::TcpStream::connect(peer_addr).await {
-            Ok(stream) => {
-                info!(
-                    "✅ STREAMING: Created direct connection for transfer {}",
-                    transfer_id
-                );
-
-                // Start streaming transfer with the direct connection
-                if let Some(ref streaming_manager) = self.streaming_manager {
-                    match streaming_manager
-                        .start_streaming_transfer(peer_id, file_path, stream)
-                        .await
-                    {
-                        Ok(actual_transfer_id) => {
-                            info!(
-                                "🚀 STREAMING: Transfer started with ID {}",
-                                actual_transfer_id
-                            );
-                        }
-                        Err(e) => {
-                            error!("❌ STREAMING: Failed to start transfer: {}", e);
-                            return Err(e);
-                        }
-                    }
-                } else {
-                    return Err(FileshareError::Transfer(
-                        "Streaming manager not available".to_string(),
-                    ));
-                }
-            }
-            Err(e) => {
-                error!(
-                    "❌ STREAMING: Failed to create direct connection to {}: {}",
-                    peer_addr, e
-                );
-                return Err(FileshareError::Network(e));
-            }
-        }
-
-        Ok(())
-    }
-
-    async fn get_peer_address(&self, peer_id: Uuid) -> Result<std::net::SocketAddr> {
-        // We need to get this from the peer manager
-        // For now, return a placeholder
-        Ok(std::net::SocketAddr::from(([127, 0, 0, 1], 9876)))
     }
 
     // NEW: Handle incoming streaming offers

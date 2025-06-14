@@ -26,8 +26,12 @@ impl FileshareDaemon {
         let settings = Arc::new(settings);
         let (shutdown_tx, shutdown_rx) = broadcast::channel(1);
 
-        // Initialize peer manager
-        let peer_manager = PeerManager::new(settings.clone()).await?;
+        // PRODUCTION: Create peer manager without circular references
+        let mut peer_manager = PeerManager::new(settings.clone()).await?;
+
+        // PRODUCTION: Set up callbacks instead of circular references
+        peer_manager.setup_file_transfer_callbacks().await;
+
         let peer_manager = Arc::new(RwLock::new(peer_manager));
 
         // Initialize discovery service
@@ -48,7 +52,7 @@ impl FileshareDaemon {
             settings,
             discovery: Some(discovery),
             peer_manager,
-            hotkey_manager: Some(hotkey_manager), // Wrap in Option
+            hotkey_manager: Some(hotkey_manager),
             clipboard,
             shutdown_tx,
             shutdown_rx,

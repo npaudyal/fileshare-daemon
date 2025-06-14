@@ -97,45 +97,50 @@ impl PeerManager {
 
     pub async fn new(settings: Arc<Settings>) -> Result<Self> {
         let (message_tx, message_rx) = mpsc::unbounded_channel();
-        let file_transfer = FileTransferManager::new(settings.clone()).await?;
 
-        // Create the peer manager
-        let peer_manager = Arc::new(RwLock::new(Self {
+        // Create file transfer manager WITHOUT any circular reference
+        let mut file_transfer = FileTransferManager::new(settings.clone()).await?;
+
+        // Set up the message sender
+        file_transfer.set_message_sender(message_tx.clone());
+
+        // PRODUCTION: Return PeerManager directly - no Arc wrapping
+        Ok(Self {
             settings,
             peers: HashMap::new(),
             file_transfer: Arc::new(RwLock::new(file_transfer)),
-            message_tx: message_tx.clone(),
+            message_tx,
             message_rx,
             connections: HashMap::new(),
-        }));
-
-        // Set up the circular reference
-        {
-            let peer_manager_guard = peer_manager.read().await;
-            let mut file_transfer_guard = peer_manager_guard.file_transfer.write().await;
-            file_transfer_guard.set_peer_manager_ref(peer_manager.clone());
-        }
-
-        // Return the inner PeerManager, not the Arc
-        let peer_manager_inner = Arc::try_unwrap(peer_manager)
-            .map_err(|_| FileshareError::Unknown("Failed to unwrap PeerManager".to_string()))?
-            .into_inner();
-
-        Ok(peer_manager_inner)
+        })
     }
 
-    pub async fn setup_file_transfer_peer_ref(peer_manager: Arc<RwLock<Self>>) {
-        let mut pm = peer_manager.write().await;
-        let mut ft = pm.file_transfer.write().await;
-        ft.set_peer_manager_ref(peer_manager.clone());
-    }
+    pub async fn setup_file_transfer_callbacks(&mut self) {
+        // Create callbacks that capture the peer information
+        let peers_for_address = self.peers.clone();
+        let peers_for_connected = self.peers.clone();
 
-    // Connect file transfer manager with message sender
-    async fn set_file_transfer_message_sender(&self) {
+        let address_callback: crate::service::file_transfer::PeerAddressCallback =
+            Arc::new(move |peer_id| {
+                peers_for_address
+                    .get(&peer_id)
+                    .map(|peer| peer.device_info.addr)
+            });
+
+        let connected_callback: crate::service::file_transfer::PeerConnectedCallback =
+            Arc::new(move |peer_id| {
+                peers_for_connected
+                    .get(&peer_id)
+                    .map(|peer| matches!(peer.connection_status, ConnectionStatus::Authenticated))
+                    .unwrap_or(false)
+            });
+
+        // Set the callbacks
         let mut ft = self.file_transfer.write().await;
-        ft.set_message_sender(self.message_tx.clone());
-    }
+        ft.set_peer_callbacks(address_callback, connected_callback);
 
+        info!("✅ File transfer callbacks configured");
+    }
     pub fn debug_connection_status(&self) {
         info!("=== CONNECTION STATUS DEBUG ===");
         info!("Total discovered peers: {}", self.peers.len());
