@@ -1322,6 +1322,7 @@ dependencies = [
  "dirs 5.0.1",
  "gethostname",
  "global-hotkey",
+ "libc",
  "lz4_flex",
  "mdns",
  "memmap2",
@@ -1332,6 +1333,8 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+ "socket2",
+ "sys-info",
  "tauri",
  "tauri-build",
  "tauri-plugin-shell",
@@ -2343,9 +2346,9 @@ dependencies = [
 
 [[package]]
 name = "libc"
-version = "0.2.172"
+version = "0.2.173"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d750af042f7ef4f724306de029d18836c26c1765a54a6a3f094cbd23a7267ffa"
+checksum = "d8cfeafaffdbc32176b64fb251369d52ea9f0a8fbc6f8759edffef7b525d64bb"
 
 [[package]]
 name = "libloading"
@@ -4072,6 +4075,16 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.101",
+]
+
+[[package]]
+name = "sys-info"
+version = "0.9.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0b3a0d0aba8bf96a0e1ddfdc352fc53b3df7f39318c71854910c3c4b024ae52c"
+dependencies = [
+ "cc",
+ "libc",
 ]
 
 [[package]]

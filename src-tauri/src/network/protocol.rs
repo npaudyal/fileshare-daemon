@@ -23,6 +23,7 @@ pub enum MessageType {
         reason: Option<String>,
     },
 
+    // Clipboard operations
     ClipboardUpdate {
         file_path: String,
         source_device: Uuid,
@@ -43,7 +44,7 @@ pub enum MessageType {
         reason: Option<String>,
     },
 
-    // File transfer
+    // CHUNKED file transfer (for smaller files)
     FileOffer {
         transfer_id: Uuid,
         metadata: FileMetadata,
@@ -69,6 +70,8 @@ pub enum MessageType {
         transfer_id: Uuid,
         error: String,
     },
+
+    // STREAMING file transfer (for larger files)
     StreamingFileOffer {
         transfer_id: Uuid,
         metadata: StreamingFileMetadata,
@@ -80,8 +83,19 @@ pub enum MessageType {
         suggested_config: Option<StreamingConfig>,
     },
 
-    // Raw streaming data is sent separately, not through this message system
-    // Only control messages go through the regular protocol
+    // Streaming connection management
+    StreamingConnectionRequest {
+        transfer_id: Uuid,
+        port: u16, // Port we want to connect to (0 = any)
+    },
+    StreamingConnectionResponse {
+        transfer_id: Uuid,
+        accepted: bool,
+        port: Option<u16>, // Port to connect to
+        reason: Option<String>,
+    },
+
+    // Streaming transfer status (sent over regular control channel)
     StreamingTransferComplete {
         transfer_id: Uuid,
         bytes_transferred: u64,
@@ -109,8 +123,8 @@ pub struct FileMetadata {
     pub created: Option<u64>,
     pub modified: Option<u64>,
     pub target_dir: Option<String>,
-    pub chunk_size: usize, // NEW: Include chunk size in metadata
-    pub total_chunks: u64, // NEW: Include total expected chunks
+    pub chunk_size: usize,
+    pub total_chunks: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -163,8 +177,6 @@ impl FileMetadata {
             .to_string();
 
         let file_size = metadata.len();
-
-        // Calculate total chunks based on file size and chunk size
         let total_chunks = (file_size + chunk_size as u64 - 1) / chunk_size as u64;
 
         // Calculate checksum
@@ -195,7 +207,6 @@ impl FileMetadata {
             .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
             .map(|d| d.as_secs());
 
-        // Guess MIME type
         let mime_type = Self::guess_mime_type(&name);
 
         Ok(Self {
@@ -206,14 +217,12 @@ impl FileMetadata {
             created,
             modified,
             target_dir: None,
-            chunk_size,   // NEW: Store the chunk size used
-            total_chunks, // NEW: Store expected total chunks
+            chunk_size,
+            total_chunks,
         })
     }
 
-    // Keep the old method for backward compatibility
     pub fn from_path(path: &PathBuf) -> crate::Result<Self> {
-        // Use default 1MB chunk size for backward compatibility
         Self::from_path_with_chunk_size(path, 1024 * 1024)
     }
 
@@ -234,9 +243,9 @@ impl FileMetadata {
             "jpg" | "jpeg" => Some("image/jpeg".to_string()),
             "png" => Some("image/png".to_string()),
             "gif" => Some("image/gif".to_string()),
-            "mp4" => Some("video/mp4".to_string()),
-            "mp3" => Some("audio/mpeg".to_string()),
-            "zip" => Some("application/zip".to_string()),
+            "mp4" | "mov" | "avi" | "mkv" => Some("video/mp4".to_string()),
+            "mp3" | "wav" | "flac" => Some("audio/mpeg".to_string()),
+            "zip" | "rar" | "7z" => Some("application/zip".to_string()),
             "json" => Some("application/json".to_string()),
             "xml" => Some("application/xml".to_string()),
             _ => None,
