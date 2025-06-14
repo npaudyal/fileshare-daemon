@@ -1,7 +1,8 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::RwLock;
-use tracing::{debug, error, info, warn};
+use tracing::info;
+use tracing::warn;
 use uuid::Uuid;
 
 #[derive(Debug, Clone)]
@@ -14,42 +15,33 @@ pub struct NetworkClipboardItem {
 
 #[derive(Clone)]
 pub struct ClipboardManager {
-    pub network_clipboard: Arc<RwLock<Option<NetworkClipboardItem>>>,
+    pub network_clipboard: Arc<RwLock<Option<NetworkClipboardItem>>>, // Make this public
     device_id: Uuid,
-    // ✅ FIXED: Add broadcast capability
-    broadcast_sender: Option<tokio::sync::mpsc::UnboundedSender<NetworkClipboardItem>>,
 }
 
 impl ClipboardManager {
     pub fn new(device_id: Uuid) -> Self {
-        info!("📋 Creating ClipboardManager for device {}", device_id);
         Self {
             network_clipboard: Arc::new(RwLock::new(None)),
             device_id,
-            broadcast_sender: None, // Will be set by daemon
         }
-    }
-
-    // ✅ FIXED: Method for daemon to set broadcast capability
-    pub fn set_broadcast_sender(
-        &mut self,
-        sender: tokio::sync::mpsc::UnboundedSender<NetworkClipboardItem>,
-    ) {
-        self.broadcast_sender = Some(sender);
-        info!("📡 Broadcast sender configured for clipboard manager");
     }
 
     fn extract_filename_cross_platform(file_path: &PathBuf) -> String {
         let path_str = file_path.to_string_lossy();
-        debug!("Extracting filename from path: '{}'", path_str);
+        info!("Extracting filename from path: '{}'", path_str);
 
+        // Handle both Windows and Unix paths manually for cross-platform compatibility
         let path_separators = ['/', '\\'];
+
+        // Find the last path separator
         if let Some(last_sep_pos) = path_str.rfind(&path_separators[..]) {
             let filename = &path_str[last_sep_pos + 1..];
-            debug!("Extracted filename: '{}'", filename);
+            info!("Extracted filename: '{}'", filename);
             filename.to_string()
         } else {
-            debug!(
+            // No separators found, the whole string is the filename
+            info!(
                 "No path separator found, using whole string as filename: '{}'",
                 path_str
             );
@@ -59,89 +51,38 @@ impl ClipboardManager {
 
     // Called when user hits copy hotkey - detect selected file and store in network clipboard
     pub async fn copy_selected_file(&self) -> crate::Result<()> {
-        info!(
-            "📋 COPY: Starting copy operation for device {}",
-            self.device_id
-        );
+        info!("Attempting to copy currently selected file");
 
+        // Get the currently selected file from the OS
         let selected_file = self.get_selected_file_from_os().await?;
 
         if let Some(file_path) = selected_file {
-            info!("📋 COPY: Selected file detected: {:?}", file_path);
+            info!("Copying file to network clipboard: {:?}", file_path);
 
-            // Validate file accessibility
+            // Get file info
             let metadata = tokio::fs::metadata(&file_path).await.map_err(|e| {
-                error!("📋 COPY: Cannot access file {:?}: {}", file_path, e);
                 crate::FileshareError::FileOperation(format!("Cannot access file: {}", e))
             })?;
 
-            let file_size = metadata.len();
-
-            if file_size == 0 {
-                warn!("📋 COPY: File is empty, skipping: {:?}", file_path);
-                self.show_notification("Empty File", "Cannot copy empty files")
-                    .await?;
-                return Ok(());
-            }
-
-            if file_size > 10 * 1024 * 1024 * 1024 {
-                warn!(
-                    "📋 COPY: File too large ({}GB), skipping: {:?}",
-                    file_size / (1024 * 1024 * 1024),
-                    file_path
-                );
-                self.show_notification("File Too Large", "File exceeds 10GB limit")
-                    .await?;
-                return Ok(());
-            }
-
-            // Create clipboard item
             let clipboard_item = NetworkClipboardItem {
                 file_path: file_path.clone(),
                 source_device: self.device_id,
                 timestamp: crate::utils::current_timestamp(),
-                file_size,
+                file_size: metadata.len(),
             };
 
-            // Store in local clipboard
             {
                 let mut clipboard = self.network_clipboard.write().await;
-                *clipboard = Some(clipboard_item.clone());
-                info!(
-                    "📋 COPY: Stored in local clipboard: {} bytes from device {}",
-                    file_size, self.device_id
-                );
+                *clipboard = Some(clipboard_item);
             }
 
-            // ✅ FIXED: Actually broadcast the clipboard update
-            self.broadcast_clipboard_update(&clipboard_item).await?;
+            info!("File copied to network clipboard: {:?}", file_path);
 
-            // Determine transfer method for notification
-            let transfer_method = if file_size >= 50 * 1024 * 1024 {
-                "High-Speed Streaming 🚀"
-            } else {
-                "Standard Transfer 📦"
-            };
-
-            // Show success notification
-            let filename = file_path.file_name().unwrap_or_default().to_string_lossy();
-            let file_size_mb = file_size as f64 / (1024.0 * 1024.0);
-
-            self.show_notification(
-                "File Ready for Network Transfer",
-                &format!(
-                    "📋 {}\n📊 {:.1} MB\n🚀 Method: {}",
-                    filename, file_size_mb, transfer_method
-                ),
-            )
-            .await?;
-
-            info!(
-                "✅ COPY: Copy operation completed successfully for {:?}",
-                file_path
-            );
+            // TODO: Broadcast to other devices that something was copied
+            self.broadcast_clipboard_update().await?;
         } else {
-            info!("📋 COPY: No file selected in file manager");
+            info!("No file selected in file manager");
+            // Show notification that no file is selected
             self.show_notification(
                 "Nothing Selected",
                 "Please select a file in your file manager first",
@@ -152,54 +93,26 @@ impl ClipboardManager {
         Ok(())
     }
 
-    pub async fn debug_clipboard_state(&self) {
-        let clipboard = self.network_clipboard.read().await;
-        match clipboard.as_ref() {
-            Some(item) => {
-                info!(
-                    "📋 DEBUG: Clipboard contains file from device {} - {:?} ({}MB)",
-                    item.source_device,
-                    item.file_path,
-                    item.file_size as f64 / (1024.0 * 1024.0)
-                );
-            }
-            None => {
-                info!("📋 DEBUG: Clipboard is empty");
-            }
-        }
-    }
-
     // Called when user hits paste hotkey - transfer file to current location
     pub async fn paste_to_current_location(&self) -> crate::Result<Option<(PathBuf, Uuid)>> {
-        info!(
-            "📁 PASTE: Starting paste operation for device {}",
-            self.device_id
-        );
+        info!("Attempting to paste from network clipboard");
 
         let clipboard_item = {
             let clipboard = self.network_clipboard.read().await;
-            let item = clipboard.clone();
-            if let Some(ref item) = item {
-                info!(
-                    "📁 PASTE: Found clipboard item from device {} ({}MB)",
-                    item.source_device,
-                    item.file_size as f64 / (1024.0 * 1024.0)
-                );
-            } else {
-                info!("📁 PASTE: Clipboard is empty");
-            }
-            item
+            clipboard.clone()
         };
 
         if let Some(item) = clipboard_item {
-            debug!(
-                "📁 PASTE: Clipboard details - file: {:?}, source: {}, timestamp: {}",
-                item.file_path, item.source_device, item.timestamp
+            // DEBUG: Log what's in the clipboard
+            info!("DEBUG: Clipboard item file_path: {:?}", item.file_path);
+            info!(
+                "DEBUG: Clipboard item source_device: {}",
+                item.source_device
             );
 
-            // Prevent same-device paste
+            // Don't paste on the same device that copied
             if item.source_device == self.device_id {
-                info!("📁 PASTE: Ignoring paste on same device that copied");
+                info!("Ignoring paste on same device that copied");
                 self.show_notification(
                     "Same Device",
                     "Can't paste on the same device you copied from",
@@ -208,33 +121,27 @@ impl ClipboardManager {
                 return Ok(None);
             }
 
-            // Get current directory
+            // Get current directory where user wants to paste
             let target_dir = self.get_current_directory().await?;
-            info!("📁 PASTE: Target directory: {:?}", target_dir);
 
-            // Extract filename properly
+            info!("Paste target directory: {:?}", target_dir);
+            info!(
+                "Will request file: {:?} from device: {}",
+                item.file_path, item.source_device
+            );
+
+            // FIXED: Extract filename in a cross-platform way
             let filename = Self::extract_filename_cross_platform(&item.file_path);
             let target_path = target_dir.join(&filename);
 
-            // Check for existing file and handle conflicts
-            let final_target_path = self.handle_file_conflicts(target_path).await?;
+            // DEBUG: Log the final paths
+            info!("DEBUG: Final source path for request: {:?}", item.file_path);
+            info!("DEBUG: Final target path for request: {:?}", target_path);
 
-            info!(
-                "📁 PASTE: Will request file from device {} to {:?}",
-                item.source_device, final_target_path
-            );
-
-            // Show preparation notification
-            let file_size_mb = item.file_size as f64 / (1024.0 * 1024.0);
-            self.show_notification(
-                "Preparing Transfer",
-                &format!("Requesting {:.1}MB file from network device", file_size_mb),
-            )
-            .await?;
-
-            Ok(Some((final_target_path, item.source_device)))
+            // Return the file info and source device for the daemon to handle transfer
+            Ok(Some((target_path, item.source_device)))
         } else {
-            info!("📁 PASTE: Network clipboard is empty");
+            info!("Network clipboard is empty");
             self.show_notification(
                 "Nothing to Paste",
                 "Network clipboard is empty. Copy a file first.",
@@ -247,117 +154,17 @@ impl ClipboardManager {
     // Update clipboard when another device copies something
     pub async fn update_from_network(&self, item: NetworkClipboardItem) {
         info!(
-            "📡 NETWORK_UPDATE: Received clipboard update from device {} for file {:?} ({}MB)",
-            item.source_device,
-            item.file_path,
-            item.file_size as f64 / (1024.0 * 1024.0)
+            "Received network clipboard update from device {}: {:?}",
+            item.source_device, item.file_path
         );
-
-        // Validate the incoming item
-        if item.source_device == self.device_id {
-            warn!(
-                "📡 NETWORK_UPDATE: Ignoring update from own device {}",
-                self.device_id
-            );
-            return;
-        }
-
-        if item.file_size == 0 {
-            warn!(
-                "📡 NETWORK_UPDATE: Ignoring empty file from device {}",
-                item.source_device
-            );
-            return;
-        }
-
-        // Store the network clipboard item
-        {
-            let mut clipboard = self.network_clipboard.write().await;
-            let old_item = clipboard.replace(item.clone());
-
-            if let Some(old) = old_item {
-                info!("📡 NETWORK_UPDATE: Replaced old clipboard item from device {} with new item from device {}", 
-                      old.source_device, item.source_device);
-            } else {
-                info!(
-                    "📡 NETWORK_UPDATE: Set new clipboard item from device {}",
-                    item.source_device
-                );
-            }
-        }
-
-        // Show notification about network clipboard update
-        let filename = item
-            .file_path
-            .file_name()
-            .unwrap_or_default()
-            .to_string_lossy();
-        let file_size_mb = item.file_size as f64 / (1024.0 * 1024.0);
-
-        if let Err(e) = self
-            .show_notification(
-                "Network File Available",
-                &format!(
-                    "📁 {} ({:.1}MB)\nReady to paste from network",
-                    filename, file_size_mb
-                ),
-            )
-            .await
-        {
-            warn!("Failed to show network update notification: {}", e);
-        }
-
-        info!(
-            "✅ NETWORK_UPDATE: Successfully updated clipboard from device {}",
-            item.source_device
-        );
-    }
-
-    async fn handle_file_conflicts(&self, target_path: PathBuf) -> crate::Result<PathBuf> {
-        if !target_path.exists() {
-            return Ok(target_path);
-        }
-
-        let mut counter = 1;
-        let original_stem = target_path
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .unwrap_or("file");
-        let extension = target_path
-            .extension()
-            .and_then(|s| s.to_str())
-            .map(|s| format!(".{}", s))
-            .unwrap_or_default();
-        let parent = target_path
-            .parent()
-            .unwrap_or_else(|| std::path::Path::new("."));
-
-        loop {
-            let new_name = format!("{} ({}){}", original_stem, counter, extension);
-            let new_path = parent.join(new_name);
-
-            if !new_path.exists() {
-                info!(
-                    "📁 Resolved file conflict: {:?} -> {:?}",
-                    target_path, new_path
-                );
-                return Ok(new_path);
-            }
-
-            counter += 1;
-            if counter > 1000 {
-                // Prevent infinite loop
-                return Err(crate::FileshareError::FileOperation(
-                    "Too many file conflicts".to_string(),
-                ));
-            }
-        }
+        let mut clipboard = self.network_clipboard.write().await;
+        *clipboard = Some(item);
     }
 
     pub async fn clear(&self) {
         let mut clipboard = self.network_clipboard.write().await;
         *clipboard = None;
-        info!("📋 Network clipboard cleared for device {}", self.device_id);
+        info!("Network clipboard cleared");
     }
 
     pub async fn is_empty(&self) -> bool {
@@ -767,27 +574,9 @@ impl ClipboardManager {
         Ok(dirs::desktop_dir().unwrap_or_else(|| PathBuf::from(".")))
     }
 
-    async fn broadcast_clipboard_update(&self, item: &NetworkClipboardItem) -> crate::Result<()> {
-        if let Some(ref sender) = self.broadcast_sender {
-            info!(
-                "📡 Broadcasting clipboard update: {:?} ({}MB)",
-                item.file_path.file_name().unwrap_or_default(),
-                item.file_size as f64 / (1024.0 * 1024.0)
-            );
-
-            if let Err(e) = sender.send(item.clone()) {
-                error!("❌ Failed to broadcast clipboard update: {}", e);
-                return Err(crate::FileshareError::Unknown(format!(
-                    "Broadcast failed: {}",
-                    e
-                )));
-            }
-
-            info!("✅ Clipboard update broadcasted successfully");
-        } else {
-            warn!("⚠️ No broadcast sender configured - clipboard update not sent to network");
-        }
-
+    async fn broadcast_clipboard_update(&self) -> crate::Result<()> {
+        // TODO: Implement network broadcast to tell other devices something was copied
+        // This will integrate with the peer manager
         Ok(())
     }
 
@@ -795,7 +584,7 @@ impl ClipboardManager {
         notify_rust::Notification::new()
             .summary(title)
             .body(message)
-            .timeout(notify_rust::Timeout::Milliseconds(4000))
+            .timeout(notify_rust::Timeout::Milliseconds(3000))
             .show()
             .map_err(|e| crate::FileshareError::Unknown(format!("Notification error: {}", e)))?;
         Ok(())

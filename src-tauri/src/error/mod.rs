@@ -33,6 +33,14 @@ pub enum FileshareError {
 
     #[error("Unknown error: {0}")]
     Unknown(String),
+    #[error("Streaming error: {0}")]
+    Streaming(String),
+
+    #[error("Connection pool error: {0}")]
+    ConnectionPool(String),
+
+    #[error("Hybrid transfer error: {0}")]
+    HybridTransfer(String),
 }
 
 // Implement From for mdns::Error

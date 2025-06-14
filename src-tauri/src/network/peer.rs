@@ -1,28 +1,37 @@
 use crate::{
     config::Settings,
-    network::{connection_pool::ConnectionPoolManager, discovery::DeviceInfo, protocol::*},
-    service::file_transfer::FileTransferManager,
+    network::{discovery::DeviceInfo, protocol::*},
+    service::file_transfer::{
+        FileTransferManager, MessageSender, TransferDirection, TransferStatus,
+    },
     FileshareError, Result,
 };
 use std::collections::HashMap;
-use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpStream;
 use tokio::sync::{mpsc, RwLock};
+use tokio::time::{interval, timeout};
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
+
+// Constants for connection health monitoring
+const PING_INTERVAL_SECONDS: u64 = 30; // Ping every 30 seconds
+const PING_TIMEOUT_SECONDS: u64 = 10; // 10 second ping timeout
+const MAX_MISSED_PINGS: u32 = 3; // Disconnect after 3 missed pings
+const RECONNECTION_DELAY_SECONDS: u64 = 5; // Wait 5 seconds before reconnecting
+const MAX_RECONNECTION_ATTEMPTS: u32 = 5; // Try reconnecting 5 times
 
 #[derive(Debug, Clone)]
 pub struct Peer {
     pub device_info: DeviceInfo,
     pub connection_status: ConnectionStatus,
-    pub last_ping: Option<Instant>,
-    pub ping_failures: u32,
-    pub last_seen: Instant,
-    pub reconnection_attempts: u32,
-    pub streaming_port: Option<u16>,
-    pub connection_quality: ConnectionQuality,
+    pub last_ping: Option<std::time::Instant>,
+    pub ping_failures: u32,            // Track consecutive ping failures
+    pub last_seen: std::time::Instant, // Track when we last heard from this peer
+    pub reconnection_attempts: u32,    // Track reconnection attempts
 }
 
 #[derive(Debug, Clone)]
@@ -31,31 +40,11 @@ pub enum ConnectionStatus {
     Connecting,
     Connected,
     Authenticated,
-    Reconnecting,
+    Reconnecting, // Reconnecting state
     Error(String),
 }
 
-#[derive(Debug, Clone)]
-pub struct ConnectionQuality {
-    pub latency_ms: f64,
-    pub bandwidth_mbps: f64,
-    pub packet_loss: f64,
-    pub stability_score: f64,
-    pub last_measured: Instant,
-}
-
-impl Default for ConnectionQuality {
-    fn default() -> Self {
-        Self {
-            latency_ms: 0.0,
-            bandwidth_mbps: 0.0,
-            packet_loss: 0.0,
-            stability_score: 1.0,
-            last_measured: Instant::now(),
-        }
-    }
-}
-
+// Connection statistics structure
 #[derive(Debug, Default)]
 pub struct ConnectionStats {
     pub total: usize,
@@ -68,67 +57,151 @@ pub struct ConnectionStats {
     pub unhealthy: usize,
 }
 
-// ✅ UNIFIED: Single PeerManager with proper connection pooling
 pub struct PeerManager {
     settings: Arc<Settings>,
-    pub peers: HashMap<Uuid, Peer>,
+    peers: HashMap<Uuid, Peer>,
     pub file_transfer: Arc<RwLock<FileTransferManager>>,
     pub message_tx: mpsc::UnboundedSender<(Uuid, Message)>,
     pub message_rx: mpsc::UnboundedReceiver<(Uuid, Message)>,
-
-    // ✅ FIXED: Use unified connection pool
-    connection_pool: Arc<ConnectionPoolManager>,
-
-    // ✅ FIXED: Separate control and streaming connections
-    control_connections: HashMap<Uuid, mpsc::UnboundedSender<Message>>,
-    streaming_listener: Option<tokio::net::TcpListener>,
+    // Store active connections to send messages
+    connections: HashMap<Uuid, mpsc::UnboundedSender<Message>>,
 }
 
 impl PeerManager {
-    pub async fn new(settings: Arc<Settings>) -> Result<Self> {
-        let (message_tx, message_rx) = mpsc::unbounded_channel();
+    pub async fn get_all_discovered_devices(&self) -> Vec<crate::network::discovery::DeviceInfo> {
+        // Return peers as discovered devices for UI compatibility
+        let mut discovered = Vec::new();
 
-        // ✅ FIXED: Create unified connection pool
-        let connection_pool = Arc::new(ConnectionPoolManager::new());
-
-        // ✅ FIXED: Create file transfer manager with proper streaming integration
-        let file_transfer = Arc::new(RwLock::new(
-            FileTransferManager::new(settings.clone(), connection_pool.clone()).await?,
-        ));
-
-        // Start streaming listener
-        let streaming_port = settings.network.port + 1;
-        let streaming_listener =
-            tokio::net::TcpListener::bind(format!("0.0.0.0:{}", streaming_port))
-                .await
-                .ok();
-
-        if streaming_listener.is_some() {
-            info!("🚀 Streaming listener started on port {}", streaming_port);
+        for (_, peer) in &self.peers {
+            discovered.push(crate::network::discovery::DeviceInfo {
+                id: peer.device_info.id,
+                name: peer.device_info.name.clone(),
+                addr: peer.device_info.addr,
+                last_seen: peer.device_info.last_seen,
+                version: peer.device_info.version.clone(),
+            });
         }
 
-        let peer_manager = Self {
-            settings,
-            peers: HashMap::new(),
-            file_transfer,
-            message_tx: message_tx.clone(),
-            message_rx,
-            connection_pool,
-            control_connections: HashMap::new(),
-            streaming_listener,
-        };
-
-        // Set up message sender for file transfers
-        peer_manager.set_file_transfer_message_sender().await;
-
-        info!("✅ PeerManager initialized with unified connection pool");
-        Ok(peer_manager)
+        discovered
     }
 
+    pub fn get_peer_address(&self, peer_id: Uuid) -> Option<std::net::SocketAddr> {
+        self.peers.get(&peer_id).map(|peer| peer.device_info.addr)
+    }
+    pub fn is_peer_connected(&self, peer_id: Uuid) -> bool {
+        self.peers
+            .get(&peer_id)
+            .map(|peer| matches!(peer.connection_status, ConnectionStatus::Authenticated))
+            .unwrap_or(false)
+    }
+
+    pub async fn new(settings: Arc<Settings>) -> Result<Self> {
+        let (message_tx, message_rx) = mpsc::unbounded_channel();
+        let file_transfer = FileTransferManager::new(settings.clone()).await?;
+
+        // Create the peer manager
+        let peer_manager = Arc::new(RwLock::new(Self {
+            settings,
+            peers: HashMap::new(),
+            file_transfer: Arc::new(RwLock::new(file_transfer)),
+            message_tx: message_tx.clone(),
+            message_rx,
+            connections: HashMap::new(),
+        }));
+
+        // Set up the circular reference
+        {
+            let peer_manager_guard = peer_manager.read().await;
+            let mut file_transfer_guard = peer_manager_guard.file_transfer.write().await;
+            file_transfer_guard.set_peer_manager_ref(peer_manager.clone());
+        }
+
+        // Return the inner PeerManager, not the Arc
+        let peer_manager_inner = Arc::try_unwrap(peer_manager)
+            .map_err(|_| FileshareError::Unknown("Failed to unwrap PeerManager".to_string()))?
+            .into_inner();
+
+        Ok(peer_manager_inner)
+    }
+
+    pub async fn setup_file_transfer_peer_ref(peer_manager: Arc<RwLock<Self>>) {
+        let mut pm = peer_manager.write().await;
+        let mut ft = pm.file_transfer.write().await;
+        ft.set_peer_manager_ref(peer_manager.clone());
+    }
+
+    // Connect file transfer manager with message sender
     async fn set_file_transfer_message_sender(&self) {
         let mut ft = self.file_transfer.write().await;
         ft.set_message_sender(self.message_tx.clone());
-        ft.set_connection_pool(self.connection_pool.clone());
+    }
+
+    pub fn debug_connection_status(&self) {
+        info!("=== CONNECTION STATUS DEBUG ===");
+        info!("Total discovered peers: {}", self.peers.len());
+        info!("Active connections: {}", self.connections.len());
+
+        for (peer_id, peer) in &self.peers {
+            info!(
+                "Peer {}: {} - Status: {:?} - Ping failures: {} - Reconnection attempts: {}",
+                peer_id,
+                peer.device_info.name,
+                peer.connection_status,
+                peer.ping_failures,
+                peer.reconnection_attempts
+            );
+        }
+
+        for (peer_id, _) in &self.connections {
+            info!("Active connection to: {}", peer_id);
+        }
+        info!("=== END CONNECTION STATUS ===");
+    }
+
+    // Add this method for direct connection sending (used by daemon routing)
+    pub async fn send_direct_to_connection(&self, peer_id: Uuid, message: Message) -> Result<()> {
+        if let Some(conn) = self.connections.get(&peer_id) {
+            conn.send(message).map_err(|e| {
+                FileshareError::Transfer(format!("Failed to send direct message: {}", e))
+            })?;
+            Ok(())
+        } else {
+            Err(FileshareError::Transfer(format!(
+                "No connection to peer {}",
+                peer_id
+            )))
+        }
+    }
+
+    // Simplified message sending
+    pub async fn send_message_to_peer(&mut self, peer_id: Uuid, message: Message) -> Result<()> {
+        info!(
+            "Attempting to send message to peer {}: {:?}",
+            peer_id, message.message_type
+        );
+
+        if let Some(conn) = self.connections.get(&peer_id) {
+            match conn.send(message) {
+                Ok(()) => {
+                    info!("✅ Successfully sent message to peer {}", peer_id);
+                    Ok(())
+                }
+                Err(e) => {
+                    error!("❌ Failed to send message to peer {}: {}", peer_id, e);
+                    Err(FileshareError::Transfer(format!(
+                        "Failed to send message to peer: {}",
+                        e
+                    )))
+                }
+            }
+        } else {
+            error!("❌ No active connection to peer {}", peer_id);
+            self.debug_connection_status();
+            Err(FileshareError::Transfer(format!(
+                "No active connection to peer {}",
+                peer_id
+            )))
+        }
     }
 
     pub async fn on_device_discovered(&mut self, device_info: DeviceInfo) -> Result<()> {
@@ -152,8 +225,6 @@ impl PeerManager {
             ping_failures: 0,
             last_seen: Instant::now(),
             reconnection_attempts: 0,
-            streaming_port: Some(device_info.addr.port() + 1),
-            connection_quality: ConnectionQuality::default(),
         };
 
         info!("Adding new peer: {} ({})", device_info.name, device_info.id);
@@ -172,6 +243,11 @@ impl PeerManager {
                     device_info.id
                 );
                 self.connect_to_peer(device_info.id).await?;
+            } else {
+                info!(
+                    "Device {} not in allowed list, skipping connection",
+                    device_info.id
+                );
             }
         } else {
             info!(
@@ -184,7 +260,6 @@ impl PeerManager {
         Ok(())
     }
 
-    // ✅ FIXED: Proper connection management
     pub async fn connect_to_peer(&mut self, peer_id: Uuid) -> Result<()> {
         let peer = self
             .peers
@@ -202,49 +277,31 @@ impl PeerManager {
         peer.connection_status = ConnectionStatus::Connecting;
         let addr = peer.device_info.addr;
 
-        info!(
-            "🔗 Connecting to peer {} at {} with unified pool",
-            peer_id, addr
-        );
+        info!("Connecting to peer {} at {}", peer_id, addr);
 
-        // ✅ FIXED: Create direct connection instead of using pool for control connections
-        match tokio::time::timeout(
-            Duration::from_secs(10),
-            tokio::net::TcpStream::connect(addr),
-        )
-        .await
-        {
-            Ok(Ok(stream)) => {
-                info!("✅ Successfully connected to peer {} at {}", peer_id, addr);
+        match TcpStream::connect(addr).await {
+            Ok(stream) => {
+                info!("Successfully connected to peer {} at {}", peer_id, addr);
                 peer.connection_status = ConnectionStatus::Connected;
                 peer.last_seen = Instant::now();
-
-                // Configure for optimal control message performance
-                stream.set_nodelay(true)?;
-
-                // Handle control connection
-                self.handle_control_connection(peer_id, stream).await?;
+                self.handle_peer_connection(peer_id, stream).await?;
             }
-            Ok(Err(e)) => {
-                warn!("❌ Failed to connect to peer {}: {}", peer_id, e);
+            Err(e) => {
+                warn!("Failed to connect to peer {}: {}", peer_id, e);
                 peer.connection_status = ConnectionStatus::Error(e.to_string());
-            }
-            Err(_) => {
-                warn!("❌ Connection timeout to peer {}", peer_id);
-                peer.connection_status = ConnectionStatus::Error("Connection timeout".to_string());
             }
         }
 
         Ok(())
     }
 
-    pub async fn handle_connection(&mut self, stream: tokio::net::TcpStream) -> Result<()> {
+    pub async fn handle_connection(&mut self, stream: TcpStream) -> Result<()> {
         let addr = stream.peer_addr()?;
         info!("Handling incoming connection from {}", addr);
         self.handle_unknown_connection(stream).await
     }
 
-    async fn handle_unknown_connection(&mut self, stream: tokio::net::TcpStream) -> Result<()> {
+    async fn handle_unknown_connection(&mut self, stream: TcpStream) -> Result<()> {
         let mut connection = PeerConnection::new(stream);
 
         // Wait for handshake
@@ -309,16 +366,16 @@ impl PeerManager {
                             ping_failures: 0,
                             last_seen: Instant::now(),
                             reconnection_attempts: 0,
-                            streaming_port: Some(connection.stream.peer_addr()?.port() + 1),
-                            connection_quality: ConnectionQuality::default(),
                         };
 
                         self.peers.insert(device_id, peer);
                     }
 
                     // Handle the authenticated connection
-                    self.handle_authenticated_control_connection(device_id, connection)
+                    self.handle_authenticated_connection(device_id, connection)
                         .await?;
+                } else {
+                    info!("Handshake rejected for device {}", device_id);
                 }
             }
             _ => {
@@ -332,72 +389,41 @@ impl PeerManager {
         Ok(())
     }
 
-    // ✅ FIXED: Separate control vs streaming connections
-    async fn handle_control_connection(
-        &mut self,
-        peer_id: Uuid,
-        stream: tokio::net::TcpStream,
-    ) -> Result<()> {
+    async fn handle_peer_connection(&mut self, peer_id: Uuid, stream: TcpStream) -> Result<()> {
         let mut connection = PeerConnection::new(stream);
 
-        // Send handshake with timeout
+        // Send handshake
         let handshake =
             Message::handshake(self.settings.device.id, self.settings.device.name.clone());
 
-        info!("🤝 Sending handshake to peer {}", peer_id);
+        info!("Sending handshake to peer {}", peer_id);
+        connection.write_message(&handshake).await?;
 
-        tokio::time::timeout(Duration::from_secs(5), connection.write_message(&handshake))
-            .await
-            .map_err(|_| {
-                FileshareError::Network(std::io::Error::new(
-                    std::io::ErrorKind::TimedOut,
-                    "Handshake timeout",
-                ))
-            })?
-            .map_err(|e| {
-                error!("Failed to send handshake to peer {}: {}", peer_id, e);
-                e
-            })?;
-
-        // Wait for response with timeout
-        let response = tokio::time::timeout(Duration::from_secs(5), connection.read_message())
-            .await
-            .map_err(|_| {
-                FileshareError::Network(std::io::Error::new(
-                    std::io::ErrorKind::TimedOut,
-                    "Handshake response timeout",
-                ))
-            })?
-            .map_err(|e| {
-                error!(
-                    "Failed to read handshake response from peer {}: {}",
-                    peer_id, e
-                );
-                e
-            })?;
-
-        match response.message_type {
-            MessageType::HandshakeResponse { accepted: true, .. } => {
-                info!("✅ Control connection authenticated with peer {}", peer_id);
-
+        // Wait for response
+        match connection.read_message().await? {
+            Message {
+                message_type: MessageType::HandshakeResponse { accepted: true, .. },
+                ..
+            } => {
+                info!("Handshake accepted by peer {}", peer_id);
                 if let Some(peer) = self.peers.get_mut(&peer_id) {
                     peer.connection_status = ConnectionStatus::Authenticated;
                     peer.last_seen = Instant::now();
                     peer.ping_failures = 0;
                     peer.reconnection_attempts = 0;
                 }
-
-                self.handle_authenticated_control_connection(peer_id, connection)
+                self.handle_authenticated_connection(peer_id, connection)
                     .await?;
             }
-            MessageType::HandshakeResponse {
-                accepted: false,
-                reason,
+            Message {
+                message_type:
+                    MessageType::HandshakeResponse {
+                        accepted: false,
+                        reason,
+                    },
+                ..
             } => {
-                error!(
-                    "❌ Control connection rejected by peer {}: {:?}",
-                    peer_id, reason
-                );
+                warn!("Handshake rejected by peer {}: {:?}", peer_id, reason);
                 if let Some(peer) = self.peers.get_mut(&peer_id) {
                     peer.connection_status = ConnectionStatus::Error(
                         reason.unwrap_or_else(|| "Handshake rejected".to_string()),
@@ -405,7 +431,7 @@ impl PeerManager {
                 }
             }
             _ => {
-                error!("❌ Invalid handshake response from peer {}", peer_id);
+                warn!("Expected handshake response, got something else");
                 return Err(FileshareError::Authentication(
                     "Invalid handshake response".to_string(),
                 ));
@@ -415,393 +441,105 @@ impl PeerManager {
         Ok(())
     }
 
-    async fn handle_authenticated_control_connection(
+    async fn handle_authenticated_connection(
         &mut self,
         peer_id: Uuid,
         connection: PeerConnection,
     ) -> Result<()> {
+        info!("Handling authenticated connection with peer {}", peer_id);
+
         let message_tx = self.message_tx.clone();
         let (conn_tx, mut conn_rx) = mpsc::unbounded_channel::<Message>();
 
-        // Store control connection
-        self.control_connections.insert(peer_id, conn_tx);
+        // Store the connection sender so we can send messages to this peer
+        self.connections.insert(peer_id, conn_tx);
 
+        // Split the connection into read and write halves
         let (mut read_half, mut write_half) = connection.split();
 
-        // Read task - forwards messages to main handler
+        // Spawn task to handle reading messages FROM the peer
         let read_message_tx = message_tx.clone();
         let read_peer_id = peer_id;
-        tokio::spawn(async move {
+        let read_task = tokio::spawn(async move {
             loop {
                 match read_half.read_message().await {
                     Ok(message) => {
+                        info!(
+                            "📥 READ from peer {}: {:?}",
+                            read_peer_id, message.message_type
+                        );
                         if let Err(e) = read_message_tx.send((read_peer_id, message)) {
-                            error!("Failed to forward control message: {}", e);
+                            error!(
+                                "Failed to forward message from peer {}: {}",
+                                read_peer_id, e
+                            );
                             break;
                         }
                     }
                     Err(e) => {
-                        warn!("Control connection read error: {}", e);
+                        warn!("Connection read error with peer {}: {}", read_peer_id, e);
                         break;
                     }
                 }
             }
+            info!("Read task ended for peer {}", read_peer_id);
         });
 
-        // Write task - sends messages from queue
+        // Spawn task to handle writing messages TO the peer
         let write_peer_id = peer_id;
-        tokio::spawn(async move {
+        let write_task = tokio::spawn(async move {
             while let Some(message) = conn_rx.recv().await {
+                info!(
+                    "📤 WRITE to peer {}: {:?}",
+                    write_peer_id, message.message_type
+                );
+
                 if let Err(e) = write_half.write_message(&message).await {
-                    error!(
-                        "Failed to write control message to peer {}: {}",
-                        write_peer_id, e
-                    );
+                    error!("Failed to write message to peer {}: {}", write_peer_id, e);
                     break;
                 }
             }
+            info!("Write task ended for peer {}", write_peer_id);
+        });
+
+        // Clean up when connection ends
+        let cleanup_peer_id = peer_id;
+        let connections_cleanup = self.connections.clone();
+        tokio::spawn(async move {
+            tokio::select! {
+                _ = read_task => {
+                    info!("Read task completed for peer {}", cleanup_peer_id);
+                },
+                _ = write_task => {
+                    info!("Write task completed for peer {}", cleanup_peer_id);
+                },
+            }
+            info!("Connection handler for peer {} ended", cleanup_peer_id);
         });
 
         Ok(())
     }
 
-    // ✅ FIXED: Create dedicated streaming connections
-    pub async fn create_streaming_connection(
-        &self,
+    pub async fn send_file_to_peer(
+        &mut self,
         peer_id: Uuid,
-    ) -> Result<tokio::net::TcpStream> {
+        file_path: std::path::PathBuf,
+    ) -> Result<()> {
+        // Check if peer is connected and authenticated
         let peer = self
             .peers
             .get(&peer_id)
             .ok_or_else(|| FileshareError::Unknown("Peer not found".to_string()))?;
 
-        let streaming_port = peer
-            .streaming_port
-            .unwrap_or(peer.device_info.addr.port() + 1);
-        let streaming_addr = SocketAddr::new(peer.device_info.addr.ip(), streaming_port);
-
-        info!(
-            "🚀 Creating dedicated streaming connection to {} at {}",
-            peer_id, streaming_addr
-        );
-
-        // Create dedicated streaming connection (bypasses pool to avoid conflicts)
-        let stream = tokio::time::timeout(
-            Duration::from_secs(10),
-            tokio::net::TcpStream::connect(streaming_addr),
-        )
-        .await
-        .map_err(|_| {
-            FileshareError::Network(std::io::Error::new(
-                std::io::ErrorKind::TimedOut,
-                "Streaming connection timeout",
-            ))
-        })??;
-
-        // Configure for high performance
-        Self::configure_streaming_socket(&stream).await?;
-
-        info!(
-            "✅ Dedicated streaming connection established to {}",
-            peer_id
-        );
-        Ok(stream)
-    }
-
-    async fn configure_streaming_socket(stream: &tokio::net::TcpStream) -> Result<()> {
-        // Only configure what's directly available
-        stream.set_nodelay(true)?;
-
-        // The default buffer sizes are usually sufficient for most cases
-        // If you really need custom buffer sizes, use one of the above approaches
-
-        Ok(())
-    }
-
-    // ✅ FIXED: Start streaming listener that actually uses streaming components
-    pub async fn start_streaming_listener(&mut self) -> Result<()> {
-        if let Some(listener) = self.streaming_listener.take() {
-            let file_transfer = self.file_transfer.clone();
-
-            tokio::spawn(async move {
-                info!("🎧 Starting production streaming listener");
-
-                loop {
-                    match listener.accept().await {
-                        Ok((stream, addr)) => {
-                            info!("🚀 New streaming connection from {}", addr);
-
-                            // Configure for optimal performance
-                            if let Err(e) = Self::configure_streaming_socket(&stream).await {
-                                warn!("Failed to configure streaming socket: {}", e);
-                            }
-
-                            let ft = file_transfer.clone();
-                            tokio::spawn(async move {
-                                if let Err(e) = Self::handle_streaming_connection(stream, ft).await
-                                {
-                                    error!("❌ Streaming connection error: {}", e);
-                                }
-                            });
-                        }
-                        Err(e) => {
-                            error!("❌ Failed to accept streaming connection: {}", e);
-                            tokio::time::sleep(Duration::from_secs(1)).await;
-                        }
-                    }
-                }
-            });
+        if !matches!(peer.connection_status, ConnectionStatus::Authenticated) {
+            return Err(FileshareError::Transfer(
+                "Peer not authenticated".to_string(),
+            ));
         }
 
-        Ok(())
-    }
-
-    // ✅ FIXED: Actually use streaming components for incoming connections
-    async fn handle_streaming_connection(
-        stream: tokio::net::TcpStream,
-        file_transfer: Arc<RwLock<FileTransferManager>>,
-    ) -> Result<()> {
-        info!("🚀 Handling incoming streaming connection with proper components");
-
-        // ✅ FIXED: Use StreamingTransferManager for incoming streams
-        let mut ft = file_transfer.write().await;
-        ft.handle_incoming_streaming_connection(stream).await?;
-
-        Ok(())
-    }
-
-    // ✅ FIXED: Smart message routing with proper component usage
-    pub async fn handle_message(
-        &mut self,
-        peer_id: Uuid,
-        message: Message,
-        clipboard: &crate::clipboard::ClipboardManager,
-    ) -> Result<()> {
-        // Update peer activity
-        if let Some(peer) = self.peers.get_mut(&peer_id) {
-            peer.last_seen = Instant::now();
-        }
-
-        info!(
-            "📥 Processing message from {}: {:?}",
-            peer_id, message.message_type
-        );
-
-        match message.message_type {
-            // ✅ FIXED: Route streaming messages to streaming manager
-            MessageType::StreamingFileOffer {
-                transfer_id,
-                metadata,
-            } => {
-                info!("🚀 ROUTING: StreamingFileOffer -> StreamingTransferManager");
-
-                let save_path =
-                    self.get_save_path(&metadata.name, metadata.target_dir.as_deref())?;
-
-                // Accept streaming offer
-                self.send_control_message(
-                    peer_id,
-                    Message::new(MessageType::StreamingFileOfferResponse {
-                        transfer_id,
-                        accepted: true,
-                        reason: None,
-                        suggested_config: None,
-                    }),
-                )
-                .await?;
-
-                // Route to streaming manager via file transfer manager
-                let mut ft = self.file_transfer.write().await;
-                ft.handle_streaming_offer(peer_id, transfer_id, metadata, save_path)
-                    .await?;
-            }
-
-            MessageType::StreamingFileOfferResponse {
-                transfer_id,
-                accepted,
-                reason,
-                ..
-            } => {
-                info!("🚀 ROUTING: StreamingFileOfferResponse -> StreamingTransferManager");
-
-                if accepted {
-                    // Create streaming connection and start transfer
-                    let stream = self.create_streaming_connection(peer_id).await?;
-                    let mut ft = self.file_transfer.write().await;
-                    ft.start_streaming_transfer(peer_id, transfer_id, stream)
-                        .await?;
-                } else {
-                    warn!("Streaming offer {} rejected: {:?}", transfer_id, reason);
-                }
-            }
-
-            // ✅ FIXED: Route chunked messages to regular file transfer
-            MessageType::FileOffer {
-                transfer_id,
-                metadata,
-            } => {
-                info!("📦 ROUTING: FileOffer -> Regular FileTransferManager");
-
-                let mut ft = self.file_transfer.write().await;
-                ft.handle_file_offer(peer_id, transfer_id, metadata).await?;
-            }
-
-            MessageType::FileOfferResponse {
-                transfer_id,
-                accepted,
-                reason,
-            } => {
-                info!("📦 ROUTING: FileOfferResponse -> Regular FileTransferManager");
-
-                let mut ft = self.file_transfer.write().await;
-                ft.handle_file_offer_response(peer_id, transfer_id, accepted, reason)
-                    .await?;
-            }
-
-            MessageType::FileChunk { transfer_id, chunk } => {
-                let mut ft = self.file_transfer.write().await;
-                ft.handle_file_chunk(peer_id, transfer_id, chunk).await?;
-            }
-
-            // Control messages
-            MessageType::Ping => {
-                self.send_control_message(peer_id, Message::pong()).await?;
-            }
-
-            MessageType::Pong => {
-                if let Some(peer) = self.peers.get_mut(&peer_id) {
-                    peer.last_ping = Some(Instant::now());
-                    peer.ping_failures = 0;
-                }
-            }
-
-            // Clipboard operations
-            MessageType::ClipboardUpdate {
-                file_path,
-                source_device,
-                timestamp,
-                file_size,
-            } => {
-                let clipboard_item = crate::clipboard::NetworkClipboardItem {
-                    file_path: std::path::PathBuf::from(file_path),
-                    source_device,
-                    timestamp,
-                    file_size,
-                };
-                clipboard.update_from_network(clipboard_item).await;
-            }
-
-            MessageType::FileRequest {
-                request_id,
-                file_path,
-                target_path,
-            } => {
-                self.handle_file_request(
-                    peer_id,
-                    request_id,
-                    std::path::PathBuf::from(file_path),
-                    std::path::PathBuf::from(target_path),
-                )
-                .await?;
-            }
-
-            _ => {
-                debug!("Unhandled message type: {:?}", message.message_type);
-            }
-        }
-
-        Ok(())
-    }
-
-    // ✅ FIXED: Send control messages through control connection
-    async fn send_control_message(&mut self, peer_id: Uuid, message: Message) -> Result<()> {
-        if let Some(conn) = self.control_connections.get(&peer_id) {
-            conn.send(message).map_err(|e| {
-                FileshareError::Transfer(format!("Failed to send control message: {}", e))
-            })?;
-            Ok(())
-        } else {
-            Err(FileshareError::Transfer(format!(
-                "No control connection to peer {}",
-                peer_id
-            )))
-        }
-    }
-
-    pub async fn send_direct_to_connection(&self, peer_id: Uuid, message: Message) -> Result<()> {
-        if let Some(conn) = self.control_connections.get(&peer_id) {
-            conn.send(message).map_err(|e| {
-                FileshareError::Transfer(format!("Failed to send direct message: {}", e))
-            })?;
-            Ok(())
-        } else {
-            Err(FileshareError::Transfer(format!(
-                "No connection to peer {}",
-                peer_id
-            )))
-        }
-    }
-
-    async fn handle_file_request(
-        &mut self,
-        peer_id: Uuid,
-        request_id: Uuid,
-        file_path: std::path::PathBuf,
-        target_path: std::path::PathBuf,
-    ) -> Result<()> {
-        if !file_path.exists() {
-            let response = Message::new(MessageType::FileRequestResponse {
-                request_id,
-                accepted: false,
-                reason: Some("File not found".to_string()),
-            });
-            return self.send_control_message(peer_id, response).await;
-        }
-
-        // Accept the request
-        let response = Message::new(MessageType::FileRequestResponse {
-            request_id,
-            accepted: true,
-            reason: None,
-        });
-        self.send_control_message(peer_id, response).await?;
-
-        // ✅ FIXED: Use intelligent method selection
+        // Start file transfer with validation
         let mut ft = self.file_transfer.write().await;
-        ft.send_file_with_validation(peer_id, file_path).await?;
-
-        Ok(())
-    }
-
-    fn get_save_path(
-        &self,
-        filename: &str,
-        target_dir: Option<&str>,
-    ) -> Result<std::path::PathBuf> {
-        let save_dir = if let Some(target_dir_str) = target_dir {
-            let target_path = std::path::PathBuf::from(target_dir_str);
-            if target_path.exists() && target_path.is_dir() {
-                target_path
-            } else {
-                self.get_default_save_dir()
-            }
-        } else {
-            self.get_default_save_dir()
-        };
-
-        std::fs::create_dir_all(&save_dir)?;
-        Ok(save_dir.join(filename))
-    }
-
-    fn get_default_save_dir(&self) -> std::path::PathBuf {
-        dirs::download_dir()
-            .or_else(|| dirs::document_dir())
-            .unwrap_or_else(|| std::path::PathBuf::from("."))
-    }
-
-    // Utility methods
-    pub async fn send_message_to_peer(&mut self, peer_id: Uuid, message: Message) -> Result<()> {
-        self.send_control_message(peer_id, message).await
+        ft.send_file_with_validation(peer_id, file_path).await
     }
 
     pub fn get_connected_peers(&self) -> Vec<Peer> {
@@ -812,23 +550,183 @@ impl PeerManager {
             .collect()
     }
 
+    // Check health of all peers
+    pub async fn check_peer_health_all(&mut self) -> Result<()> {
+        let authenticated_peers: Vec<Uuid> = self
+            .peers
+            .iter()
+            .filter(|(_, peer)| matches!(peer.connection_status, ConnectionStatus::Authenticated))
+            .map(|(id, _)| *id)
+            .collect();
+
+        for peer_id in authenticated_peers {
+            if let Err(e) = self.check_peer_health(peer_id).await {
+                warn!("Health check failed for peer {}: {}", peer_id, e);
+            }
+        }
+
+        Ok(())
+    }
+
+    // Check individual peer health
+    async fn check_peer_health(&mut self, peer_id: Uuid) -> Result<()> {
+        info!("🩺 Checking health of peer {}", peer_id);
+
+        // Send ping and wait for response
+        match self.ping_peer_with_timeout(peer_id).await {
+            Ok(response_time) => {
+                info!(
+                    "✅ Peer {} responded to ping in {:?}",
+                    peer_id, response_time
+                );
+
+                // Reset ping failures on successful ping
+                if let Some(peer) = self.peers.get_mut(&peer_id) {
+                    peer.ping_failures = 0;
+                    peer.last_ping = Some(Instant::now());
+                    peer.last_seen = Instant::now();
+                }
+            }
+            Err(_) => {
+                warn!("❌ Peer {} failed to respond to ping", peer_id);
+                self.handle_ping_failure(peer_id).await?;
+            }
+        }
+
+        Ok(())
+    }
+
+    // Ping peer with timeout
+    async fn ping_peer_with_timeout(&mut self, peer_id: Uuid) -> Result<Duration> {
+        let start_time = Instant::now();
+        let ping_message = Message::ping();
+
+        // Send ping
+        self.send_message_to_peer(peer_id, ping_message).await?;
+
+        // Wait for pong response with timeout
+        match timeout(
+            Duration::from_secs(PING_TIMEOUT_SECONDS),
+            self.wait_for_pong(peer_id),
+        )
+        .await
+        {
+            Ok(_) => {
+                let response_time = start_time.elapsed();
+                Ok(response_time)
+            }
+            Err(_) => Err(FileshareError::Network(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "Ping timeout",
+            ))),
+        }
+    }
+
+    // Wait for pong response
+    async fn wait_for_pong(&mut self, _peer_id: Uuid) -> Result<()> {
+        // This would typically wait for a pong message
+        // For now, we'll implement a simple delay simulation
+        // In a real implementation, you'd wait for the actual pong message
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        Ok(())
+    }
+
+    // Handle ping failure
+    async fn handle_ping_failure(&mut self, peer_id: Uuid) -> Result<()> {
+        if let Some(peer) = self.peers.get_mut(&peer_id) {
+            peer.ping_failures += 1;
+
+            info!(
+                "❌ Ping failure {} for peer {}",
+                peer.ping_failures, peer_id
+            );
+
+            if peer.ping_failures >= MAX_MISSED_PINGS {
+                warn!(
+                    "💔 Peer {} exceeded max ping failures, marking as disconnected",
+                    peer_id
+                );
+                peer.connection_status = ConnectionStatus::Disconnected;
+
+                // Remove from active connections
+                self.connections.remove(&peer_id);
+
+                // Attempt reconnection if this was an authenticated peer
+                self.attempt_reconnection(peer_id).await?;
+            }
+        }
+
+        Ok(())
+    }
+
+    // Fixed version - separate the data extraction from the method calls
+    async fn attempt_reconnection(&mut self, peer_id: Uuid) -> Result<()> {
+        // First, extract the necessary data and update the peer state
+        let should_reconnect = if let Some(peer) = self.peers.get_mut(&peer_id) {
+            if peer.reconnection_attempts >= MAX_RECONNECTION_ATTEMPTS {
+                error!("💥 Max reconnection attempts reached for peer {}", peer_id);
+                peer.connection_status =
+                    ConnectionStatus::Error("Max reconnection attempts exceeded".to_string());
+                return Ok(());
+            }
+
+            peer.reconnection_attempts += 1;
+            peer.connection_status = ConnectionStatus::Reconnecting;
+
+            info!(
+                "🔄 Attempting reconnection {} to peer {}",
+                peer.reconnection_attempts, peer_id
+            );
+
+            true // Indicate we should proceed with reconnection
+        } else {
+            false // Peer not found
+        };
+
+        if should_reconnect {
+            // Wait before reconnecting
+            tokio::time::sleep(Duration::from_secs(RECONNECTION_DELAY_SECONDS)).await;
+
+            // Now we can safely call connect_to_peer since we're not holding any borrows
+            match self.connect_to_peer(peer_id).await {
+                Ok(_) => {
+                    info!("✅ Successfully reconnected to peer {}", peer_id);
+                    // Reset reconnection attempts on successful connection
+                    if let Some(peer) = self.peers.get_mut(&peer_id) {
+                        peer.reconnection_attempts = 0;
+                    }
+                }
+                Err(e) => {
+                    // Get the current attempt count for logging
+                    let attempt_count = self
+                        .peers
+                        .get(&peer_id)
+                        .map(|p| p.reconnection_attempts)
+                        .unwrap_or(0);
+
+                    warn!(
+                        "❌ Reconnection attempt {} failed for peer {}: {}",
+                        attempt_count, peer_id, e
+                    );
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    // Check if peer is healthy
     pub fn is_peer_healthy(&self, peer_id: Uuid) -> bool {
-        self.peers
-            .get(&peer_id)
-            .map(|peer| {
-                matches!(peer.connection_status, ConnectionStatus::Authenticated)
-                    && peer.ping_failures < 3
-            })
-            .unwrap_or(false)
+        if let Some(peer) = self.peers.get(&peer_id) {
+            matches!(peer.connection_status, ConnectionStatus::Authenticated)
+                && peer.ping_failures < MAX_MISSED_PINGS
+                && peer.last_seen.elapsed().as_secs() < PING_INTERVAL_SECONDS * 2
+        } else {
+            false
+        }
     }
 
-    pub async fn get_all_discovered_devices(&self) -> Vec<DeviceInfo> {
-        self.peers
-            .values()
-            .map(|peer| peer.device_info.clone())
-            .collect()
-    }
-
+    // Get connection statistics
     pub fn get_connection_stats(&self) -> ConnectionStats {
         let mut stats = ConnectionStats::default();
 
@@ -851,27 +749,486 @@ impl PeerManager {
         stats
     }
 
-    pub async fn check_peer_health_all(&mut self) -> Result<()> {
-        // Implementation for health checks
+    // Enhanced message handling with connection health updates
+    pub async fn handle_message(
+        &mut self,
+        peer_id: Uuid,
+        message: Message,
+        clipboard: &crate::clipboard::ClipboardManager,
+    ) -> Result<()> {
+        // Update last seen timestamp for any message
+        if let Some(peer) = self.peers.get_mut(&peer_id) {
+            peer.last_seen = Instant::now();
+        }
+
+        info!(
+            "📥 Processing message from {}: {:?}",
+            peer_id, message.message_type
+        );
+
+        match message.message_type {
+            MessageType::Ping => {
+                debug!("Received ping from {}", peer_id);
+                if let Some(conn) = self.connections.get(&peer_id) {
+                    let _ = conn.send(Message::pong());
+                }
+            }
+            MessageType::Pong => {
+                debug!("Received pong from {}", peer_id);
+                if let Some(peer) = self.peers.get_mut(&peer_id) {
+                    peer.last_ping = Some(Instant::now());
+                    peer.ping_failures = 0; // Reset ping failures on pong
+                    peer.last_seen = Instant::now();
+                }
+            }
+
+            MessageType::ClipboardUpdate {
+                file_path,
+                source_device,
+                timestamp,
+                file_size,
+            } => {
+                info!("Received clipboard update from {}: {}", peer_id, file_path);
+
+                let clipboard_item = crate::clipboard::NetworkClipboardItem {
+                    file_path: PathBuf::from(file_path),
+                    source_device,
+                    timestamp,
+                    file_size,
+                };
+
+                clipboard.update_from_network(clipboard_item).await;
+            }
+
+            MessageType::ClipboardClear => {
+                info!("Received clipboard clear from {}", peer_id);
+                clipboard.clear().await;
+            }
+
+            MessageType::StreamingFileOffer {
+                transfer_id,
+                metadata,
+            } => {
+                info!(
+                    "✅ Processing StreamingFileOffer from {}: {} ({:.1}MB)",
+                    peer_id,
+                    metadata.name,
+                    metadata.size as f64 / (1024.0 * 1024.0)
+                );
+
+                let mut ft = self.file_transfer.write().await;
+                ft.handle_streaming_file_offer(peer_id, transfer_id, metadata)
+                    .await?;
+            }
+
+            MessageType::StreamingFileOfferResponse {
+                transfer_id,
+                accepted,
+                reason,
+                suggested_config,
+            } => {
+                info!(
+                    "Received streaming offer response from {}: {}",
+                    peer_id, accepted
+                );
+
+                if accepted {
+                    info!(
+                        "✅ Streaming offer {} accepted, setting up connection",
+                        transfer_id
+                    );
+
+                    // Check if peer is still connected
+                    if !self.is_peer_connected(peer_id) {
+                        warn!(
+                            "❌ Peer {} is not connected, cannot start streaming transfer",
+                            peer_id
+                        );
+                        return Ok(());
+                    }
+
+                    let mut ft = self.file_transfer.write().await;
+                    ft.initiate_streaming_connection(peer_id, transfer_id, suggested_config)
+                        .await?;
+                } else {
+                    warn!(
+                        "🚫 Streaming offer {} rejected by peer {}: {:?}",
+                        transfer_id, peer_id, reason
+                    );
+                }
+            }
+
+            MessageType::StreamingConnectionRequest { transfer_id, port } => {
+                info!(
+                    "Received streaming connection request for transfer {}",
+                    transfer_id
+                );
+                self.handle_streaming_connection_request(peer_id, transfer_id, port)
+                    .await?;
+            }
+
+            MessageType::StreamingConnectionResponse {
+                transfer_id,
+                accepted,
+                port,
+                reason,
+            } => {
+                if accepted {
+                    if let Some(port) = port {
+                        info!(
+                            "Streaming connection approved for transfer {} on port {}",
+                            transfer_id, port
+                        );
+                        self.initiate_streaming_connection(peer_id, transfer_id, port)
+                            .await?;
+                    }
+                } else {
+                    warn!(
+                        "Streaming connection rejected for transfer {}: {:?}",
+                        transfer_id, reason
+                    );
+                }
+            }
+
+            MessageType::StreamingTransferComplete {
+                transfer_id,
+                bytes_transferred,
+                chunks_received,
+                file_hash,
+            } => {
+                info!(
+                    "✅ Streaming transfer {} completed: {} bytes, {} chunks",
+                    transfer_id, bytes_transferred, chunks_received
+                );
+                // Handle completion notification
+            }
+
+            MessageType::StreamingTransferError {
+                transfer_id,
+                error,
+                chunk_index,
+            } => {
+                error!(
+                    "❌ Streaming transfer {} failed: {} (chunk: {:?})",
+                    transfer_id, error, chunk_index
+                );
+                // Handle error notification
+            }
+
+            MessageType::FileRequest {
+                request_id,
+                file_path,
+                target_path,
+            } => {
+                info!(
+                    "Received file request from {}: {} -> {}",
+                    peer_id, file_path, target_path
+                );
+                self.handle_file_request(
+                    peer_id,
+                    request_id,
+                    PathBuf::from(file_path),
+                    PathBuf::from(target_path),
+                )
+                .await?;
+            }
+
+            MessageType::FileRequestResponse {
+                request_id,
+                accepted,
+                reason,
+            } => {
+                if accepted {
+                    info!("File request {} accepted by {}", request_id, peer_id);
+                } else {
+                    warn!(
+                        "File request {} rejected by {}: {:?}",
+                        request_id, peer_id, reason
+                    );
+                }
+            }
+
+            MessageType::FileOffer {
+                transfer_id,
+                metadata,
+            } => {
+                info!(
+                    "✅ Processing incoming FileOffer from {}: {}",
+                    peer_id, metadata.name
+                );
+
+                // Handle the file offer
+                let mut ft = self.file_transfer.write().await;
+                ft.handle_file_offer(peer_id, transfer_id, metadata).await?;
+
+                // Create and send the response
+                let response = ft.create_file_offer_response(transfer_id, true, None);
+                drop(ft); // Release the lock
+
+                // Send the response
+                if let Some(conn) = self.connections.get(&peer_id) {
+                    if let Err(e) = conn.send(response) {
+                        error!(
+                            "Failed to send FileOfferResponse to peer {}: {}",
+                            peer_id, e
+                        );
+                    } else {
+                        info!("✅ Sent FileOfferResponse to peer {}", peer_id);
+                    }
+                } else {
+                    error!(
+                        "No connection found for peer {} to send FileOfferResponse",
+                        peer_id
+                    );
+                }
+            }
+
+            MessageType::FileOfferResponse {
+                transfer_id,
+                accepted,
+                reason,
+            } => {
+                info!(
+                    "Received file offer response from {}: {}",
+                    peer_id, accepted
+                );
+                let mut ft = self.file_transfer.write().await;
+                ft.handle_file_offer_response(peer_id, transfer_id, accepted, reason)
+                    .await?;
+            }
+
+            MessageType::FileChunk { transfer_id, chunk } => {
+                let mut ft = self.file_transfer.write().await;
+                ft.handle_file_chunk(peer_id, transfer_id, chunk).await?;
+            }
+
+            MessageType::TransferComplete {
+                transfer_id,
+                checksum,
+            } => {
+                info!(
+                    "✅ Received TransferComplete for transfer {} from peer {}",
+                    transfer_id, peer_id
+                );
+
+                // Check if we already processed this completion
+                let ft = self.file_transfer.read().await;
+                if let Some(transfer) = ft.active_transfers.get(&transfer_id) {
+                    if matches!(transfer.status, TransferStatus::Completed) {
+                        info!(
+                            "✅ Transfer {} already marked as complete, ignoring duplicate",
+                            transfer_id
+                        );
+                        return Ok(());
+                    }
+                }
+                drop(ft);
+
+                let mut ft = self.file_transfer.write().await;
+                ft.handle_transfer_complete(peer_id, transfer_id, checksum)
+                    .await?;
+            }
+
+            MessageType::TransferError { transfer_id, error } => {
+                error!("Transfer error from {}: {}", peer_id, error);
+                let mut ft = self.file_transfer.write().await;
+                ft.handle_transfer_error(peer_id, transfer_id, error)
+                    .await?;
+            }
+
+            MessageType::FileChunkAck {
+                transfer_id,
+                chunk_index,
+            } => {
+                debug!(
+                    "Received chunk ack for transfer {} chunk {}",
+                    transfer_id, chunk_index
+                );
+            }
+
+            _ => {
+                debug!(
+                    "Unhandled message type from {}: {:?}",
+                    peer_id, message.message_type
+                );
+            }
+        }
         Ok(())
+    }
+
+    async fn handle_streaming_connection_request(
+        &mut self,
+        peer_id: Uuid,
+        transfer_id: Uuid,
+        requested_port: u16,
+    ) -> Result<()> {
+        info!(
+            "Setting up streaming connection for transfer {} from peer {}",
+            transfer_id, peer_id
+        );
+
+        // We can either use the requested port or assign our own
+        let port = if requested_port == 0 {
+            0 // Let system assign
+        } else {
+            requested_port
+        };
+
+        // For now, accept all streaming connections
+        // In production, you might want additional validation
+
+        if let Some(conn) = self.connections.get(&peer_id) {
+            let response = Message::new(MessageType::StreamingConnectionResponse {
+                transfer_id,
+                accepted: true,
+                port: Some(self.settings.network.port), // Use our main port for now
+                reason: None,
+            });
+
+            let _ = conn.send(response);
+            info!(
+                "✅ Approved streaming connection for transfer {}",
+                transfer_id
+            );
+        }
+
+        Ok(())
+    }
+
+    // NEW: Initiate streaming connection
+    async fn initiate_streaming_connection(
+        &mut self,
+        peer_id: Uuid,
+        transfer_id: Uuid,
+        port: u16,
+    ) -> Result<()> {
+        info!(
+            "Initiating streaming connection to peer {} on port {} for transfer {}",
+            peer_id, port, transfer_id
+        );
+
+        // Get peer address
+        if let Some(peer) = self.peers.get(&peer_id) {
+            let mut streaming_addr = peer.device_info.addr;
+            streaming_addr.set_port(port);
+
+            // Get connection from pool
+            let ft = self.file_transfer.read().await;
+            if let Some(connection_pool) = ft.get_connection_pool() {
+                match connection_pool
+                    .get_connection(peer_id, streaming_addr)
+                    .await
+                {
+                    Ok(stream) => {
+                        info!("✅ Got streaming connection for transfer {}", transfer_id);
+                        // The actual streaming will be handled by the StreamingTransferManager
+                    }
+                    Err(e) => {
+                        error!("❌ Failed to get streaming connection: {}", e);
+                        return Err(e);
+                    }
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn handle_file_request(
+        &mut self,
+        peer_id: Uuid,
+        request_id: Uuid,
+        file_path: PathBuf,
+        target_path: PathBuf,
+    ) -> Result<()> {
+        info!(
+            "Processing file request {} for {:?} (target: {:?})",
+            request_id, file_path, target_path
+        );
+
+        // Check if the requested file exists
+        if !file_path.exists() {
+            warn!("Requested file does not exist: {:?}", file_path);
+            let response = Message::new(MessageType::FileRequestResponse {
+                request_id,
+                accepted: false,
+                reason: Some("File not found".to_string()),
+            });
+
+            if let Some(conn) = self.connections.get(&peer_id) {
+                let _ = conn.send(response);
+            }
+            return Ok(());
+        }
+
+        // Accept the request
+        let response = Message::new(MessageType::FileRequestResponse {
+            request_id,
+            accepted: true,
+            reason: None,
+        });
+
+        if let Some(conn) = self.connections.get(&peer_id) {
+            let _ = conn.send(response);
+        }
+
+        info!(
+            "File request accepted, starting file transfer to peer {} for file: {:?}",
+            peer_id, file_path
+        );
+
+        // Extract target directory
+        let target_dir = Self::extract_target_directory(&target_path);
+
+        info!("Target directory extracted: {:?}", target_dir);
+
+        // Start file transfer with target directory
+        let mut ft = self.file_transfer.write().await;
+        ft.send_file_with_target_dir(peer_id, file_path, target_dir)
+            .await?;
+
+        Ok(())
+    }
+
+    fn extract_target_directory(target_path: &PathBuf) -> Option<String> {
+        let target_str = target_path.to_string_lossy();
+        info!("Extracting directory from target path: '{}'", target_str);
+
+        // Handle both Windows and Unix paths manually for cross-platform compatibility
+        let path_separators = ['/', '\\'];
+
+        // Find the last path separator
+        if let Some(last_sep_pos) = target_str.rfind(&path_separators[..]) {
+            let dir_path = &target_str[..last_sep_pos];
+            info!("Extracted directory: '{}'", dir_path);
+
+            if dir_path.is_empty() {
+                None
+            } else {
+                Some(dir_path.to_string())
+            }
+        } else {
+            info!("No path separator found, no directory to extract");
+            None
+        }
     }
 }
 
-// Helper structs
+// Split PeerConnection into read and write halves
 pub struct PeerConnection {
-    stream: tokio::net::TcpStream,
+    stream: TcpStream,
 }
 
 pub struct PeerConnectionReadHalf {
-    stream: tokio::io::ReadHalf<tokio::net::TcpStream>,
+    stream: tokio::io::ReadHalf<TcpStream>,
 }
 
 pub struct PeerConnectionWriteHalf {
-    stream: tokio::io::WriteHalf<tokio::net::TcpStream>,
+    stream: tokio::io::WriteHalf<TcpStream>,
 }
 
 impl PeerConnection {
-    fn new(stream: tokio::net::TcpStream) -> Self {
+    fn new(stream: TcpStream) -> Self {
         Self { stream }
     }
 
@@ -884,9 +1241,11 @@ impl PeerConnection {
     }
 
     async fn write_message(&mut self, message: &Message) -> Result<()> {
+        // Serialize the message
         let message_data = bincode::serialize(message)?;
         let message_len = message_data.len() as u32;
 
+        // Write length first, then data
         self.stream.write_all(&message_len.to_be_bytes()).await?;
         self.stream.write_all(&message_data).await?;
         self.stream.flush().await?;
@@ -895,45 +1254,57 @@ impl PeerConnection {
     }
 
     async fn read_message(&mut self) -> Result<Message> {
+        // Read message length first (4 bytes)
         let mut len_bytes = [0u8; 4];
         self.stream.read_exact(&mut len_bytes).await?;
         let message_len = u32::from_be_bytes(len_bytes) as usize;
 
+        // Validate message length to prevent memory attacks
         if message_len > 100_000_000 {
             return Err(FileshareError::Transfer("Message too large".to_string()));
         }
 
+        // Read the message data
         let mut message_data = vec![0u8; message_len];
         self.stream.read_exact(&mut message_data).await?;
 
+        // Deserialize the message
         let message: Message = bincode::deserialize(&message_data)?;
+
         Ok(message)
     }
 }
 
 impl PeerConnectionReadHalf {
     async fn read_message(&mut self) -> Result<Message> {
+        // Read message length first (4 bytes)
         let mut len_bytes = [0u8; 4];
         self.stream.read_exact(&mut len_bytes).await?;
         let message_len = u32::from_be_bytes(len_bytes) as usize;
 
+        // Validate message length to prevent memory attacks
         if message_len > 100_000_000 {
             return Err(FileshareError::Transfer("Message too large".to_string()));
         }
 
+        // Read the message data
         let mut message_data = vec![0u8; message_len];
         self.stream.read_exact(&mut message_data).await?;
 
+        // Deserialize the message
         let message: Message = bincode::deserialize(&message_data)?;
+
         Ok(message)
     }
 }
 
 impl PeerConnectionWriteHalf {
     async fn write_message(&mut self, message: &Message) -> Result<()> {
+        // Serialize the message
         let message_data = bincode::serialize(message)?;
         let message_len = message_data.len() as u32;
 
+        // Write length first, then data
         self.stream.write_all(&message_len.to_be_bytes()).await?;
         self.stream.write_all(&message_data).await?;
         self.stream.flush().await?;

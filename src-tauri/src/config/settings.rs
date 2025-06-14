@@ -35,6 +35,11 @@ pub struct TransferSettings {
     pub max_concurrent_transfers: usize,
     pub bandwidth_limit_mbps: Option<u32>,
     pub temp_dir: Option<PathBuf>,
+    pub streaming_threshold_mb: u32,
+    pub streaming_chunk_size: usize,
+    pub streaming_memory_limit_mb: u32,
+    pub enable_streaming_compression: bool,
+    pub streaming_max_connections: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -63,6 +68,11 @@ impl Default for Settings {
                 max_concurrent_transfers: 5,
                 bandwidth_limit_mbps: None,
                 temp_dir: None,
+                streaming_threshold_mb: 50,
+                streaming_chunk_size: 512 * 1024, // 512KB for streaming
+                streaming_memory_limit_mb: 200,
+                enable_streaming_compression: true,
+                streaming_max_connections: 4,
             },
             security: SecuritySettings {
                 require_pairing: false,
