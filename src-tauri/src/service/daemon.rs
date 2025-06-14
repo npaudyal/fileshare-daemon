@@ -40,12 +40,66 @@ impl FileshareDaemon {
         // Initialize hotkey manager
         let hotkey_manager = HotkeyManager::new()?;
 
-        // Initialize clipboard manager with device ID
-        let clipboard = ClipboardManager::new(settings.device.id);
+        // ✅ FIXED: Initialize clipboard manager with broadcast capability
+        let mut clipboard = ClipboardManager::new(settings.device.id);
+
+        // Create clipboard broadcast channel
+        let (clipboard_tx, mut clipboard_rx) = tokio::sync::mpsc::unbounded_channel();
+        clipboard.set_broadcast_sender(clipboard_tx);
+
+        // Start clipboard broadcast handler
+        let clipboard_peer_manager = peer_manager.clone();
+        tokio::spawn(async move {
+            while let Some(clipboard_item) = clipboard_rx.recv().await {
+                info!(
+                    "📡 DAEMON: Received clipboard broadcast request for file: {:?}",
+                    clipboard_item.file_path
+                );
+
+                // Get healthy peers and broadcast
+                let healthy_peers = {
+                    let pm = clipboard_peer_manager.read().await;
+                    pm.get_connected_peers()
+                        .iter()
+                        .filter(|peer| pm.is_peer_healthy(peer.device_info.id))
+                        .map(|peer| peer.device_info.id)
+                        .collect::<Vec<_>>()
+                };
+
+                info!(
+                    "📡 DAEMON: Broadcasting to {} healthy peers",
+                    healthy_peers.len()
+                );
+
+                for peer_id in healthy_peers {
+                    let message = crate::network::protocol::Message::new(
+                        crate::network::protocol::MessageType::ClipboardUpdate {
+                            file_path: clipboard_item.file_path.to_string_lossy().to_string(),
+                            source_device: clipboard_item.source_device,
+                            timestamp: clipboard_item.timestamp,
+                            file_size: clipboard_item.file_size,
+                        },
+                    );
+
+                    let mut pm = clipboard_peer_manager.write().await;
+                    if let Err(e) = pm.send_message_to_peer(peer_id, message).await {
+                        error!(
+                            "❌ DAEMON: Failed to send clipboard update to peer {}: {}",
+                            peer_id, e
+                        );
+                    } else {
+                        info!("✅ DAEMON: Sent clipboard update to peer {}", peer_id);
+                    }
+                }
+            }
+        });
 
         info!("🚀 FileshareDaemon initialized with intelligent transfer selection");
         info!("📊 Transfer Logic: <50MB = Chunked Protocol, ≥50MB = Streaming Protocol");
-        info!("📋 Clipboard Manager initialized for device: {}", settings.device.id);
+        info!(
+            "📋 Clipboard Manager initialized with broadcast capability for device: {}",
+            settings.device.id
+        );
 
         Ok(Self {
             settings,
@@ -78,7 +132,10 @@ impl FileshareDaemon {
             let mut pm = self.peer_manager.write().await;
             match pm.start_streaming_listener().await {
                 Ok(()) => {
-                    info!("✅ Streaming listener started on port {}", self.settings.network.port + 1);
+                    info!(
+                        "✅ Streaming listener started on port {}",
+                        self.settings.network.port + 1
+                    );
                 }
                 Err(e) => {
                     error!("❌ Failed to start streaming listener: {}", e);
@@ -297,26 +354,26 @@ impl FileshareDaemon {
             }
         }
 
-        info!("🎹 Hotkey event handler stopped after processing {} events", event_count);
+        info!(
+            "🎹 Hotkey event handler stopped after processing {} events",
+            event_count
+        );
     }
 
     // ✅ ENHANCED: Intelligent copy operation with comprehensive error handling and state tracking
     async fn handle_intelligent_copy_operation(
         clipboard: ClipboardManager,
-        peer_manager: Arc<RwLock<PeerManager>>,
+        _peer_manager: Arc<RwLock<PeerManager>>, // No longer needed for broadcasting
     ) -> Result<()> {
         info!("📋 COPY_OP: Starting intelligent copy operation");
-        
-        // Debug clipboard state before operation
-        clipboard.debug_clipboard_state().await;
 
-        // Copy currently selected file to network clipboard with validation
+        // The clipboard manager now handles everything including broadcasting!
         match clipboard.copy_selected_file().await {
             Ok(()) => {
-                info!("✅ COPY_OP: File successfully copied to network clipboard");
+                info!("✅ COPY_OP: Copy operation with broadcasting completed successfully");
             }
             Err(e) => {
-                error!("❌ COPY_OP: Failed to copy file: {}", e);
+                error!("❌ COPY_OP: Copy operation failed: {}", e);
                 Self::show_error_notification(
                     "Copy Failed",
                     &format!("Failed to copy file: {}", e),
@@ -324,101 +381,6 @@ impl FileshareDaemon {
                 .await?;
                 return Err(e);
             }
-        }
-
-        // Get the clipboard item and broadcast to healthy peers
-        let clipboard_item = {
-            let clipboard_state = clipboard.network_clipboard.read().await;
-            clipboard_state.clone()
-        };
-
-        if let Some(item) = clipboard_item {
-            info!("📋 COPY_OP: Broadcasting clipboard item from device {} ({}MB)", 
-                  item.source_device, item.file_size as f64 / (1024.0 * 1024.0));
-
-            // Get healthy peers for broadcasting
-            let healthy_peer_ids = {
-                let pm = peer_manager.read().await;
-                let connected_peers = pm.get_connected_peers();
-                let healthy_peers: Vec<_> = connected_peers
-                    .iter()
-                    .filter(|peer| pm.is_peer_healthy(peer.device_info.id))
-                    .map(|peer| peer.device_info.id)
-                    .collect();
-                
-                info!("📡 COPY_OP: Found {} healthy peers for broadcast", healthy_peers.len());
-                healthy_peers
-            };
-
-            if healthy_peer_ids.is_empty() {
-                warn!("📡 COPY_OP: No healthy peers found for broadcasting");
-                Self::show_warning_notification(
-                    "No Network Devices",
-                    "File copied locally, but no network devices available for sharing",
-                ).await?;
-                return Ok(());
-            }
-
-            // Broadcast to each healthy peer with individual error handling
-            let mut successful_broadcasts = 0;
-            let mut failed_broadcasts = 0;
-
-            for peer_id in &healthy_peer_ids {
-                let message = crate::network::protocol::Message::new(
-                    crate::network::protocol::MessageType::ClipboardUpdate {
-                        file_path: item.file_path.to_string_lossy().to_string(),
-                        source_device: item.source_device,
-                        timestamp: item.timestamp,
-                        file_size: item.file_size,
-                    },
-                );
-
-                info!("📡 COPY_OP: Sending clipboard update to peer {}", peer_id);
-
-                // Send message with individual error handling
-                match {
-                    let mut pm = peer_manager.write().await;
-                    pm.send_message_to_peer(*peer_id, message).await
-                } {
-                    Ok(()) => {
-                        successful_broadcasts += 1;
-                        info!("✅ COPY_OP: Successfully sent clipboard update to peer {}", peer_id);
-                    }
-                    Err(e) => {
-                        failed_broadcasts += 1;
-                        error!("❌ COPY_OP: Failed to send clipboard update to peer {}: {}", peer_id, e);
-                    }
-                }
-            }
-
-            // Show final result notification
-            let (transfer_method, icon, estimated_speed) = Self::determine_transfer_method_info(item.file_size);
-            let filename = item.file_path.file_name().unwrap_or_default().to_string_lossy();
-            let file_size_mb = item.file_size as f64 / (1024.0 * 1024.0);
-
-            let notification_body = if failed_broadcasts == 0 {
-                format!(
-                    "{} {}\n📊 {:.1} MB\n🧠 Method: {}\n⚡ Speed: {}\n📡 {} devices notified",
-                    icon, filename, file_size_mb, transfer_method, estimated_speed, successful_broadcasts
-                )
-            } else {
-                format!(
-                    "{} {}\n📊 {:.1} MB\n🧠 Method: {}\n⚡ Speed: {}\n📡 {}/{} devices notified (⚠️ {} failed)",
-                    icon, filename, file_size_mb, transfer_method, estimated_speed, 
-                    successful_broadcasts, successful_broadcasts + failed_broadcasts, failed_broadcasts
-                )
-            };
-
-            Self::show_success_notification("File Ready for Network Transfer", &notification_body)
-                .await?;
-
-            info!("✅ COPY_OP: Copy operation completed - {}/{} broadcasts successful", 
-                  successful_broadcasts, successful_broadcasts + failed_broadcasts);
-        } else {
-            error!("❌ COPY_OP: Clipboard item is None after successful copy - this should not happen");
-            return Err(crate::FileshareError::Unknown(
-                "Clipboard item disappeared after copy".to_string()
-            ));
         }
 
         Ok(())
@@ -430,16 +392,19 @@ impl FileshareDaemon {
         peer_manager: Arc<RwLock<PeerManager>>,
     ) -> Result<()> {
         info!("📁 PASTE_OP: Starting intelligent paste operation");
-        
+
         // Debug clipboard state before operation
         clipboard.debug_clipboard_state().await;
 
         // Try to paste from network clipboard
         let paste_result = clipboard.paste_to_current_location().await;
-        
+
         match paste_result {
             Ok(Some((target_path, source_device))) => {
-                info!("📁 PASTE_OP: Paste target: {:?}, source device: {}", target_path, source_device);
+                info!(
+                    "📁 PASTE_OP: Paste target: {:?}, source device: {}",
+                    target_path, source_device
+                );
 
                 // Validate that source device is healthy and get peer info
                 let (is_healthy, peer_info) = {
@@ -450,13 +415,17 @@ impl FileshareDaemon {
                 };
 
                 if !is_healthy {
-                    warn!("⚠️ PASTE_OP: Source device {} is not healthy, attempting transfer anyway", source_device);
-                    
+                    warn!(
+                        "⚠️ PASTE_OP: Source device {} is not healthy, attempting transfer anyway",
+                        source_device
+                    );
+
                     // Show warning but continue
                     Self::show_warning_notification(
                         "⚠️ Device Offline",
                         "Source device may be offline. Transfer may fail.",
-                    ).await?;
+                    )
+                    .await?;
                 }
 
                 // Get file info for the paste request
@@ -469,17 +438,22 @@ impl FileshareDaemon {
                         None => {
                             error!("❌ PASTE_OP: Clipboard is empty during paste - race condition detected");
                             return Err(crate::FileshareError::Unknown(
-                                "Clipboard became empty during paste operation".to_string()
+                                "Clipboard became empty during paste operation".to_string(),
                             ));
                         }
                     }
                 };
 
-                info!("📁 PASTE_OP: Requesting file: {} ({:.1}MB) from device {}", 
-                      source_file_path, file_size as f64 / (1024.0 * 1024.0), source_device);
+                info!(
+                    "📁 PASTE_OP: Requesting file: {} ({:.1}MB) from device {}",
+                    source_file_path,
+                    file_size as f64 / (1024.0 * 1024.0),
+                    source_device
+                );
 
                 // Determine transfer method and show info
-                let (transfer_method, icon, estimated_speed) = Self::determine_transfer_method_info(file_size);
+                let (transfer_method, icon, estimated_speed) =
+                    Self::determine_transfer_method_info(file_size);
 
                 // Send file request to source device
                 let request_id = uuid::Uuid::new_v4();
@@ -491,7 +465,10 @@ impl FileshareDaemon {
                     },
                 );
 
-                info!("📁 PASTE_OP: Sending FileRequest {} to device {}", request_id, source_device);
+                info!(
+                    "📁 PASTE_OP: Sending FileRequest {} to device {}",
+                    request_id, source_device
+                );
 
                 // Send the message with comprehensive error handling
                 let send_result = {
@@ -502,7 +479,7 @@ impl FileshareDaemon {
                 match send_result {
                     Ok(()) => {
                         let file_size_mb = file_size as f64 / (1024.0 * 1024.0);
-                        
+
                         Self::show_info_notification(
                             "🧠 Transfer Request Sent",
                             &format!(
@@ -516,14 +493,21 @@ impl FileshareDaemon {
                             ),
                         ).await?;
 
-                        info!("✅ PASTE_OP: File request sent successfully to device {}", source_device);
+                        info!(
+                            "✅ PASTE_OP: File request sent successfully to device {}",
+                            source_device
+                        );
                     }
                     Err(e) => {
-                        error!("❌ PASTE_OP: Failed to send file request to device {}: {}", source_device, e);
+                        error!(
+                            "❌ PASTE_OP: Failed to send file request to device {}: {}",
+                            source_device, e
+                        );
                         Self::show_error_notification(
                             "❌ Transfer Request Failed",
                             &format!("Could not contact source device: {}", e),
-                        ).await?;
+                        )
+                        .await?;
                         return Err(e);
                     }
                 }
@@ -537,7 +521,8 @@ impl FileshareDaemon {
                 Self::show_error_notification(
                     "❌ Paste Failed",
                     &format!("Paste operation failed: {}", e),
-                ).await?;
+                )
+                .await?;
                 return Err(e);
             }
         }
@@ -569,7 +554,10 @@ impl FileshareDaemon {
         clipboard: ClipboardManager,
     ) -> Result<()> {
         let listener = tokio::net::TcpListener::bind(settings.get_bind_address()).await?;
-        info!("🌐 Enhanced peer manager listening on {}", settings.get_bind_address());
+        info!(
+            "🌐 Enhanced peer manager listening on {}",
+            settings.get_bind_address()
+        );
 
         // ✅ Enhanced connection monitoring with better logging
         let health_pm = peer_manager.clone();
@@ -585,8 +573,10 @@ impl FileshareDaemon {
 
                 let stats = pm.get_connection_stats();
                 if stats.total > 0 {
-                    info!("📊 Health Check: {} total connections, {} authenticated, {} unhealthy", 
-                          stats.total, stats.authenticated, stats.unhealthy);
+                    info!(
+                        "📊 Health Check: {} total connections, {} authenticated, {} unhealthy",
+                        stats.total, stats.authenticated, stats.unhealthy
+                    );
                 } else {
                     debug!("📊 Health Check: No active connections");
                 }
@@ -645,7 +635,7 @@ impl FileshareDaemon {
             let mut message_count = 0u64;
             let mut clipboard_message_count = 0u64;
             let mut last_stats_log = tokio::time::Instant::now();
-            
+
             loop {
                 interval.tick().await;
 
@@ -665,43 +655,62 @@ impl FileshareDaemon {
                         crate::network::protocol::MessageType::ClipboardUpdate { .. } => {
                             clipboard_message_count += 1;
                             clipboard_updates += 1;
-                            info!("📋 Processing ClipboardUpdate #{} from peer {}", clipboard_message_count, peer_id);
+                            info!(
+                                "📋 Processing ClipboardUpdate #{} from peer {}",
+                                clipboard_message_count, peer_id
+                            );
                         }
                         crate::network::protocol::MessageType::FileRequest { .. } => {
                             info!("📁 Processing FileRequest from peer {}", peer_id);
                         }
                         _ => {
-                            debug!("📥 Processing message #{} from peer {}: {:?}", 
-                                   message_count, peer_id, message.message_type);
+                            debug!(
+                                "📥 Processing message #{} from peer {}: {:?}",
+                                message_count, peer_id, message.message_type
+                            );
                         }
                     }
 
                     // Health check with detailed logging
                     if !pm.is_peer_healthy(peer_id) {
-                        warn!("⚠️ Dropping message from unhealthy peer {}: {:?}", peer_id, message.message_type);
+                        warn!(
+                            "⚠️ Dropping message from unhealthy peer {}: {:?}",
+                            peer_id, message.message_type
+                        );
                         continue;
                     }
 
                     // Process message with detailed error handling
-                    match pm.handle_message(peer_id, message.clone(), &message_clipboard).await {
-                        Ok(()) => {
-                            match &message.message_type {
-                                crate::network::protocol::MessageType::ClipboardUpdate { .. } => {
-                                    info!("✅ Successfully processed ClipboardUpdate #{} from peer {}", clipboard_message_count, peer_id);
-                                }
-                                _ => {
-                                    debug!("✅ Successfully processed message #{} from peer {}", message_count, peer_id);
-                                }
+                    match pm
+                        .handle_message(peer_id, message.clone(), &message_clipboard)
+                        .await
+                    {
+                        Ok(()) => match &message.message_type {
+                            crate::network::protocol::MessageType::ClipboardUpdate { .. } => {
+                                info!(
+                                    "✅ Successfully processed ClipboardUpdate #{} from peer {}",
+                                    clipboard_message_count, peer_id
+                                );
                             }
-                        }
+                            _ => {
+                                debug!(
+                                    "✅ Successfully processed message #{} from peer {}",
+                                    message_count, peer_id
+                                );
+                            }
+                        },
                         Err(e) => {
                             error_count += 1;
-                            error!("❌ Error #{} processing message from peer {}: {} | Message: {:?}", 
-                                   error_count, peer_id, e, message.message_type);
-                            
+                            error!(
+                                "❌ Error #{} processing message from peer {}: {} | Message: {:?}",
+                                error_count, peer_id, e, message.message_type
+                            );
+
                             // Add specific error handling for clipboard messages
                             match message.message_type {
-                                crate::network::protocol::MessageType::ClipboardUpdate { .. } => {
+                                crate::network::protocol::MessageType::ClipboardUpdate {
+                                    ..
+                                } => {
                                     error!("❌ CRITICAL: ClipboardUpdate message failed - clipboard sync may be broken");
                                     // Debug clipboard state after failed update
                                     message_clipboard.debug_clipboard_state().await;
@@ -721,13 +730,18 @@ impl FileshareDaemon {
                         info!("📊 Message batch: processed {} messages ({} clipboard updates), {} errors", 
                               processed_count, clipboard_updates, error_count);
                     } else {
-                        debug!("📊 Message batch: processed {} messages, {} errors", processed_count, error_count);
+                        debug!(
+                            "📊 Message batch: processed {} messages, {} errors",
+                            processed_count, error_count
+                        );
                     }
                 }
 
                 if last_stats_log.elapsed() >= Duration::from_secs(60) {
-                    info!("📊 Message Stats: {} total messages, {} clipboard messages processed", 
-                          message_count, clipboard_message_count);
+                    info!(
+                        "📊 Message Stats: {} total messages, {} clipboard messages processed",
+                        message_count, clipboard_message_count
+                    );
                     last_stats_log = tokio::time::Instant::now();
                 }
             }
@@ -758,7 +772,10 @@ impl FileshareDaemon {
             }
             Err(e) => {
                 warn!("⚠️ Failed to show success notification '{}': {}", title, e);
-                Err(crate::FileshareError::Unknown(format!("Notification error: {}", e)))
+                Err(crate::FileshareError::Unknown(format!(
+                    "Notification error: {}",
+                    e
+                )))
             }
         }
     }
@@ -776,7 +793,10 @@ impl FileshareDaemon {
             }
             Err(e) => {
                 warn!("⚠️ Failed to show info notification '{}': {}", title, e);
-                Err(crate::FileshareError::Unknown(format!("Notification error: {}", e)))
+                Err(crate::FileshareError::Unknown(format!(
+                    "Notification error: {}",
+                    e
+                )))
             }
         }
     }
@@ -794,7 +814,10 @@ impl FileshareDaemon {
             }
             Err(e) => {
                 warn!("⚠️ Failed to show warning notification '{}': {}", title, e);
-                Err(crate::FileshareError::Unknown(format!("Notification error: {}", e)))
+                Err(crate::FileshareError::Unknown(format!(
+                    "Notification error: {}",
+                    e
+                )))
             }
         }
     }
@@ -812,7 +835,10 @@ impl FileshareDaemon {
             }
             Err(e) => {
                 error!("❌ Failed to show error notification '{}': {}", title, e);
-                Err(crate::FileshareError::Unknown(format!("Notification error: {}", e)))
+                Err(crate::FileshareError::Unknown(format!(
+                    "Notification error: {}",
+                    e
+                )))
             }
         }
     }

@@ -16,6 +16,8 @@ pub struct NetworkClipboardItem {
 pub struct ClipboardManager {
     pub network_clipboard: Arc<RwLock<Option<NetworkClipboardItem>>>,
     device_id: Uuid,
+    // ✅ FIXED: Add broadcast capability
+    broadcast_sender: Option<tokio::sync::mpsc::UnboundedSender<NetworkClipboardItem>>,
 }
 
 impl ClipboardManager {
@@ -24,7 +26,17 @@ impl ClipboardManager {
         Self {
             network_clipboard: Arc::new(RwLock::new(None)),
             device_id,
+            broadcast_sender: None, // Will be set by daemon
         }
+    }
+
+    // ✅ FIXED: Method for daemon to set broadcast capability
+    pub fn set_broadcast_sender(
+        &mut self,
+        sender: tokio::sync::mpsc::UnboundedSender<NetworkClipboardItem>,
+    ) {
+        self.broadcast_sender = Some(sender);
+        info!("📡 Broadcast sender configured for clipboard manager");
     }
 
     fn extract_filename_cross_platform(file_path: &PathBuf) -> String {
@@ -73,7 +85,6 @@ impl ClipboardManager {
             }
 
             if file_size > 10 * 1024 * 1024 * 1024 {
-                // 10GB limit
                 warn!(
                     "📋 COPY: File too large ({}GB), skipping: {:?}",
                     file_size / (1024 * 1024 * 1024),
@@ -101,6 +112,9 @@ impl ClipboardManager {
                     file_size, self.device_id
                 );
             }
+
+            // ✅ FIXED: Actually broadcast the clipboard update
+            self.broadcast_clipboard_update(&clipboard_item).await?;
 
             // Determine transfer method for notification
             let transfer_method = if file_size >= 50 * 1024 * 1024 {
@@ -753,9 +767,27 @@ impl ClipboardManager {
         Ok(dirs::desktop_dir().unwrap_or_else(|| PathBuf::from(".")))
     }
 
-    async fn broadcast_clipboard_update(&self) -> crate::Result<()> {
-        // TODO: Implement network broadcast to tell other devices something was copied
-        // This will integrate with the peer manager
+    async fn broadcast_clipboard_update(&self, item: &NetworkClipboardItem) -> crate::Result<()> {
+        if let Some(ref sender) = self.broadcast_sender {
+            info!(
+                "📡 Broadcasting clipboard update: {:?} ({}MB)",
+                item.file_path.file_name().unwrap_or_default(),
+                item.file_size as f64 / (1024.0 * 1024.0)
+            );
+
+            if let Err(e) = sender.send(item.clone()) {
+                error!("❌ Failed to broadcast clipboard update: {}", e);
+                return Err(crate::FileshareError::Unknown(format!(
+                    "Broadcast failed: {}",
+                    e
+                )));
+            }
+
+            info!("✅ Clipboard update broadcasted successfully");
+        } else {
+            warn!("⚠️ No broadcast sender configured - clipboard update not sent to network");
+        }
+
         Ok(())
     }
 
