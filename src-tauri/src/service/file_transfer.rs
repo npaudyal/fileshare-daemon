@@ -10,7 +10,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 use tokio::time::sleep;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
 // Phase 1 constants and limits
@@ -892,31 +892,40 @@ impl FileTransferManager {
     pub fn cleanup_stale_transfers_enhanced(&mut self) {
         let now = Instant::now();
         let timeout = Duration::from_secs(TRANSFER_TIMEOUT_SECONDS);
-        let completion_grace_period = Duration::from_secs(30); // 30 seconds grace for completed transfers
+        let completion_grace_period = Duration::from_secs(10); // REDUCED from 30 to 10 seconds
 
         let initial_count = self.active_transfers.len();
 
         self.active_transfers.retain(|transfer_id, transfer| {
-            // CRITICAL: Give completed transfers a grace period before cleanup
+            // CRITICAL: Give completed transfers a shorter grace period
             match &transfer.status {
                 TransferStatus::Completed => {
-                    if now.duration_since(transfer.last_activity) > completion_grace_period {
-                        info!("🧹 Cleaning up completed transfer: {}", transfer_id);
+                    let time_since_completion = now.duration_since(transfer.last_activity);
+                    if time_since_completion > completion_grace_period {
+                        info!(
+                            "🧹 Cleaning up completed transfer: {} (completed {:.1}s ago)",
+                            transfer_id,
+                            time_since_completion.as_secs_f64()
+                        );
                         return false;
                     } else {
-                        info!("✅ Protecting recently completed transfer: {}", transfer_id);
-                        return true; // Keep it for grace period
+                        debug!(
+                            "✅ Protecting recently completed transfer: {} ({:.1}s ago)",
+                            transfer_id,
+                            time_since_completion.as_secs_f64()
+                        );
+                        return true;
                     }
                 }
                 TransferStatus::Error(_) => {
-                    if now.duration_since(transfer.last_activity) > Duration::from_secs(60) {
+                    if now.duration_since(transfer.last_activity) > Duration::from_secs(30) {
                         info!("🧹 Cleaning up errored transfer: {}", transfer_id);
                         return false;
                     }
                     return true;
                 }
                 TransferStatus::Cancelled => {
-                    if now.duration_since(transfer.last_activity) > Duration::from_secs(10) {
+                    if now.duration_since(transfer.last_activity) > Duration::from_secs(5) {
                         info!("🧹 Cleaning up cancelled transfer: {}", transfer_id);
                         return false;
                     }
@@ -936,9 +945,14 @@ impl FileTransferManager {
                 transfer.status,
                 TransferStatus::Active | TransferStatus::Pending
             ) && now.duration_since(transfer.last_activity)
-                > Duration::from_secs(CHUNK_TIMEOUT_SECONDS)
+                > Duration::from_secs(CHUNK_TIMEOUT_SECONDS * 2)
+            // Give more time for large transfers
             {
-                warn!("🧹 Removing inactive transfer: {}", transfer_id);
+                warn!(
+                    "🧹 Removing inactive transfer: {} (inactive for {:.1}s)",
+                    transfer_id,
+                    now.duration_since(transfer.last_activity).as_secs_f64()
+                );
                 return false;
             }
 
@@ -1371,24 +1385,37 @@ impl FileTransferManager {
         );
 
         // Check if transfer exists and is incoming
-        let transfer = self.active_transfers.get(&transfer_id);
-        if let Some(transfer) = transfer {
-            // Only process chunks for INCOMING transfers
-            if !matches!(transfer.direction, TransferDirection::Incoming) {
-                warn!(
-                    "⚠️ RECEIVER: Ignoring chunk {} for outgoing transfer {} - chunks should only be processed for incoming transfers",
-                    chunk.index, transfer_id
-                );
-                return Ok(());
-            }
-        } else {
+        let transfer_exists = self.active_transfers.contains_key(&transfer_id);
+
+        if !transfer_exists {
             warn!(
-                "⚠️ RECEIVER: Received chunk for unknown transfer {}",
-                transfer_id
+                "⚠️ RECEIVER: Received chunk {} for unknown transfer {} - transfer may have been cleaned up",
+                chunk.index, transfer_id
+            );
+
+            // Send a transfer error to stop the sender
+            if let Some(ref sender) = self.message_sender {
+                let error_msg = Message::new(MessageType::TransferError {
+                    transfer_id,
+                    error: "Transfer not found - may have been completed or cancelled".to_string(),
+                });
+                let _ = sender.send((peer_id, error_msg));
+            }
+            return Ok(());
+        }
+
+        let transfer = self.active_transfers.get(&transfer_id).unwrap();
+
+        // Only process chunks for INCOMING transfers
+        if !matches!(transfer.direction, TransferDirection::Incoming) {
+            warn!(
+                "⚠️ RECEIVER: Ignoring chunk {} for outgoing transfer {} - chunks should only be processed for incoming transfers",
+                chunk.index, transfer_id
             );
             return Ok(());
         }
 
+        // ENHANCED: More robust completion detection
         let is_complete = {
             let transfer = self.active_transfers.get_mut(&transfer_id).unwrap();
 
@@ -1399,7 +1426,11 @@ impl FileTransferManager {
             }
 
             if !matches!(transfer.status, TransferStatus::Active) {
-                return Err(FileshareError::Transfer("Transfer not active".to_string()));
+                warn!(
+                    "Transfer {} not active (status: {:?}), ignoring chunk",
+                    transfer_id, transfer.status
+                );
+                return Ok(());
             }
 
             // Update last activity timestamp
@@ -1422,10 +1453,6 @@ impl FileTransferManager {
                     transfer.chunks_received.len(),
                     transfer.metadata.total_chunks
                 );
-                error!(
-                    "   File size: {} bytes, Chunk size: {} bytes",
-                    expected_file_size, chunk_size
-                );
                 return Err(FileshareError::Transfer(format!(
                     "Chunk index {} out of bounds (expected max {})",
                     chunk.index,
@@ -1438,14 +1465,6 @@ impl FileTransferManager {
                     "❌ RECEIVER: Chunk {} extends beyond expected file size for transfer {}",
                     chunk.index, transfer_id
                 );
-                error!("   Expected file size: {} bytes", expected_file_size);
-                error!(
-                    "   Chunk offset: {} + {} = {} bytes",
-                    expected_offset,
-                    chunk.data.len(),
-                    actual_end_offset
-                );
-                error!("   Agreed chunk size: {} bytes", chunk_size);
                 return Err(FileshareError::Transfer(format!(
                     "Chunk {} too large: offset {} + size {} = {} exceeds file size {}",
                     chunk.index,
@@ -1468,18 +1487,40 @@ impl FileTransferManager {
                 chunk.data.len()
             );
 
-            // Mark chunk as received
-            transfer.chunks_received[chunk.index as usize] = true;
-            transfer.bytes_transferred += chunk.data.len() as u64;
+            // Mark chunk as received ONLY if not already received (prevent double-counting)
+            if !transfer.chunks_received[chunk.index as usize] {
+                transfer.chunks_received[chunk.index as usize] = true;
+                transfer.bytes_transferred += chunk.data.len() as u64;
+            } else {
+                warn!("Received duplicate chunk {}, ignoring", chunk.index);
+            }
 
             let chunks_received_count = transfer.chunks_received.iter().filter(|&&x| x).count();
             info!(
-                "📊 RECEIVER: Chunk {} marked as received for transfer {} ({}/{} chunks, {} bytes total)",
-                chunk.index, transfer_id, chunks_received_count, transfer.chunks_received.len(), transfer.bytes_transferred
+                "📊 RECEIVER: Chunk {} processed for transfer {} ({}/{} chunks, {} bytes total)",
+                chunk.index,
+                transfer_id,
+                chunks_received_count,
+                transfer.chunks_received.len(),
+                transfer.bytes_transferred
             );
 
-            // Check if transfer is complete
-            chunk.is_last || transfer.chunks_received.iter().all(|&received| received)
+            // ENHANCED: More careful completion detection
+            let all_chunks_received = transfer.chunks_received.iter().all(|&received| received);
+            let bytes_complete = transfer.bytes_transferred >= transfer.metadata.size;
+
+            // Only complete if we have ALL chunks AND enough bytes OR if marked as last chunk
+            let should_complete =
+                (chunk.is_last && bytes_complete) || (all_chunks_received && bytes_complete);
+
+            if should_complete {
+                info!(
+                    "🎯 RECEIVER: Transfer {} completion detected - is_last: {}, all_chunks: {}, bytes_complete: {}",
+                    transfer_id, chunk.is_last, all_chunks_received, bytes_complete
+                );
+            }
+
+            should_complete
         };
 
         if is_complete {
@@ -1501,7 +1542,6 @@ impl FileTransferManager {
 
         Ok(())
     }
-
     async fn complete_file_transfer(&mut self, transfer_id: Uuid) -> Result<()> {
         let (file_path, expected_checksum, file_data, peer_id) = {
             let transfer = self
@@ -1509,9 +1549,20 @@ impl FileTransferManager {
                 .get_mut(&transfer_id)
                 .ok_or_else(|| FileshareError::Transfer("Transfer not found".to_string()))?;
 
+            // CRITICAL: Check if already completed to prevent double-completion
+            if matches!(transfer.status, TransferStatus::Completed) {
+                info!("✅ Transfer {} already completed, skipping", transfer_id);
+                return Ok(());
+            }
+
             // CRITICAL: Mark as completed IMMEDIATELY to prevent retries
             transfer.status = TransferStatus::Completed;
             transfer.last_activity = Instant::now();
+
+            info!(
+                "📝 RECEIVER: Finalizing transfer {} completion",
+                transfer_id
+            );
 
             (
                 transfer.file_path.clone(),
@@ -1584,12 +1635,17 @@ impl FileTransferManager {
             }
         }
 
-        // CRITICAL: Remove completed transfer after a short delay to prevent immediate cleanup issues
+        // FIXED: Schedule proper cleanup
+        let transfer_id_for_cleanup = transfer_id;
+        let active_transfers_ref = &mut self.active_transfers;
+
+        // Remove the transfer after a brief delay to allow final messages
         tokio::spawn({
-            let transfer_id = transfer_id;
+            let transfer_id = transfer_id_for_cleanup;
             async move {
-                tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
-                // Note: We can't access self here, so we'll handle this in the cleanup method
+                tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+                // This will be handled by the next cleanup cycle
+                info!("🧹 Transfer {} scheduled for cleanup", transfer_id);
             }
         });
 
