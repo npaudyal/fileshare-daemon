@@ -813,6 +813,37 @@ impl PeerManager {
                 clipboard.update_from_network(clipboard_item).await;
             }
 
+            MessageType::SimpleFileRequest {
+                request_id,
+                file_path,
+                target_dir,
+            } => {
+                info!(
+                    "📥 Received SimpleFileRequest from {}: {} -> {}",
+                    peer_id, file_path, target_dir
+                );
+
+                self.handle_simple_file_request(peer_id, request_id, file_path, target_dir)
+                    .await?;
+            }
+
+            MessageType::SimpleFileRequestResponse {
+                request_id,
+                accepted,
+                reason,
+                transfer_id,
+            } => {
+                if accepted {
+                    info!(
+                        "✅ File request {} accepted with transfer {}",
+                        request_id,
+                        transfer_id.unwrap_or_default()
+                    );
+                } else {
+                    warn!("❌ File request {} rejected: {:?}", request_id, reason);
+                }
+            }
+
             MessageType::ClipboardClear => {
                 info!("Received clipboard clear from {}", peer_id);
                 clipboard.clear().await;
@@ -915,6 +946,79 @@ impl PeerManager {
                 );
             }
         }
+        Ok(())
+    }
+
+    async fn handle_simple_file_request(
+        &mut self,
+        peer_id: Uuid,
+        request_id: Uuid,
+        file_path: String,
+        target_dir: String,
+    ) -> Result<()> {
+        info!(
+            "🔍 Processing file request {} for: {}",
+            request_id, file_path
+        );
+
+        let file_path_buf = PathBuf::from(&file_path);
+
+        if !file_path_buf.exists() {
+            warn!("❌ Requested file does not exist: {}", file_path);
+
+            let response = Message::new(MessageType::SimpleFileRequestResponse {
+                request_id,
+                accepted: false,
+                reason: Some("File not found".to_string()),
+                transfer_id: None,
+            });
+
+            if let Some(conn) = self.connections.get(&peer_id) {
+                let _ = conn.send(response);
+            }
+            return Ok(());
+        }
+
+        // Accept the request and start adaptive transfer
+        let transfer_id = uuid::Uuid::new_v4();
+
+        let response = Message::new(MessageType::SimpleFileRequestResponse {
+            request_id,
+            accepted: true,
+            reason: None,
+            transfer_id: Some(transfer_id),
+        });
+
+        if let Some(conn) = self.connections.get(&peer_id) {
+            let _ = conn.send(response);
+        }
+
+        info!("✅ File request accepted, starting adaptive transfer");
+
+        // Get peer address for transfer
+        let peer_addr = self
+            .get_peer_address(peer_id)
+            .ok_or_else(|| FileshareError::Transfer("Peer address not found".to_string()))?;
+
+        // Start the adaptive transfer
+        if let Some(ref transfer_manager) = self.transfer_manager {
+            let mut tm = transfer_manager.write().await;
+
+            // Use the adaptive transfer system to send the file
+            tm.send_file_with_address(peer_id, file_path_buf, peer_addr)
+                .await?;
+
+            info!(
+                "✅ Adaptive file transfer initiated for request {}",
+                request_id
+            );
+        } else {
+            error!("❌ Transfer manager not available");
+            return Err(FileshareError::Transfer(
+                "Transfer manager not configured".to_string(),
+            ));
+        }
+
         Ok(())
     }
 

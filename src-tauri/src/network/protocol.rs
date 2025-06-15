@@ -44,6 +44,18 @@ pub enum MessageType {
         reason: Option<String>,
     },
 
+    SimpleFileRequest {
+        request_id: Uuid,
+        file_path: String,  // Path on the source device
+        target_dir: String, // Where to save on requesting device
+    },
+    SimpleFileRequestResponse {
+        request_id: Uuid,
+        accepted: bool,
+        reason: Option<String>,
+        transfer_id: Option<Uuid>, // If accepted, the transfer ID to use
+    },
+
     // SIMPLIFIED: Single adaptive file transfer system
     SimpleFileOffer {
         transfer_id: Uuid,
