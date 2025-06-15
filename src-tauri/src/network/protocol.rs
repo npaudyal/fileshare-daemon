@@ -1,4 +1,4 @@
-use crate::network::streaming_protocol::*;
+// src/network/protocol.rs - COMPLETE SIMPLIFIED VERSION
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use uuid::Uuid;
@@ -44,98 +44,31 @@ pub enum MessageType {
         reason: Option<String>,
     },
 
-    // CHUNKED file transfer (for smaller files)
-    FileOffer {
+    // SIMPLIFIED: Single adaptive file transfer system
+    SimpleFileOffer {
         transfer_id: Uuid,
-        metadata: FileMetadata,
+        metadata: SimpleFileMetadata,
     },
-    FileOfferResponse {
-        transfer_id: Uuid,
-        accepted: bool,
-        reason: Option<String>,
-    },
-    FileChunk {
-        transfer_id: Uuid,
-        chunk: TransferChunk,
-    },
-    FileChunkAck {
-        transfer_id: Uuid,
-        chunk_index: u64,
-    },
-    TransferComplete {
-        transfer_id: Uuid,
-        checksum: String,
-    },
-    TransferError {
-        transfer_id: Uuid,
-        error: String,
-    },
-
-    // STREAMING file transfer (for larger files)
-    StreamingFileOffer {
-        transfer_id: Uuid,
-        metadata: StreamingFileMetadata,
-    },
-    StreamingFileOfferResponse {
+    SimpleFileOfferResponse {
         transfer_id: Uuid,
         accepted: bool,
-        reason: Option<String>,
-        suggested_config: Option<StreamingConfig>,
+        my_port: u16, // Port for direct connection
     },
-
-    // Streaming connection management
-    StreamingConnectionRequest {
-        transfer_id: Uuid,
-        port: u16, // Port we want to connect to (0 = any)
-    },
-    StreamingConnectionResponse {
-        transfer_id: Uuid,
-        accepted: bool,
-        port: Option<u16>, // Port to connect to
-        reason: Option<String>,
-    },
-
-    // Streaming transfer status (sent over regular control channel)
-    StreamingTransferComplete {
+    SimpleTransferComplete {
         transfer_id: Uuid,
         bytes_transferred: u64,
-        chunks_received: u64,
-        file_hash: String,
-    },
-    StreamingTransferError {
-        transfer_id: Uuid,
-        error: String,
-        chunk_index: Option<u64>,
-    },
-
-    HighSpeedFileRequest {
-        request_id: Uuid,
-        file_path: String,
-        target_path: String,
-        suggested_connections: usize,
-    },
-    HighSpeedFileOffer {
-        transfer_id: Uuid,
-        metadata: HighSpeedFileMetadata,
-        connection_count: usize,
-        peer_connections: Vec<std::net::SocketAddr>,
-    },
-    HighSpeedFileOfferResponse {
-        transfer_id: Uuid,
-        accepted: bool,
-        reason: Option<String>,
-        my_connections: Vec<std::net::SocketAddr>,
-    },
-    HighSpeedTransferComplete {
-        transfer_id: Uuid,
-        total_bytes: u64,
         duration_seconds: f64,
         average_speed_mbps: f64,
     },
-    HighSpeedTransferError {
+    SimpleTransferError {
         transfer_id: Uuid,
         error: String,
-        connection_id: Option<usize>,
+    },
+    SimpleTransferProgress {
+        transfer_id: Uuid,
+        bytes_transferred: u64,
+        total_bytes: u64,
+        speed_mbps: f64,
     },
 
     // Control
@@ -145,35 +78,81 @@ pub enum MessageType {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct HighSpeedFileMetadata {
+pub struct SimpleFileMetadata {
     pub name: String,
     pub size: u64,
-    pub checksum: String,
-    pub chunk_size: usize,
-    pub estimated_chunks: u64,
-    pub suggested_connections: usize,
-    pub created: Option<u64>,
-    pub modified: Option<u64>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct FileMetadata {
-    pub name: String,
-    pub size: u64,
-    pub checksum: String,
+    pub transfer_id: Uuid,
+    pub checksum: Option<String>, // Optional for verification
     pub mime_type: Option<String>,
-    pub created: Option<u64>,
-    pub modified: Option<u64>,
     pub target_dir: Option<String>,
-    pub chunk_size: usize,
-    pub total_chunks: u64,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct TransferChunk {
-    pub index: u64,
-    pub data: Vec<u8>,
-    pub is_last: bool,
+impl SimpleFileMetadata {
+    pub fn from_path(path: &PathBuf) -> crate::Result<Self> {
+        use sha2::{Digest, Sha256};
+        use std::fs;
+        use std::io::Read;
+
+        let metadata = fs::metadata(path)?;
+        let name = path
+            .file_name()
+            .ok_or_else(|| crate::FileshareError::FileOperation("Invalid file name".to_string()))?
+            .to_string_lossy()
+            .to_string();
+
+        let file_size = metadata.len();
+
+        // Calculate checksum for verification
+        let mut file = fs::File::open(path)?;
+        let mut hasher = Sha256::new();
+        let mut buffer = [0; 8192];
+
+        loop {
+            let bytes_read = file.read(&mut buffer)?;
+            if bytes_read == 0 {
+                break;
+            }
+            hasher.update(&buffer[..bytes_read]);
+        }
+
+        let checksum = format!("{:x}", hasher.finalize());
+        let mime_type = Self::guess_mime_type(&name);
+
+        Ok(Self {
+            name,
+            size: file_size,
+            transfer_id: Uuid::new_v4(),
+            checksum: Some(checksum),
+            mime_type,
+            target_dir: None,
+        })
+    }
+
+    pub fn with_target_dir(mut self, target_dir: Option<String>) -> Self {
+        self.target_dir = target_dir;
+        self
+    }
+
+    fn guess_mime_type(filename: &str) -> Option<String> {
+        let extension = std::path::Path::new(filename)
+            .extension()?
+            .to_str()?
+            .to_lowercase();
+
+        match extension.as_str() {
+            "txt" => Some("text/plain".to_string()),
+            "pdf" => Some("application/pdf".to_string()),
+            "jpg" | "jpeg" => Some("image/jpeg".to_string()),
+            "png" => Some("image/png".to_string()),
+            "gif" => Some("image/gif".to_string()),
+            "mp4" | "mov" | "avi" | "mkv" => Some("video/mp4".to_string()),
+            "mp3" | "wav" | "flac" => Some("audio/mpeg".to_string()),
+            "zip" | "rar" | "7z" => Some("application/zip".to_string()),
+            "json" => Some("application/json".to_string()),
+            "xml" => Some("application/xml".to_string()),
+            _ => None,
+        }
+    }
 }
 
 impl Message {
@@ -202,95 +181,5 @@ impl Message {
 
     pub fn pong() -> Self {
         Self::new(MessageType::Pong)
-    }
-}
-
-impl FileMetadata {
-    pub fn from_path_with_chunk_size(path: &PathBuf, chunk_size: usize) -> crate::Result<Self> {
-        use sha2::{Digest, Sha256};
-        use std::fs;
-        use std::io::Read;
-
-        let metadata = fs::metadata(path)?;
-        let name = path
-            .file_name()
-            .ok_or_else(|| crate::FileshareError::FileOperation("Invalid file name".to_string()))?
-            .to_string_lossy()
-            .to_string();
-
-        let file_size = metadata.len();
-        let total_chunks = (file_size + chunk_size as u64 - 1) / chunk_size as u64;
-
-        // Calculate checksum
-        let mut file = fs::File::open(path)?;
-        let mut hasher = Sha256::new();
-        let mut buffer = [0; 8192];
-
-        loop {
-            let bytes_read = file.read(&mut buffer)?;
-            if bytes_read == 0 {
-                break;
-            }
-            hasher.update(&buffer[..bytes_read]);
-        }
-
-        let checksum = format!("{:x}", hasher.finalize());
-
-        // Get timestamps
-        let created = metadata
-            .created()
-            .ok()
-            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-            .map(|d| d.as_secs());
-
-        let modified = metadata
-            .modified()
-            .ok()
-            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-            .map(|d| d.as_secs());
-
-        let mime_type = Self::guess_mime_type(&name);
-
-        Ok(Self {
-            name,
-            size: file_size,
-            checksum,
-            mime_type,
-            created,
-            modified,
-            target_dir: None,
-            chunk_size,
-            total_chunks,
-        })
-    }
-
-    pub fn from_path(path: &PathBuf) -> crate::Result<Self> {
-        Self::from_path_with_chunk_size(path, 1024 * 1024)
-    }
-
-    pub fn with_target_dir(mut self, target_dir: Option<String>) -> Self {
-        self.target_dir = target_dir;
-        self
-    }
-
-    fn guess_mime_type(filename: &str) -> Option<String> {
-        let extension = std::path::Path::new(filename)
-            .extension()?
-            .to_str()?
-            .to_lowercase();
-
-        match extension.as_str() {
-            "txt" => Some("text/plain".to_string()),
-            "pdf" => Some("application/pdf".to_string()),
-            "jpg" | "jpeg" => Some("image/jpeg".to_string()),
-            "png" => Some("image/png".to_string()),
-            "gif" => Some("image/gif".to_string()),
-            "mp4" | "mov" | "avi" | "mkv" => Some("video/mp4".to_string()),
-            "mp3" | "wav" | "flac" => Some("audio/mpeg".to_string()),
-            "zip" | "rar" | "7z" => Some("application/zip".to_string()),
-            "json" => Some("application/json".to_string()),
-            "xml" => Some("application/xml".to_string()),
-            _ => None,
-        }
     }
 }

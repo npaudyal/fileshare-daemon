@@ -1,9 +1,8 @@
+// src/network/peer.rs - COMPLETE SIMPLIFIED VERSION
 use crate::{
     config::Settings,
     network::{discovery::DeviceInfo, protocol::*},
-    service::file_transfer::{
-        FileTransferManager, MessageSender, TransferDirection, TransferStatus,
-    },
+    service::adaptive_transfer::AdaptiveTransferManager,
     FileshareError, Result,
 };
 use std::collections::HashMap;
@@ -13,25 +12,25 @@ use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::{mpsc, RwLock};
-use tokio::time::{interval, timeout};
+use tokio::time::timeout;
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
 // Constants for connection health monitoring
-const PING_INTERVAL_SECONDS: u64 = 30; // Ping every 30 seconds
-const PING_TIMEOUT_SECONDS: u64 = 10; // 10 second ping timeout
-const MAX_MISSED_PINGS: u32 = 3; // Disconnect after 3 missed pings
-const RECONNECTION_DELAY_SECONDS: u64 = 5; // Wait 5 seconds before reconnecting
-const MAX_RECONNECTION_ATTEMPTS: u32 = 5; // Try reconnecting 5 times
+const PING_INTERVAL_SECONDS: u64 = 30;
+const PING_TIMEOUT_SECONDS: u64 = 10;
+const MAX_MISSED_PINGS: u32 = 3;
+const RECONNECTION_DELAY_SECONDS: u64 = 5;
+const MAX_RECONNECTION_ATTEMPTS: u32 = 5;
 
 #[derive(Debug, Clone)]
 pub struct Peer {
     pub device_info: DeviceInfo,
     pub connection_status: ConnectionStatus,
     pub last_ping: Option<std::time::Instant>,
-    pub ping_failures: u32,            // Track consecutive ping failures
-    pub last_seen: std::time::Instant, // Track when we last heard from this peer
-    pub reconnection_attempts: u32,    // Track reconnection attempts
+    pub ping_failures: u32,
+    pub last_seen: std::time::Instant,
+    pub reconnection_attempts: u32,
 }
 
 #[derive(Debug, Clone)]
@@ -40,11 +39,10 @@ pub enum ConnectionStatus {
     Connecting,
     Connected,
     Authenticated,
-    Reconnecting, // Reconnecting state
+    Reconnecting,
     Error(String),
 }
 
-// Connection statistics structure
 #[derive(Debug, Default)]
 pub struct ConnectionStats {
     pub total: usize,
@@ -60,16 +58,29 @@ pub struct ConnectionStats {
 pub struct PeerManager {
     pub settings: Arc<Settings>,
     peers: HashMap<Uuid, Peer>,
-    pub file_transfer: Arc<RwLock<FileTransferManager>>,
+
+    // SIMPLIFIED: Direct integration with adaptive transfer manager
+    pub transfer_manager: Option<Arc<RwLock<AdaptiveTransferManager>>>,
+
     pub message_tx: mpsc::UnboundedSender<(Uuid, Message)>,
     pub message_rx: mpsc::UnboundedReceiver<(Uuid, Message)>,
+
     // Store active connections to send messages
     connections: HashMap<Uuid, mpsc::UnboundedSender<Message>>,
+
+    // Track pending transfers for file path lookup
+    pending_transfers: HashMap<Uuid, PendingTransfer>,
+}
+
+#[derive(Debug, Clone)]
+struct PendingTransfer {
+    file_path: PathBuf,
+    peer_id: Uuid,
+    created_at: Instant,
 }
 
 impl PeerManager {
     pub async fn get_all_discovered_devices(&self) -> Vec<crate::network::discovery::DeviceInfo> {
-        // Return peers as discovered devices for UI compatibility
         let mut discovered = Vec::new();
 
         for (_, peer) in &self.peers {
@@ -88,6 +99,7 @@ impl PeerManager {
     pub fn get_peer_address(&self, peer_id: Uuid) -> Option<std::net::SocketAddr> {
         self.peers.get(&peer_id).map(|peer| peer.device_info.addr)
     }
+
     pub fn is_peer_connected(&self, peer_id: Uuid) -> bool {
         self.peers
             .get(&peer_id)
@@ -98,53 +110,37 @@ impl PeerManager {
     pub async fn new(settings: Arc<Settings>) -> Result<Self> {
         let (message_tx, message_rx) = mpsc::unbounded_channel();
 
-        // Create file transfer manager WITHOUT any circular reference
-        let mut file_transfer = FileTransferManager::new(settings.clone()).await?;
-
-        // Set up the message sender
-        file_transfer.set_message_sender(message_tx.clone());
-
-        // PRODUCTION: Return PeerManager directly - no Arc wrapping
         Ok(Self {
             settings,
             peers: HashMap::new(),
-            file_transfer: Arc::new(RwLock::new(file_transfer)),
+            transfer_manager: None,
             message_tx,
             message_rx,
             connections: HashMap::new(),
+            pending_transfers: HashMap::new(),
         })
     }
 
-    pub async fn setup_file_transfer_callbacks(&mut self) {
-        // Create callbacks that capture the peer information
-        let peers_for_address = self.peers.clone();
-        let peers_for_connected = self.peers.clone();
+    // Set transfer manager reference
+    pub async fn set_transfer_manager(
+        &mut self,
+        transfer_manager: Arc<RwLock<AdaptiveTransferManager>>,
+    ) {
+        // Set message sender for transfer manager
+        {
+            let mut tm = transfer_manager.write().await; // FIXED: Use async write
+            tm.set_message_sender(self.message_tx.clone());
+        }
 
-        let address_callback: crate::service::file_transfer::PeerAddressCallback =
-            Arc::new(move |peer_id| {
-                peers_for_address
-                    .get(&peer_id)
-                    .map(|peer| peer.device_info.addr)
-            });
-
-        let connected_callback: crate::service::file_transfer::PeerConnectedCallback =
-            Arc::new(move |peer_id| {
-                peers_for_connected
-                    .get(&peer_id)
-                    .map(|peer| matches!(peer.connection_status, ConnectionStatus::Authenticated))
-                    .unwrap_or(false)
-            });
-
-        // Set the callbacks
-        let mut ft = self.file_transfer.write().await;
-        ft.set_peer_callbacks(address_callback, connected_callback);
-
-        info!("✅ File transfer callbacks configured");
+        self.transfer_manager = Some(transfer_manager);
+        info!("✅ Transfer manager configured");
     }
+
     pub fn debug_connection_status(&self) {
         info!("=== CONNECTION STATUS DEBUG ===");
         info!("Total discovered peers: {}", self.peers.len());
         info!("Active connections: {}", self.connections.len());
+        info!("Pending transfers: {}", self.pending_transfers.len());
 
         for (peer_id, peer) in &self.peers {
             info!(
@@ -163,7 +159,6 @@ impl PeerManager {
         info!("=== END CONNECTION STATUS ===");
     }
 
-    // Add this method for direct connection sending (used by daemon routing)
     pub async fn send_direct_to_connection(&self, peer_id: Uuid, message: Message) -> Result<()> {
         if let Some(conn) = self.connections.get(&peer_id) {
             conn.send(message).map_err(|e| {
@@ -178,7 +173,6 @@ impl PeerManager {
         }
     }
 
-    // Simplified message sending
     pub async fn send_message_to_peer(&mut self, peer_id: Uuid, message: Message) -> Result<()> {
         info!(
             "Attempting to send message to peer {}: {:?}",
@@ -210,9 +204,7 @@ impl PeerManager {
     }
 
     pub async fn on_device_discovered(&mut self, device_info: DeviceInfo) -> Result<()> {
-        // Check if peer already exists
         if let Some(existing_peer) = self.peers.get_mut(&device_info.id) {
-            // Update last seen time and device info, but keep connection status
             existing_peer.device_info = device_info;
             existing_peer.last_seen = Instant::now();
             debug!(
@@ -222,7 +214,6 @@ impl PeerManager {
             return Ok(());
         }
 
-        // Create new peer only if it doesn't exist
         let peer = Peer {
             device_info: device_info.clone(),
             connection_status: ConnectionStatus::Disconnected,
@@ -235,7 +226,6 @@ impl PeerManager {
         info!("Adding new peer: {} ({})", device_info.name, device_info.id);
         self.peers.insert(device_info.id, peer);
 
-        // Attempt to connect to new peers
         if self.settings.security.require_pairing {
             if self
                 .settings
@@ -309,7 +299,6 @@ impl PeerManager {
     async fn handle_unknown_connection(&mut self, stream: TcpStream) -> Result<()> {
         let mut connection = PeerConnection::new(stream);
 
-        // Wait for handshake
         match connection.read_message().await? {
             Message {
                 message_type:
@@ -322,7 +311,6 @@ impl PeerManager {
             } => {
                 info!("Received handshake from {} ({})", device_name, device_id);
 
-                // Check if this device is allowed
                 let accepted = if self.settings.security.require_pairing {
                     self.settings.security.allowed_devices.contains(&device_id)
                 } else {
@@ -345,14 +333,13 @@ impl PeerManager {
 
                 if accepted {
                     info!("Handshake accepted for device {}", device_id);
-                    // Update or create peer
+
                     if let Some(peer) = self.peers.get_mut(&device_id) {
                         peer.connection_status = ConnectionStatus::Authenticated;
                         peer.last_seen = Instant::now();
                         peer.ping_failures = 0;
                         peer.reconnection_attempts = 0;
                     } else {
-                        // Create new peer from handshake info
                         let device_info = DeviceInfo {
                             id: device_id,
                             name: device_name,
@@ -376,7 +363,6 @@ impl PeerManager {
                         self.peers.insert(device_id, peer);
                     }
 
-                    // Handle the authenticated connection
                     self.handle_authenticated_connection(device_id, connection)
                         .await?;
                 } else {
@@ -397,14 +383,12 @@ impl PeerManager {
     async fn handle_peer_connection(&mut self, peer_id: Uuid, stream: TcpStream) -> Result<()> {
         let mut connection = PeerConnection::new(stream);
 
-        // Send handshake
         let handshake =
             Message::handshake(self.settings.device.id, self.settings.device.name.clone());
 
         info!("Sending handshake to peer {}", peer_id);
         connection.write_message(&handshake).await?;
 
-        // Wait for response
         match connection.read_message().await? {
             Message {
                 message_type: MessageType::HandshakeResponse { accepted: true, .. },
@@ -456,13 +440,11 @@ impl PeerManager {
         let message_tx = self.message_tx.clone();
         let (conn_tx, mut conn_rx) = mpsc::unbounded_channel::<Message>();
 
-        // Store the connection sender so we can send messages to this peer
         self.connections.insert(peer_id, conn_tx);
 
-        // Split the connection into read and write halves
         let (mut read_half, mut write_half) = connection.split();
 
-        // Spawn task to handle reading messages FROM the peer
+        // Read task
         let read_message_tx = message_tx.clone();
         let read_peer_id = peer_id;
         let read_task = tokio::spawn(async move {
@@ -490,7 +472,7 @@ impl PeerManager {
             info!("Read task ended for peer {}", read_peer_id);
         });
 
-        // Spawn task to handle writing messages TO the peer
+        // Write task
         let write_peer_id = peer_id;
         let write_task = tokio::spawn(async move {
             while let Some(message) = conn_rx.recv().await {
@@ -507,9 +489,8 @@ impl PeerManager {
             info!("Write task ended for peer {}", write_peer_id);
         });
 
-        // Clean up when connection ends
+        // Cleanup when connection ends
         let cleanup_peer_id = peer_id;
-        let connections_cleanup = self.connections.clone();
         tokio::spawn(async move {
             tokio::select! {
                 _ = read_task => {
@@ -525,12 +506,12 @@ impl PeerManager {
         Ok(())
     }
 
+    // SIMPLIFIED: Send file using adaptive transfer manager
     pub async fn send_file_to_peer(
         &mut self,
         peer_id: Uuid,
         file_path: std::path::PathBuf,
     ) -> Result<()> {
-        // Check if peer is connected and authenticated
         let peer = self
             .peers
             .get(&peer_id)
@@ -542,9 +523,27 @@ impl PeerManager {
             ));
         }
 
-        // Start file transfer with validation
-        let mut ft = self.file_transfer.write().await;
-        ft.send_file_with_validation(peer_id, file_path).await
+        if let Some(ref transfer_manager) = self.transfer_manager {
+            let mut tm = transfer_manager.write().await;
+            let transfer_id = tm.send_file(peer_id, file_path.clone()).await?;
+
+            // Store pending transfer for lookup
+            self.pending_transfers.insert(
+                transfer_id,
+                PendingTransfer {
+                    file_path,
+                    peer_id,
+                    created_at: Instant::now(),
+                },
+            );
+
+            info!("✅ File transfer {} initiated", transfer_id);
+            Ok(())
+        } else {
+            Err(FileshareError::Transfer(
+                "Transfer manager not configured".to_string(),
+            ))
+        }
     }
 
     pub fn get_connected_peers(&self) -> Vec<Peer> {
@@ -555,7 +554,6 @@ impl PeerManager {
             .collect()
     }
 
-    // Check health of all peers
     pub async fn check_peer_health_all(&mut self) -> Result<()> {
         let authenticated_peers: Vec<Uuid> = self
             .peers
@@ -573,11 +571,9 @@ impl PeerManager {
         Ok(())
     }
 
-    // Check individual peer health
     async fn check_peer_health(&mut self, peer_id: Uuid) -> Result<()> {
         info!("🩺 Checking health of peer {}", peer_id);
 
-        // Send ping and wait for response
         match self.ping_peer_with_timeout(peer_id).await {
             Ok(response_time) => {
                 info!(
@@ -585,7 +581,6 @@ impl PeerManager {
                     peer_id, response_time
                 );
 
-                // Reset ping failures on successful ping
                 if let Some(peer) = self.peers.get_mut(&peer_id) {
                     peer.ping_failures = 0;
                     peer.last_ping = Some(Instant::now());
@@ -601,15 +596,12 @@ impl PeerManager {
         Ok(())
     }
 
-    // Ping peer with timeout
     async fn ping_peer_with_timeout(&mut self, peer_id: Uuid) -> Result<Duration> {
         let start_time = Instant::now();
         let ping_message = Message::ping();
 
-        // Send ping
         self.send_message_to_peer(peer_id, ping_message).await?;
 
-        // Wait for pong response with timeout
         match timeout(
             Duration::from_secs(PING_TIMEOUT_SECONDS),
             self.wait_for_pong(peer_id),
@@ -627,16 +619,11 @@ impl PeerManager {
         }
     }
 
-    // Wait for pong response
     async fn wait_for_pong(&mut self, _peer_id: Uuid) -> Result<()> {
-        // This would typically wait for a pong message
-        // For now, we'll implement a simple delay simulation
-        // In a real implementation, you'd wait for the actual pong message
         tokio::time::sleep(Duration::from_millis(100)).await;
         Ok(())
     }
 
-    // Handle ping failure
     async fn handle_ping_failure(&mut self, peer_id: Uuid) -> Result<()> {
         if let Some(peer) = self.peers.get_mut(&peer_id) {
             peer.ping_failures += 1;
@@ -652,11 +639,7 @@ impl PeerManager {
                     peer_id
                 );
                 peer.connection_status = ConnectionStatus::Disconnected;
-
-                // Remove from active connections
                 self.connections.remove(&peer_id);
-
-                // Attempt reconnection if this was an authenticated peer
                 self.attempt_reconnection(peer_id).await?;
             }
         }
@@ -664,9 +647,7 @@ impl PeerManager {
         Ok(())
     }
 
-    // Fixed version - separate the data extraction from the method calls
     async fn attempt_reconnection(&mut self, peer_id: Uuid) -> Result<()> {
-        // First, extract the necessary data and update the peer state
         let should_reconnect = if let Some(peer) = self.peers.get_mut(&peer_id) {
             if peer.reconnection_attempts >= MAX_RECONNECTION_ATTEMPTS {
                 error!("💥 Max reconnection attempts reached for peer {}", peer_id);
@@ -683,26 +664,22 @@ impl PeerManager {
                 peer.reconnection_attempts, peer_id
             );
 
-            true // Indicate we should proceed with reconnection
+            true
         } else {
-            false // Peer not found
+            false
         };
 
         if should_reconnect {
-            // Wait before reconnecting
             tokio::time::sleep(Duration::from_secs(RECONNECTION_DELAY_SECONDS)).await;
 
-            // Now we can safely call connect_to_peer since we're not holding any borrows
             match self.connect_to_peer(peer_id).await {
                 Ok(_) => {
                     info!("✅ Successfully reconnected to peer {}", peer_id);
-                    // Reset reconnection attempts on successful connection
                     if let Some(peer) = self.peers.get_mut(&peer_id) {
                         peer.reconnection_attempts = 0;
                     }
                 }
                 Err(e) => {
-                    // Get the current attempt count for logging
                     let attempt_count = self
                         .peers
                         .get(&peer_id)
@@ -720,7 +697,6 @@ impl PeerManager {
         Ok(())
     }
 
-    // Check if peer is healthy
     pub fn is_peer_healthy(&self, peer_id: Uuid) -> bool {
         if let Some(peer) = self.peers.get(&peer_id) {
             matches!(peer.connection_status, ConnectionStatus::Authenticated)
@@ -731,7 +707,6 @@ impl PeerManager {
         }
     }
 
-    // Get connection statistics
     pub fn get_connection_stats(&self) -> ConnectionStats {
         let mut stats = ConnectionStats::default();
 
@@ -754,14 +729,34 @@ impl PeerManager {
         stats
     }
 
-    // Enhanced message handling with connection health updates
+    // Get file path for transfer
+    pub fn get_file_path_for_transfer(&self, transfer_id: Uuid) -> Option<PathBuf> {
+        self.pending_transfers
+            .get(&transfer_id)
+            .map(|pt| pt.file_path.clone())
+    }
+
+    // Clean up old pending transfers
+    pub fn cleanup_pending_transfers(&mut self) {
+        let cutoff = Instant::now() - Duration::from_secs(300); // 5 minutes
+        let initial_count = self.pending_transfers.len();
+
+        self.pending_transfers
+            .retain(|_, pt| pt.created_at > cutoff);
+
+        let removed = initial_count - self.pending_transfers.len();
+        if removed > 0 {
+            debug!("🧹 Cleaned up {} old pending transfers", removed);
+        }
+    }
+
+    // SIMPLIFIED: Enhanced message handling with adaptive transfer support
     pub async fn handle_message(
         &mut self,
         peer_id: Uuid,
         message: Message,
         clipboard: &crate::clipboard::ClipboardManager,
     ) -> Result<()> {
-        // Update last seen timestamp for any message
         if let Some(peer) = self.peers.get_mut(&peer_id) {
             peer.last_seen = Instant::now();
         }
@@ -782,7 +777,7 @@ impl PeerManager {
                 debug!("Received pong from {}", peer_id);
                 if let Some(peer) = self.peers.get_mut(&peer_id) {
                     peer.last_ping = Some(Instant::now());
-                    peer.ping_failures = 0; // Reset ping failures on pong
+                    peer.ping_failures = 0;
                     peer.last_seen = Instant::now();
                 }
             }
@@ -810,114 +805,61 @@ impl PeerManager {
                 clipboard.clear().await;
             }
 
-            MessageType::StreamingFileOffer {
+            // SIMPLIFIED: Handle adaptive file transfer messages
+            MessageType::SimpleFileOffer {
                 transfer_id,
                 metadata,
             } => {
                 info!(
-                    "✅ Processing StreamingFileOffer from {}: {} ({:.1}MB)",
+                    "✅ Processing SimpleFileOffer from {}: {} ({:.1}MB)",
                     peer_id,
                     metadata.name,
                     metadata.size as f64 / (1024.0 * 1024.0)
                 );
 
-                let mut ft = self.file_transfer.write().await;
-                ft.handle_streaming_file_offer(peer_id, transfer_id, metadata)
-                    .await?;
+                if let Some(ref transfer_manager) = self.transfer_manager {
+                    let mut tm = transfer_manager.write().await;
+                    tm.handle_file_offer(peer_id, transfer_id, metadata).await?;
+                }
             }
 
-            MessageType::StreamingFileOfferResponse {
+            MessageType::SimpleFileOfferResponse {
                 transfer_id,
                 accepted,
-                reason,
-                suggested_config,
+                my_port,
             } => {
                 info!(
-                    "Received streaming offer response from {}: {}",
-                    peer_id, accepted
+                    "Received simple file offer response from {}: {} (port: {})",
+                    peer_id, accepted, my_port
                 );
 
-                if accepted {
-                    info!(
-                        "✅ Streaming offer {} accepted, setting up connection",
-                        transfer_id
-                    );
-
-                    // Check if peer is still connected
-                    if !self.is_peer_connected(peer_id) {
-                        warn!(
-                            "❌ Peer {} is not connected, cannot start streaming transfer",
-                            peer_id
-                        );
-                        return Ok(());
-                    }
-
-                    let mut ft = self.file_transfer.write().await;
-                    ft.initiate_streaming_connection(peer_id, transfer_id, suggested_config)
+                if let Some(ref transfer_manager) = self.transfer_manager {
+                    let mut tm = transfer_manager.write().await;
+                    tm.handle_offer_response(peer_id, transfer_id, accepted, my_port)
                         .await?;
-                } else {
-                    warn!(
-                        "🚫 Streaming offer {} rejected by peer {}: {:?}",
-                        transfer_id, peer_id, reason
-                    );
                 }
             }
 
-            MessageType::StreamingConnectionRequest { transfer_id, port } => {
-                info!(
-                    "Received streaming connection request for transfer {}",
-                    transfer_id
-                );
-                self.handle_streaming_connection_request(peer_id, transfer_id, port)
-                    .await?;
-            }
-
-            MessageType::StreamingConnectionResponse {
-                transfer_id,
-                accepted,
-                port,
-                reason,
-            } => {
-                if accepted {
-                    if let Some(port) = port {
-                        info!(
-                            "Streaming connection approved for transfer {} on port {}",
-                            transfer_id, port
-                        );
-                        self.initiate_streaming_connection(peer_id, transfer_id, port)
-                            .await?;
-                    }
-                } else {
-                    warn!(
-                        "Streaming connection rejected for transfer {}: {:?}",
-                        transfer_id, reason
-                    );
-                }
-            }
-
-            MessageType::StreamingTransferComplete {
+            MessageType::SimpleTransferComplete {
                 transfer_id,
                 bytes_transferred,
-                chunks_received,
-                file_hash,
+                duration_seconds,
+                average_speed_mbps,
             } => {
                 info!(
-                    "✅ Streaming transfer {} completed: {} bytes, {} chunks",
-                    transfer_id, bytes_transferred, chunks_received
+                    "✅ Transfer {} completed: {} bytes in {:.1}s at {:.1}MB/s",
+                    transfer_id, bytes_transferred, duration_seconds, average_speed_mbps
                 );
-                // Handle completion notification
+
+                // Clean up pending transfer
+                self.pending_transfers.remove(&transfer_id);
             }
 
-            MessageType::StreamingTransferError {
-                transfer_id,
-                error,
-                chunk_index,
-            } => {
-                error!(
-                    "❌ Streaming transfer {} failed: {} (chunk: {:?})",
-                    transfer_id, error, chunk_index
-                );
-                // Handle error notification
+            MessageType::SimpleTransferError { transfer_id, error } => {
+                error!("❌ Transfer {} failed: {}", transfer_id, error);
+
+                // Clean up pending transfer
+                self.pending_transfers.remove(&transfer_id);
             }
 
             MessageType::FileRequest {
@@ -953,104 +895,6 @@ impl PeerManager {
                 }
             }
 
-            MessageType::FileOffer {
-                transfer_id,
-                metadata,
-            } => {
-                info!(
-                    "✅ Processing incoming FileOffer from {}: {}",
-                    peer_id, metadata.name
-                );
-
-                // Handle the file offer
-                let mut ft = self.file_transfer.write().await;
-                ft.handle_file_offer(peer_id, transfer_id, metadata).await?;
-
-                // Create and send the response
-                let response = ft.create_file_offer_response(transfer_id, true, None);
-                drop(ft); // Release the lock
-
-                // Send the response
-                if let Some(conn) = self.connections.get(&peer_id) {
-                    if let Err(e) = conn.send(response) {
-                        error!(
-                            "Failed to send FileOfferResponse to peer {}: {}",
-                            peer_id, e
-                        );
-                    } else {
-                        info!("✅ Sent FileOfferResponse to peer {}", peer_id);
-                    }
-                } else {
-                    error!(
-                        "No connection found for peer {} to send FileOfferResponse",
-                        peer_id
-                    );
-                }
-            }
-
-            MessageType::FileOfferResponse {
-                transfer_id,
-                accepted,
-                reason,
-            } => {
-                info!(
-                    "Received file offer response from {}: {}",
-                    peer_id, accepted
-                );
-                let mut ft = self.file_transfer.write().await;
-                ft.handle_file_offer_response(peer_id, transfer_id, accepted, reason)
-                    .await?;
-            }
-
-            MessageType::FileChunk { transfer_id, chunk } => {
-                let mut ft = self.file_transfer.write().await;
-                ft.handle_file_chunk(peer_id, transfer_id, chunk).await?;
-            }
-
-            MessageType::TransferComplete {
-                transfer_id,
-                checksum,
-            } => {
-                info!(
-                    "✅ Received TransferComplete for transfer {} from peer {}",
-                    transfer_id, peer_id
-                );
-
-                // Check if we already processed this completion
-                let ft = self.file_transfer.read().await;
-                if let Some(transfer) = ft.active_transfers.get(&transfer_id) {
-                    if matches!(transfer.status, TransferStatus::Completed) {
-                        info!(
-                            "✅ Transfer {} already marked as complete, ignoring duplicate",
-                            transfer_id
-                        );
-                        return Ok(());
-                    }
-                }
-                drop(ft);
-
-                let mut ft = self.file_transfer.write().await;
-                ft.handle_transfer_complete(peer_id, transfer_id, checksum)
-                    .await?;
-            }
-
-            MessageType::TransferError { transfer_id, error } => {
-                error!("Transfer error from {}: {}", peer_id, error);
-                let mut ft = self.file_transfer.write().await;
-                ft.handle_transfer_error(peer_id, transfer_id, error)
-                    .await?;
-            }
-
-            MessageType::FileChunkAck {
-                transfer_id,
-                chunk_index,
-            } => {
-                debug!(
-                    "Received chunk ack for transfer {} chunk {}",
-                    transfer_id, chunk_index
-                );
-            }
-
             _ => {
                 debug!(
                     "Unhandled message type from {}: {:?}",
@@ -1058,84 +902,6 @@ impl PeerManager {
                 );
             }
         }
-        Ok(())
-    }
-
-    async fn handle_streaming_connection_request(
-        &mut self,
-        peer_id: Uuid,
-        transfer_id: Uuid,
-        requested_port: u16,
-    ) -> Result<()> {
-        info!(
-            "Setting up streaming connection for transfer {} from peer {}",
-            transfer_id, peer_id
-        );
-
-        // We can either use the requested port or assign our own
-        let port = if requested_port == 0 {
-            0 // Let system assign
-        } else {
-            requested_port
-        };
-
-        // For now, accept all streaming connections
-        // In production, you might want additional validation
-
-        if let Some(conn) = self.connections.get(&peer_id) {
-            let response = Message::new(MessageType::StreamingConnectionResponse {
-                transfer_id,
-                accepted: true,
-                port: Some(self.settings.network.port), // Use our main port for now
-                reason: None,
-            });
-
-            let _ = conn.send(response);
-            info!(
-                "✅ Approved streaming connection for transfer {}",
-                transfer_id
-            );
-        }
-
-        Ok(())
-    }
-
-    // NEW: Initiate streaming connection
-    async fn initiate_streaming_connection(
-        &mut self,
-        peer_id: Uuid,
-        transfer_id: Uuid,
-        port: u16,
-    ) -> Result<()> {
-        info!(
-            "Initiating streaming connection to peer {} on port {} for transfer {}",
-            peer_id, port, transfer_id
-        );
-
-        // Get peer address
-        if let Some(peer) = self.peers.get(&peer_id) {
-            let mut streaming_addr = peer.device_info.addr;
-            streaming_addr.set_port(port);
-
-            // Get connection from pool
-            let ft = self.file_transfer.read().await;
-            if let Some(connection_pool) = ft.get_connection_pool() {
-                match connection_pool
-                    .get_connection(peer_id, streaming_addr)
-                    .await
-                {
-                    Ok(stream) => {
-                        info!("✅ Got streaming connection for transfer {}", transfer_id);
-                        // The actual streaming will be handled by the StreamingTransferManager
-                    }
-                    Err(e) => {
-                        error!("❌ Failed to get streaming connection: {}", e);
-                        return Err(e);
-                    }
-                }
-            }
-        }
-
         Ok(())
     }
 
@@ -1151,7 +917,6 @@ impl PeerManager {
             request_id, file_path, target_path
         );
 
-        // Check if the requested file exists
         if !file_path.exists() {
             warn!("Requested file does not exist: {:?}", file_path);
             let response = Message::new(MessageType::FileRequestResponse {
@@ -1177,45 +942,12 @@ impl PeerManager {
             let _ = conn.send(response);
         }
 
-        info!(
-            "File request accepted, starting file transfer to peer {} for file: {:?}",
-            peer_id, file_path
-        );
+        info!("File request accepted, starting adaptive file transfer");
 
-        // Extract target directory
-        let target_dir = Self::extract_target_directory(&target_path);
-
-        info!("Target directory extracted: {:?}", target_dir);
-
-        // Start file transfer with target directory
-        let mut ft = self.file_transfer.write().await;
-        ft.send_file_with_target_dir(peer_id, file_path, target_dir)
-            .await?;
+        // Start simplified file transfer
+        self.send_file_to_peer(peer_id, file_path).await?;
 
         Ok(())
-    }
-
-    fn extract_target_directory(target_path: &PathBuf) -> Option<String> {
-        let target_str = target_path.to_string_lossy();
-        info!("Extracting directory from target path: '{}'", target_str);
-
-        // Handle both Windows and Unix paths manually for cross-platform compatibility
-        let path_separators = ['/', '\\'];
-
-        // Find the last path separator
-        if let Some(last_sep_pos) = target_str.rfind(&path_separators[..]) {
-            let dir_path = &target_str[..last_sep_pos];
-            info!("Extracted directory: '{}'", dir_path);
-
-            if dir_path.is_empty() {
-                None
-            } else {
-                Some(dir_path.to_string())
-            }
-        } else {
-            info!("No path separator found, no directory to extract");
-            None
-        }
     }
 }
 
@@ -1246,11 +978,9 @@ impl PeerConnection {
     }
 
     async fn write_message(&mut self, message: &Message) -> Result<()> {
-        // Serialize the message
         let message_data = bincode::serialize(message)?;
         let message_len = message_data.len() as u32;
 
-        // Write length first, then data
         self.stream.write_all(&message_len.to_be_bytes()).await?;
         self.stream.write_all(&message_data).await?;
         self.stream.flush().await?;
@@ -1259,21 +989,17 @@ impl PeerConnection {
     }
 
     async fn read_message(&mut self) -> Result<Message> {
-        // Read message length first (4 bytes)
         let mut len_bytes = [0u8; 4];
         self.stream.read_exact(&mut len_bytes).await?;
         let message_len = u32::from_be_bytes(len_bytes) as usize;
 
-        // Validate message length to prevent memory attacks
         if message_len > 100_000_000 {
             return Err(FileshareError::Transfer("Message too large".to_string()));
         }
 
-        // Read the message data
         let mut message_data = vec![0u8; message_len];
         self.stream.read_exact(&mut message_data).await?;
 
-        // Deserialize the message
         let message: Message = bincode::deserialize(&message_data)?;
 
         Ok(message)
@@ -1282,21 +1008,17 @@ impl PeerConnection {
 
 impl PeerConnectionReadHalf {
     async fn read_message(&mut self) -> Result<Message> {
-        // Read message length first (4 bytes)
         let mut len_bytes = [0u8; 4];
         self.stream.read_exact(&mut len_bytes).await?;
         let message_len = u32::from_be_bytes(len_bytes) as usize;
 
-        // Validate message length to prevent memory attacks
         if message_len > 100_000_000 {
             return Err(FileshareError::Transfer("Message too large".to_string()));
         }
 
-        // Read the message data
         let mut message_data = vec![0u8; message_len];
         self.stream.read_exact(&mut message_data).await?;
 
-        // Deserialize the message
         let message: Message = bincode::deserialize(&message_data)?;
 
         Ok(message)
@@ -1305,11 +1027,9 @@ impl PeerConnectionReadHalf {
 
 impl PeerConnectionWriteHalf {
     async fn write_message(&mut self, message: &Message) -> Result<()> {
-        // Serialize the message
         let message_data = bincode::serialize(message)?;
         let message_len = message_data.len() as u32;
 
-        // Write length first, then data
         self.stream.write_all(&message_len.to_be_bytes()).await?;
         self.stream.write_all(&message_data).await?;
         self.stream.flush().await?;

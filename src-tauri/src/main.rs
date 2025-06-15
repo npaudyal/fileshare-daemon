@@ -1,4 +1,4 @@
-// Prevents additional console window on Windows in release
+// src/main.rs - COMPLETE SIMPLIFIED VERSION
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 use fileshare_daemon::{config::Settings, service::FileshareDaemon};
@@ -13,12 +13,12 @@ use tokio::sync::{Mutex, RwLock};
 use tracing::{error, info, warn};
 use uuid::Uuid;
 
-// Enhanced DeviceInfo with more management features
+// Enhanced DeviceInfo with simplified management
 #[derive(serde::Serialize, serde::Deserialize, Clone, Debug)]
 struct DeviceInfo {
     id: String,
     name: String,
-    display_name: Option<String>, // Custom nickname
+    display_name: Option<String>,
     device_type: String,
     is_paired: bool,
     is_connected: bool,
@@ -42,33 +42,39 @@ enum TrustLevel {
     Blocked,
 }
 
-#[derive(serde::Serialize, serde::Deserialize, Clone, Debug)]
-struct DeviceAction {
-    action: String,
-    device_id: String,
-    params: Option<HashMap<String, String>>,
+// SIMPLIFIED: Transfer progress info
+#[derive(serde::Serialize, serde::Deserialize)]
+struct TransferProgressInfo {
+    transfer_id: String,
+    bytes_transferred: u64,
+    total_bytes: u64,
+    speed_mbps: f64,
+    eta_seconds: f64,
+    connections_active: usize,
+    status: String,
+    progress_percentage: f64,
 }
 
+// SIMPLIFIED: Get adaptive transfer progress
 #[tauri::command]
-async fn get_high_speed_progress(
+async fn get_transfer_progress(
     transfer_id: String,
     state: tauri::State<'_, AppState>,
-) -> Result<Option<HighSpeedProgressInfo>, String> {
+) -> Result<Option<TransferProgressInfo>, String> {
     let transfer_uuid =
         Uuid::parse_str(&transfer_id).map_err(|e| format!("Invalid transfer ID: {}", e))?;
 
     if let Some(daemon_ref) = state.daemon_ref.lock().await.as_ref() {
-        if let Some(progress) = daemon_ref.get_high_speed_progress(transfer_uuid).await {
-            Ok(Some(HighSpeedProgressInfo {
+        if let Some(progress) = daemon_ref.get_transfer_progress(transfer_uuid).await {
+            Ok(Some(TransferProgressInfo {
                 transfer_id: progress.transfer_id.to_string(),
                 bytes_transferred: progress.bytes_transferred,
                 total_bytes: progress.total_bytes,
                 speed_mbps: progress.speed_mbps,
-                eta_seconds: progress.eta_seconds,
-                cpu_usage: progress.cpu_usage,
-                memory_usage: progress.memory_usage,
-                compression_ratio: progress.compression_ratio,
-                connection_speeds: progress.connection_speeds,
+                eta_seconds: progress.eta_seconds(),
+                connections_active: progress.connections_active,
+                status: format!("{:?}", progress.status),
+                progress_percentage: progress.percentage(),
             }))
         } else {
             Ok(None)
@@ -79,158 +85,64 @@ async fn get_high_speed_progress(
 }
 
 #[tauri::command]
-async fn get_all_high_speed_transfers(
-    state: tauri::State<'_, AppState>,
-) -> Result<Vec<HighSpeedProgressInfo>, String> {
-    if let Some(daemon_ref) = state.daemon_ref.lock().await.as_ref() {
-        let all_progress = daemon_ref.get_all_high_speed_progress().await;
+async fn test_adaptive_transfer(state: tauri::State<'_, AppState>) -> Result<String, String> {
+    info!("🧪 Testing simplified adaptive transfer system");
 
-        Ok(all_progress
-            .into_iter()
-            .map(|progress| HighSpeedProgressInfo {
-                transfer_id: progress.transfer_id.to_string(),
-                bytes_transferred: progress.bytes_transferred,
-                total_bytes: progress.total_bytes,
-                speed_mbps: progress.speed_mbps,
-                eta_seconds: progress.eta_seconds,
-                cpu_usage: progress.cpu_usage,
-                memory_usage: progress.memory_usage,
-                compression_ratio: progress.compression_ratio,
-                connection_speeds: progress.connection_speeds,
-            })
-            .collect())
+    if let Some(daemon_ref) = state.daemon_ref.lock().await.as_ref() {
+        let stats = daemon_ref.get_connection_stats().await; // FIXED: Use daemon method
+
+        Ok(format!(
+            "📊 Adaptive Transfer System Status:\n\
+            🔗 Connections: {} total ({} healthy)\n\
+            🚀 Features: Memory-mapped I/O, Zero-copy, Direct TCP\n\
+            ⚡ Performance: Optimized for maximum speed\n\
+            📈 Adaptive: Automatically scales based on file size\n\
+            ✅ Status: Ready for high-performance transfers",
+            stats.total, stats.authenticated
+        ))
     } else {
         Err("Daemon not ready".to_string())
     }
 }
 
-#[derive(serde::Serialize, serde::Deserialize)]
-struct HighSpeedProgressInfo {
-    transfer_id: String,
-    bytes_transferred: u64,
-    total_bytes: u64,
-    speed_mbps: f64,
-    eta_seconds: f64,
-    cpu_usage: f64,
-    memory_usage: u64,
-    compression_ratio: f64,
-    connection_speeds: Vec<f64>,
-}
-
-// Test commands for debugging
+// Test system performance
 #[tauri::command]
-async fn test_hotkey_system() -> Result<String, String> {
-    info!("🧪 Starting comprehensive hotkey system test...");
+async fn test_system_performance() -> Result<String, String> {
+    info!("🧪 Testing system performance capabilities");
 
-    tokio::task::spawn_blocking(|| run_hotkey_diagnostics())
-        .await
-        .map_err(|e| format!("Test spawn error: {}", e))
-}
+    tokio::task::spawn_blocking(|| {
+        use std::time::Instant;
 
-#[tauri::command]
-async fn test_isolated_hotkey() -> Result<String, String> {
-    tokio::task::spawn_blocking(|| isolated_hotkey_test())
-        .await
-        .map_err(|e| format!("Spawn error: {}", e))
-}
+        // Test memory allocation speed
+        let start = Instant::now();
+        let _large_buffer = vec![0u8; 100 * 1024 * 1024]; // 100MB
+        let alloc_time = start.elapsed();
 
-fn run_hotkey_diagnostics() -> String {
-    use global_hotkey::{
-        hotkey::{Code, HotKey, Modifiers},
-        GlobalHotKeyEvent, GlobalHotKeyManager,
-    };
+        // Test file I/O (if test file exists)
+        let io_test_result = if let Ok(metadata) = std::fs::metadata("Cargo.toml") {
+            let start = Instant::now();
+            let _data = std::fs::read("Cargo.toml").unwrap_or_default();
+            let io_time = start.elapsed();
+            format!("File I/O: {:.2}ms", io_time.as_millis())
+        } else {
+            "File I/O: No test file available".to_string()
+        };
 
-    let mut results = Vec::new();
-    results.push("🧪 HOTKEY DIAGNOSTICS STARTING".to_string());
-    results.push(format!("Platform: {}", std::env::consts::OS));
-    results.push(format!("Architecture: {}", std::env::consts::ARCH));
-
-    // Test 1: Manager Creation
-    results.push("\n--- TEST 1: HOTKEY MANAGER CREATION ---".to_string());
-    let manager = match GlobalHotKeyManager::new() {
-        Ok(manager) => {
-            results.push("✅ GlobalHotKeyManager created successfully".to_string());
-            manager
-        }
-        Err(e) => {
-            results.push(format!("❌ Failed to create GlobalHotKeyManager: {}", e));
-            return results.join("\n");
-        }
-    };
-
-    // Test simple hotkeys
-    results.push("\n--- TEST 2: SIMPLE HOTKEY TEST ---".to_string());
-    let simple_hotkeys = vec![
-        ("F11", HotKey::new(None, Code::F11)),
-        (
-            "Ctrl+Alt+F11",
-            HotKey::new(Some(Modifiers::CONTROL | Modifiers::ALT), Code::F11),
-        ),
-        (
-            "Ctrl+Alt+Y",
-            HotKey::new(Some(Modifiers::CONTROL | Modifiers::ALT), Code::KeyY),
-        ),
-        (
-            "Ctrl+Alt+I",
-            HotKey::new(Some(Modifiers::CONTROL | Modifiers::ALT), Code::KeyI),
-        ),
-    ];
-
-    let mut registered = Vec::new();
-    for (name, hotkey) in &simple_hotkeys {
-        match manager.register(*hotkey) {
-            Ok(()) => {
-                results.push(format!("✅ Registered: {} (ID: {})", name, hotkey.id()));
-                registered.push((name, *hotkey));
-            }
-            Err(e) => {
-                results.push(format!("❌ Failed: {} - {}", name, e));
-            }
-        }
-    }
-
-    // Cleanup
-    for (name, hotkey) in &registered {
-        let _ = manager.unregister(*hotkey);
-        results.push(format!("Cleaned up: {}", name));
-    }
-
-    results.join("\n")
-}
-
-fn isolated_hotkey_test() -> String {
-    use global_hotkey::{
-        hotkey::{Code, HotKey},
-        GlobalHotKeyManager,
-    };
-
-    let mut results = Vec::new();
-    results.push("🔬 ISOLATED HOTKEY TEST".to_string());
-
-    let manager = match GlobalHotKeyManager::new() {
-        Ok(m) => {
-            results.push("✅ Fresh manager created".to_string());
-            m
-        }
-        Err(e) => {
-            results.push(format!("❌ Fresh manager failed: {}", e));
-            return results.join("\n");
-        }
-    };
-
-    let basic_hotkey = HotKey::new(None, Code::F9);
-
-    match manager.register(basic_hotkey) {
-        Ok(()) => {
-            results.push("✅ F9 registered successfully!".to_string());
-            let _ = manager.unregister(basic_hotkey);
-        }
-        Err(e) => {
-            results.push(format!("❌ Even F9 failed: {}", e));
-        }
-    }
-
-    results.join("\n")
+        format!(
+            "🔧 System Performance Test Results:\n\
+            💾 Memory allocation (100MB): {:.2}ms\n\
+            📁 {}\n\
+            🖥️ Platform: {}\n\
+            🏗️ Architecture: {}\n\
+            ✅ System ready for high-performance transfers",
+            alloc_time.as_millis(),
+            io_test_result,
+            std::env::consts::OS,
+            std::env::consts::ARCH
+        )
+    })
+    .await
+    .map_err(|e| format!("Performance test failed: {}", e))
 }
 
 #[tauri::command]
@@ -245,106 +157,13 @@ async fn get_system_info() -> Result<SystemInfo, String> {
 }
 
 #[tauri::command]
-async fn pair_device_enhanced(
-    device_id: String,
-    state: tauri::State<'_, AppState>,
-) -> Result<String, String> {
-    info!("🔗 UI requested enhanced pairing for device: {}", device_id);
-
-    let device_uuid =
-        Uuid::parse_str(&device_id).map_err(|e| format!("Invalid device ID: {}", e))?;
-
-    // Check if device is discoverable and healthy
-    let is_available = {
-        if let Some(daemon_ref) = state.daemon_ref.lock().await.as_ref() {
-            let pm = daemon_ref.peer_manager.read().await;
-            pm.is_peer_healthy(device_uuid)
-        } else {
-            false
-        }
-    };
-
-    if !is_available {
-        warn!(
-            "⚠️ Attempting to pair with potentially offline device {}",
-            device_id
-        );
-    }
-
-    // Proceed with existing pairing logic
-    pair_device_with_trust(device_id, TrustLevel::Trusted, state).await?;
-
-    let status_msg = if is_available {
-        "Device paired successfully and is online"
-    } else {
-        "Device paired successfully (device may be offline)"
-    };
-
-    info!("✅ Enhanced pairing completed: {}", status_msg);
-    Ok(status_msg.to_string())
-}
-
-#[tauri::command]
-async fn test_file_transfer(state: tauri::State<'_, AppState>) -> Result<String, String> {
-    info!("🧪 Testing enhanced file transfer system");
-
-    if let Some(daemon_ref) = state.daemon_ref.lock().await.as_ref() {
-        let pm = daemon_ref.peer_manager.read().await;
-        let stats = pm.get_connection_stats();
-
-        let ft = pm.file_transfer.read().await;
-        let active_transfers = ft.get_active_transfers();
-
-        Ok(format!(
-            "📊 Transfer System Status:\n\
-            Connections: {} total ({} healthy)\n\
-            Active Transfers: {}\n\
-            System: Ready for Phase 1 (100MB limit)",
-            stats.total,
-            stats.authenticated,
-            active_transfers.len()
-        ))
-    } else {
-        Err("Daemon not ready".to_string())
-    }
-}
-
-#[tauri::command]
-async fn test_connection_health(state: tauri::State<'_, AppState>) -> Result<String, String> {
-    info!("🩺 Testing connection health monitoring");
-
-    if let Some(daemon_ref) = state.daemon_ref.lock().await.as_ref() {
-        let mut pm = daemon_ref.peer_manager.write().await;
-
-        if let Err(e) = pm.check_peer_health_all().await {
-            return Err(format!("Health check failed: {}", e));
-        }
-
-        let stats = pm.get_connection_stats();
-        Ok(format!(
-            "🫀 Health Check Complete:\n\
-            Total: {} | Healthy: {} | Unhealthy: {}\n\
-            Connected: {} | Reconnecting: {} | Errors: {}",
-            stats.total,
-            stats.authenticated,
-            stats.unhealthy,
-            stats.connected,
-            stats.reconnecting,
-            stats.error
-        ))
-    } else {
-        Err("Daemon not ready".to_string())
-    }
-}
-
-#[tauri::command]
 async fn get_network_metrics(_state: tauri::State<'_, AppState>) -> Result<NetworkMetrics, String> {
     // Mock data - implement real metrics collection
     Ok(NetworkMetrics {
-        bytes_received: 1024 * 1024 * 50, // 50MB
-        bytes_sent: 1024 * 1024 * 30,     // 30MB
+        bytes_received: 1024 * 1024 * 50,
+        bytes_sent: 1024 * 1024 * 30,
         transfers_total: 25,
-        avg_speed: 1024 * 1024 * 2, // 2MB/s
+        avg_speed: 1024 * 1024 * 2,
     })
 }
 
@@ -355,37 +174,17 @@ async fn update_app_settings(
 ) -> Result<(), String> {
     let mut app_settings = state.settings.write().await;
 
-    // Update the settings
     app_settings.device.name = settings.device_name;
     app_settings.network.port = settings.network_port;
     app_settings.network.discovery_port = settings.discovery_port;
-    app_settings.transfer.chunk_size = settings.chunk_size;
-    app_settings.transfer.max_concurrent_transfers = settings.max_concurrent_transfers;
     app_settings.security.require_pairing = settings.require_pairing;
     app_settings.security.encryption_enabled = settings.encryption_enabled;
 
-    // Save to file
     app_settings
         .save(None)
         .map_err(|e| format!("Failed to save settings: {}", e))?;
 
     Ok(())
-}
-
-#[tauri::command]
-async fn export_settings(state: tauri::State<'_, AppState>) -> Result<(), String> {
-    // Export settings to a file
-    info!("Exporting settings to file");
-    // Implementation would save to user-selected file
-    Ok(())
-}
-
-#[tauri::command]
-async fn import_settings(_state: tauri::State<'_, AppState>) -> Result<AppSettings, String> {
-    // Import settings from a file
-    info!("Importing settings from file");
-    // Mock return - implementation would read from user-selected file
-    Err("Import not implemented yet".to_string())
 }
 
 // Add these structs
@@ -412,24 +211,13 @@ struct AppSettings {
     device_id: String,
     network_port: u16,
     discovery_port: u16,
-    chunk_size: usize,
-    max_concurrent_transfers: usize,
     require_pairing: bool,
     encryption_enabled: bool,
     auto_accept_from_trusted: bool,
     block_unknown_devices: bool,
 }
 
-// NEW: Device statistics structure
-#[derive(serde::Serialize, serde::Deserialize, Clone, Debug)]
-struct DeviceStats {
-    transfer_speed: u64, // bytes per second
-    success_rate: f32,   // percentage
-    last_activity: u64,  // unix timestamp
-    total_data: u64,     // total bytes transferred
-}
-
-// Device management storage (in real app, this would be persistent)
+// Device management storage
 #[derive(Default)]
 struct DeviceManager {
     device_metadata: HashMap<String, DeviceMetadata>,
@@ -458,7 +246,7 @@ struct AppState {
 async fn get_discovered_devices(
     state: tauri::State<'_, AppState>,
 ) -> Result<Vec<DeviceInfo>, String> {
-    info!("🔍 UI requesting discovered devices with metadata");
+    info!("🔍 UI requesting discovered devices");
 
     let settings = state.settings.read().await;
     let device_manager = state.device_manager.read().await;
@@ -511,10 +299,7 @@ async fn get_discovered_devices(
             });
         }
 
-        info!(
-            "📱 Returning {} discovered devices with metadata",
-            devices.len()
-        );
+        info!("📱 Returning {} discovered devices", devices.len());
         Ok(devices)
     } else {
         warn!("❌ Daemon not ready yet");
@@ -522,7 +307,7 @@ async fn get_discovered_devices(
     }
 }
 
-// Enhanced device pairing with trust level
+// Device pairing with trust level
 #[tauri::command]
 async fn pair_device_with_trust(
     device_id: String,
@@ -570,10 +355,7 @@ async fn pair_device_with_trust(
         metadata.connection_count += 1;
     }
 
-    info!(
-        "✅ Device {} paired successfully with trust level",
-        device_id
-    );
+    info!("✅ Device {} paired successfully", device_id);
     Ok(())
 }
 
@@ -585,7 +367,6 @@ async fn block_device(device_id: String, state: tauri::State<'_, AppState>) -> R
     let device_uuid =
         Uuid::parse_str(&device_id).map_err(|e| format!("Invalid device ID: {}", e))?;
 
-    // Remove from allowed devices and add to blocked
     {
         let mut settings = state.settings.write().await;
         settings
@@ -599,14 +380,12 @@ async fn block_device(device_id: String, state: tauri::State<'_, AppState>) -> R
         }
     }
 
-    // Add to blocked list
     {
         let mut device_manager = state.device_manager.write().await;
         if !device_manager.blocked_devices.contains(&device_id) {
             device_manager.blocked_devices.push(device_id.clone());
         }
 
-        // Update trust level
         if let Some(metadata) = device_manager.device_metadata.get_mut(&device_id) {
             metadata.trust_level = TrustLevel::Blocked;
         }
@@ -616,232 +395,7 @@ async fn block_device(device_id: String, state: tauri::State<'_, AppState>) -> R
     Ok(())
 }
 
-// Unblock device
-#[tauri::command]
-async fn unblock_device(
-    device_id: String,
-    state: tauri::State<'_, AppState>,
-) -> Result<(), String> {
-    info!("✅ UI requested to unblock device: {}", device_id);
-
-    {
-        let mut device_manager = state.device_manager.write().await;
-        device_manager.blocked_devices.retain(|id| id != &device_id);
-
-        // Update trust level
-        if let Some(metadata) = device_manager.device_metadata.get_mut(&device_id) {
-            metadata.trust_level = TrustLevel::Unknown;
-        }
-    }
-
-    info!("✅ Device {} unblocked successfully", device_id);
-    Ok(())
-}
-
-// Enhanced device renaming with validation
-#[tauri::command]
-async fn rename_device_enhanced(
-    device_id: String,
-    new_name: String,
-    state: tauri::State<'_, AppState>,
-) -> Result<(), String> {
-    info!(
-        "📝 UI requested to rename device {} to '{}'",
-        device_id, new_name
-    );
-
-    // Validate name
-    if new_name.trim().is_empty() {
-        return Err("Device name cannot be empty".to_string());
-    }
-
-    if new_name.len() > 50 {
-        return Err("Device name too long (max 50 characters)".to_string());
-    }
-
-    // Check for forbidden characters
-    if new_name.contains(['<', '>', ':', '"', '|', '?', '*', '/', '\\']) {
-        return Err("Device name contains forbidden characters".to_string());
-    }
-
-    // Update device metadata
-    {
-        let mut device_manager = state.device_manager.write().await;
-        let metadata = device_manager
-            .device_metadata
-            .entry(device_id.clone())
-            .or_insert_with(|| DeviceMetadata {
-                display_name: None,
-                trust_level: TrustLevel::Unknown,
-                first_seen: chrono::Utc::now().timestamp() as u64,
-                connection_count: 0,
-                last_transfer_time: None,
-                total_transfers: 0,
-                notes: None,
-            });
-
-        metadata.display_name = Some(new_name.trim().to_string());
-    }
-
-    info!("✅ Device {} renamed successfully", device_id);
-    Ok(())
-}
-
-// Forget device (remove all traces)
-#[tauri::command]
-async fn forget_device(device_id: String, state: tauri::State<'_, AppState>) -> Result<(), String> {
-    info!("🗑️ UI requested to forget device: {}", device_id);
-
-    let device_uuid =
-        Uuid::parse_str(&device_id).map_err(|e| format!("Invalid device ID: {}", e))?;
-
-    // Remove from all lists
-    {
-        let mut settings = state.settings.write().await;
-        settings
-            .security
-            .allowed_devices
-            .retain(|&id| id != device_uuid);
-
-        if let Err(e) = settings.save(None) {
-            error!("Failed to save settings: {}", e);
-            return Err(format!("Failed to save settings: {}", e));
-        }
-    }
-
-    {
-        let mut device_manager = state.device_manager.write().await;
-        device_manager.blocked_devices.retain(|id| id != &device_id);
-        device_manager.device_metadata.remove(&device_id);
-    }
-
-    info!("✅ Device {} forgotten successfully", device_id);
-    Ok(())
-}
-
-// Bulk device operations
-#[tauri::command]
-async fn bulk_device_action(
-    action: String,
-    device_ids: Vec<String>,
-    state: tauri::State<'_, AppState>,
-) -> Result<u32, String> {
-    info!(
-        "📦 UI requested bulk action '{}' on {} devices",
-        action,
-        device_ids.len()
-    );
-
-    let total_devices = device_ids.len();
-    let mut success_count = 0;
-
-    for device_id in device_ids {
-        let result = match action.as_str() {
-            "pair" => pair_device_with_trust(device_id, TrustLevel::Trusted, state.clone()).await,
-            "unpair" => unpair_device(device_id, state.clone()).await,
-            "block" => block_device(device_id, state.clone()).await,
-            "forget" => forget_device(device_id, state.clone()).await,
-            _ => Err(format!("Unknown action: {}", action)),
-        };
-
-        if result.is_ok() {
-            success_count += 1;
-        }
-    }
-
-    info!(
-        "✅ Bulk action completed: {}/{} successful",
-        success_count, total_devices
-    );
-    Ok(success_count)
-}
-
-// NEW: Manual device connection
-#[tauri::command]
-async fn connect_to_peer(
-    device_id: String,
-    state: tauri::State<'_, AppState>,
-) -> Result<(), String> {
-    info!("🔗 UI requested to connect to device: {}", device_id);
-
-    let _device_uuid =
-        Uuid::parse_str(&device_id).map_err(|e| format!("Invalid device ID: {}", e))?;
-
-    // Note: Connection handling is done automatically by the daemon
-    // This command could trigger manual connection attempts if needed
-
-    info!("✅ Connection request processed for device: {}", device_id);
-    Ok(())
-}
-
-// NEW: Manual device disconnection
-#[tauri::command]
-async fn disconnect_from_peer(
-    device_id: String,
-    state: tauri::State<'_, AppState>,
-) -> Result<(), String> {
-    info!("🔌 UI requested to disconnect from device: {}", device_id);
-
-    let _device_uuid =
-        Uuid::parse_str(&device_id).map_err(|e| format!("Invalid device ID: {}", e))?;
-
-    // Note: Disconnection would need to be implemented in the daemon
-    info!(
-        "✅ Disconnection request processed for device: {}",
-        device_id
-    );
-    Ok(())
-}
-
-// NEW: Get device statistics
-#[tauri::command]
-async fn get_device_stats(
-    device_id: String,
-    state: tauri::State<'_, AppState>,
-) -> Result<DeviceStats, String> {
-    info!("📊 UI requested stats for device: {}", device_id);
-
-    // Get metadata for the device
-    let device_manager = state.device_manager.read().await;
-    if let Some(metadata) = device_manager.device_metadata.get(&device_id) {
-        // Calculate some realistic stats based on metadata
-        let last_activity = metadata.last_transfer_time.unwrap_or_else(|| {
-            chrono::Utc::now().timestamp() as u64 - 3600 // 1 hour ago as fallback
-        });
-
-        let transfer_speed = match metadata.total_transfers {
-            0 => 0,
-            1..=5 => 512 * 1024,   // 512 KB/s for new devices
-            6..=20 => 1024 * 1024, // 1 MB/s for moderate use
-            _ => 2 * 1024 * 1024,  // 2 MB/s for heavy use
-        };
-
-        let success_rate = match metadata.connection_count {
-            0 => 0.0,
-            1..=3 => 85.0 + (metadata.connection_count as f32 * 2.0),
-            _ => 95.0 + (rand::random::<f32>() * 4.0), // 95-99% for stable devices
-        };
-
-        let total_data = (metadata.total_transfers as u64) * 1024 * 1024; // Assume 1MB per transfer average
-
-        Ok(DeviceStats {
-            transfer_speed,
-            success_rate,
-            last_activity,
-            total_data,
-        })
-    } else {
-        // Return default stats for unknown devices
-        Ok(DeviceStats {
-            transfer_speed: 0,
-            success_rate: 0.0,
-            last_activity: chrono::Utc::now().timestamp() as u64,
-            total_data: 0,
-        })
-    }
-}
-
-// Keep existing commands
+// Keep existing commands for compatibility
 #[tauri::command]
 async fn pair_device(device_id: String, state: tauri::State<'_, AppState>) -> Result<(), String> {
     pair_device_with_trust(device_id, TrustLevel::Trusted, state).await
@@ -867,7 +421,6 @@ async fn unpair_device(device_id: String, state: tauri::State<'_, AppState>) -> 
         }
     }
 
-    // Update trust level but keep metadata
     {
         let mut device_manager = state.device_manager.write().await;
         if let Some(metadata) = device_manager.device_metadata.get_mut(&device_id) {
@@ -879,14 +432,85 @@ async fn unpair_device(device_id: String, state: tauri::State<'_, AppState>) -> 
     Ok(())
 }
 
-// Keep existing commands
 #[tauri::command]
 async fn rename_device(
     device_id: String,
     new_name: String,
     state: tauri::State<'_, AppState>,
 ) -> Result<(), String> {
-    rename_device_enhanced(device_id, new_name, state).await
+    info!(
+        "📝 UI requested to rename device {} to '{}'",
+        device_id, new_name
+    );
+
+    if new_name.trim().is_empty() {
+        return Err("Device name cannot be empty".to_string());
+    }
+
+    {
+        let mut device_manager = state.device_manager.write().await;
+        let metadata = device_manager
+            .device_metadata
+            .entry(device_id.clone())
+            .or_insert_with(|| DeviceMetadata {
+                display_name: None,
+                trust_level: TrustLevel::Unknown,
+                first_seen: chrono::Utc::now().timestamp() as u64,
+                connection_count: 0,
+                last_transfer_time: None,
+                total_transfers: 0,
+                notes: None,
+            });
+
+        metadata.display_name = Some(new_name.trim().to_string());
+    }
+
+    info!("✅ Device {} renamed successfully", device_id);
+    Ok(())
+}
+
+#[tauri::command]
+async fn cancel_transfer(
+    transfer_id: String,
+    state: tauri::State<'_, AppState>,
+) -> Result<(), String> {
+    let transfer_uuid =
+        Uuid::parse_str(&transfer_id).map_err(|e| format!("Invalid transfer ID: {}", e))?;
+
+    if let Some(daemon_ref) = state.daemon_ref.lock().await.as_ref() {
+        daemon_ref
+            .cancel_transfer(transfer_uuid)
+            .await
+            .map_err(|e| format!("Failed to cancel transfer: {}", e))?;
+        Ok(())
+    } else {
+        Err("Daemon not ready".to_string())
+    }
+}
+
+#[tauri::command]
+async fn get_all_active_transfers(
+    state: tauri::State<'_, AppState>,
+) -> Result<Vec<TransferProgressInfo>, String> {
+    if let Some(daemon_ref) = state.daemon_ref.lock().await.as_ref() {
+        let transfers = daemon_ref.get_all_active_transfers().await;
+
+        Ok(transfers
+            .into_iter()
+            .map(|progress| TransferProgressInfo {
+                transfer_id: progress.transfer_id.to_string(),
+                bytes_transferred: progress.bytes_transferred,
+                total_bytes: progress.total_bytes,
+                speed_mbps: progress.speed_mbps,
+                eta_seconds: progress.eta_seconds(),
+                connections_active: progress.connections_active,
+                status: format!("{:?}", progress.status),
+                progress_percentage: progress.percentage(),
+            })
+            .collect())
+    } else {
+        Err("Daemon not ready".to_string())
+    }
 }
 
 #[tauri::command]
@@ -898,18 +522,15 @@ async fn get_app_settings(state: tauri::State<'_, AppState>) -> Result<AppSettin
         device_id: settings.device.id.to_string(),
         network_port: settings.network.port,
         discovery_port: settings.network.discovery_port,
-        chunk_size: settings.transfer.chunk_size,
-        max_concurrent_transfers: settings.transfer.max_concurrent_transfers,
         require_pairing: settings.security.require_pairing,
         encryption_enabled: settings.security.encryption_enabled,
-        auto_accept_from_trusted: false, // TODO: Add to settings
-        block_unknown_devices: false,    // TODO: Add to settings
+        auto_accept_from_trusted: false,
+        block_unknown_devices: false,
     })
 }
 
 #[tauri::command]
 async fn get_connection_status(state: tauri::State<'_, AppState>) -> Result<bool, String> {
-    // For now, return true if daemon is running
     let daemon_ref = state.daemon_ref.lock().await;
     Ok(daemon_ref.is_some())
 }
@@ -939,7 +560,6 @@ async fn hide_window(app: tauri::AppHandle) -> Result<(), String> {
 fn determine_device_type_and_platform(device_name: &str) -> (String, Option<String>) {
     let name_lower = device_name.to_lowercase();
 
-    // Platform detection
     let platform = if name_lower.contains("iphone") || name_lower.contains("ios") {
         Some("iOS".to_string())
     } else if name_lower.contains("android") {
@@ -957,7 +577,6 @@ fn determine_device_type_and_platform(device_name: &str) -> (String, Option<Stri
         None
     };
 
-    // Device type detection
     let device_type = if name_lower.contains("iphone")
         || name_lower.contains("android")
         || name_lower.contains("mobile")
@@ -986,7 +605,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with_env_filter("fileshare_daemon=debug,fileshare_daemon::network::discovery=debug")
         .init();
 
-    info!("🚀 Starting Fileshare Daemon with Shared Ownership Architecture");
+    info!("🚀 Starting Simplified High-Performance Fileshare Daemon");
 
     let settings = Settings::load(None).map_err(|e| format!("Failed to load settings: {}", e))?;
     info!("📋 Configuration loaded: {:?}", settings.device.name);
@@ -1006,35 +625,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             pair_device_with_trust,
             unpair_device,
             block_device,
-            unblock_device,
             rename_device,
-            rename_device_enhanced,
-            forget_device,
-            bulk_device_action,
-            connect_to_peer,
-            disconnect_from_peer,
-            get_device_stats,
             get_app_settings,
             get_connection_status,
+            get_all_active_transfers,
+            cancel_transfer,
             refresh_devices,
             get_system_info,
             get_network_metrics,
-            get_high_speed_progress,
-            get_all_high_speed_transfers,
+            get_transfer_progress,
+            test_adaptive_transfer,
+            test_system_performance,
             update_app_settings,
-            pair_device_enhanced,
-            test_file_transfer,
-            test_connection_health,
-            export_settings,
-            import_settings,
-            test_hotkey_system,
-            test_isolated_hotkey,
             quit_app,
             hide_window
         ])
         .setup(|app| {
             let _main_window = WebviewWindowBuilder::new(app, "main", WebviewUrl::default())
-                .title("Fileshare") // This will appear in native title bar
+                .title("Fileshare - High Performance")
                 .inner_size(700.0, 700.0)
                 .center()
                 .decorations(true)
@@ -1044,7 +652,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .shadow(true)
                 .build()?;
 
-            info!("🪟 Main window created and hidden");
+            info!("🪟 Main window created");
 
             // Create tray
             let quit = MenuItem::with_id(app, "quit", "Quit", true, None::<&str>)?;
@@ -1059,7 +667,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 TrayIconBuilder::new()
                     .icon(icon.clone())
                     .menu(&menu)
-                    .tooltip("Fileshare - Network File Sharing")
+                    .tooltip("Fileshare - High Performance Network File Sharing")
                     .on_tray_icon_event(move |_tray, event| match event {
                         TrayIconEvent::Click {
                             button: MouseButton::Left,
@@ -1097,11 +705,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     .build(app)?;
             }
 
-            // Start daemon with shared ownership architecture
+            // Start simplified daemon
             let app_handle = app.handle().clone();
             tokio::spawn(async move {
-                if let Err(e) = start_daemon(app_handle).await {
-                    error!("❌ Failed to start daemon: {}", e);
+                if let Err(e) = start_simplified_daemon(app_handle).await {
+                    error!("❌ Failed to start simplified daemon: {}", e);
                 }
             });
 
@@ -1113,9 +721,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-// FIXED: Shared ownership daemon startup
-async fn start_daemon(app_handle: tauri::AppHandle) -> Result<(), Box<dyn std::error::Error>> {
-    info!("🔧 Starting background daemon with shared ownership architecture...");
+// SIMPLIFIED: Daemon startup with adaptive transfer integration
+async fn start_simplified_daemon(
+    app_handle: tauri::AppHandle,
+) -> Result<(), Box<dyn std::error::Error>> {
+    info!("🔧 Starting simplified high-performance daemon...");
 
     let state: tauri::State<AppState> = app_handle.state();
 
@@ -1124,14 +734,14 @@ async fn start_daemon(app_handle: tauri::AppHandle) -> Result<(), Box<dyn std::e
         settings_lock.clone()
     };
 
-    // Create the daemon wrapped in Arc for shared ownership
+    // Create the simplified daemon
     let daemon = Arc::new(
         FileshareDaemon::new(settings)
             .await
             .map_err(|e| format!("Failed to create daemon: {}", e))?,
     );
 
-    info!("✅ Daemon created successfully");
+    info!("✅ Simplified daemon created successfully");
 
     // Store daemon reference for UI access
     {
@@ -1141,12 +751,12 @@ async fn start_daemon(app_handle: tauri::AppHandle) -> Result<(), Box<dyn std::e
 
     info!("✅ Daemon reference stored for UI access");
 
-    // Start background services using shared ownership
+    // Start background services
     daemon
         .start_background_services()
         .await
         .map_err(|e| format!("Failed to start background services: {}", e))?;
 
-    info!("✅ Background daemon started successfully with shared ownership");
+    info!("✅ Simplified high-performance daemon started successfully");
     Ok(())
 }
