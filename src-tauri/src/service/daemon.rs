@@ -323,7 +323,6 @@ impl FileshareDaemon {
         Ok(())
     }
 
-    // Simplified paste operation
     async fn handle_paste_operation_simplified(
         clipboard: ClipboardManager,
         peer_manager: Arc<RwLock<PeerManager>>,
@@ -336,22 +335,48 @@ impl FileshareDaemon {
             let (source_file_path, file_size) = {
                 let clipboard_state = clipboard.network_clipboard.read().await;
                 let item = clipboard_state.as_ref().unwrap();
-                (item.file_path.to_string_lossy().to_string(), item.file_size)
+                (item.file_path.clone(), item.file_size)
             };
 
             info!(
-                "🎯 Requesting file: {} ({:.1}MB)",
+                "🎯 Requesting file: {:?} ({:.1}MB)",
                 source_file_path,
                 file_size as f64 / (1024.0 * 1024.0)
             );
 
-            // Send simplified file request
-            let request_id = uuid::Uuid::new_v4();
+            // FIXED: Use SimpleFileOffer instead of FileRequest
+            let transfer_id = uuid::Uuid::new_v4();
+            let metadata = crate::network::protocol::SimpleFileMetadata {
+                name: source_file_path
+                    .file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .to_string(),
+                size: file_size,
+                transfer_id,
+                checksum: None,
+                mime_type: None,
+                target_dir: Some(
+                    target_path
+                        .parent()
+                        .unwrap_or_else(|| std::path::Path::new("."))
+                        .to_string_lossy()
+                        .to_string(),
+                ),
+            };
+
+            // Set up incoming transfer
+            {
+                let mut tm = transfer_manager.write().await;
+                tm.handle_file_offer(source_device, transfer_id, metadata.clone())
+                    .await?;
+            }
+
+            // Send SimpleFileOffer request (reverse offer)
             let message = crate::network::protocol::Message::new(
-                crate::network::protocol::MessageType::FileRequest {
-                    request_id,
-                    file_path: source_file_path,
-                    target_path: target_path.to_string_lossy().to_string(),
+                crate::network::protocol::MessageType::SimpleFileOffer {
+                    transfer_id,
+                    metadata,
                 },
             );
 
@@ -360,14 +385,14 @@ impl FileshareDaemon {
 
             notify_rust::Notification::new()
                 .summary("📁 File Transfer Starting")
-                .body("Requesting file from source device...")
+                .body("Requesting file using adaptive transfer...")
                 .timeout(notify_rust::Timeout::Milliseconds(3000))
                 .show()
                 .map_err(|e| {
                     crate::FileshareError::Unknown(format!("Notification error: {}", e))
                 })?;
 
-            info!("✅ File request sent to source device");
+            info!("✅ File transfer request sent using adaptive system");
         }
 
         Ok(())
