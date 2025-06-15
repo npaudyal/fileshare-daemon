@@ -1,4 +1,4 @@
-// src/service/adaptive_transfer.rs - COMPLETE FIXED VERSION
+// src/service/adaptive_transfer.rs - FIXED VERSION
 use crate::{config::Settings, network::protocol::*, FileshareError, Result};
 use memmap2::{Mmap, MmapOptions};
 use std::collections::HashMap;
@@ -8,12 +8,14 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpStream;
+use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
-// Simplified transfer configuration
+// Add transfer server port offset
+const TRANSFER_PORT_OFFSET: u16 = 100; // Transfer port = main_port + 100
+
 #[derive(Debug, Clone)]
 pub struct TransferConfig {
     pub max_connections: usize,
@@ -33,7 +35,6 @@ impl Default for TransferConfig {
     }
 }
 
-// Simple transfer state
 #[derive(Debug, Clone)]
 pub enum TransferStatus {
     Starting,
@@ -43,7 +44,6 @@ pub enum TransferStatus {
     Cancelled,
 }
 
-// Simplified progress tracking
 #[derive(Debug, Clone)]
 pub struct TransferProgress {
     pub transfer_id: Uuid,
@@ -72,16 +72,17 @@ impl TransferProgress {
     }
 }
 
-// Main adaptive transfer manager
 pub struct AdaptiveTransferManager {
     settings: Arc<Settings>,
     config: TransferConfig,
     active_transfers: HashMap<Uuid, Arc<TransferState>>,
     message_sender: Option<mpsc::UnboundedSender<(Uuid, Message)>>,
-    // Store pending file offers for lookup
     pending_offers: HashMap<Uuid, PendingOffer>,
-    // Store active incoming transfers for receiving
     incoming_transfers: HashMap<Uuid, IncomingTransfer>,
+
+    // NEW: Separate transfer server
+    transfer_listener: Option<TcpListener>,
+    transfer_port: u16,
 }
 
 #[derive(Debug, Clone)]
@@ -90,7 +91,7 @@ struct PendingOffer {
     peer_id: Uuid,
     metadata: SimpleFileMetadata,
     created_at: Instant,
-    peer_addr: Option<std::net::SocketAddr>, // Store peer address
+    peer_addr: Option<std::net::SocketAddr>,
 }
 
 #[derive(Debug)]
@@ -100,24 +101,32 @@ struct IncomingTransfer {
     metadata: SimpleFileMetadata,
     save_path: PathBuf,
     expected_connections: usize,
-    active_connections: Vec<TcpStream>,
+    received_chunks: HashMap<u64, Vec<u8>>,
     created_at: Instant,
 }
 
-// Internal transfer state with proper connection handling
 struct TransferState {
     transfer_id: Uuid,
     peer_id: Uuid,
     file_path: PathBuf,
     total_bytes: u64,
-    bytes_transferred: Arc<AtomicU64>, // Wrap in Arc for sharing
+    bytes_transferred: Arc<AtomicU64>,
     started_at: Instant,
     status: std::sync::RwLock<TransferStatus>,
-    connection_count: usize, // Store count instead of actual connections
+    connection_count: usize,
 }
 
 impl AdaptiveTransferManager {
     pub async fn new(settings: Arc<Settings>) -> Result<Self> {
+        let transfer_port = settings.network.port + TRANSFER_PORT_OFFSET;
+
+        // Create dedicated transfer listener
+        let transfer_listener = TcpListener::bind(format!("0.0.0.0:{}", transfer_port))
+            .await
+            .map_err(|e| FileshareError::Network(e))?;
+
+        info!("🚀 Transfer server listening on port {}", transfer_port);
+
         Ok(Self {
             settings,
             config: TransferConfig::default(),
@@ -125,22 +134,149 @@ impl AdaptiveTransferManager {
             message_sender: None,
             pending_offers: HashMap::new(),
             incoming_transfers: HashMap::new(),
+            transfer_listener: Some(transfer_listener),
+            transfer_port,
         })
+    }
+
+    // NEW: Start transfer server
+    pub async fn start_transfer_server(&mut self) -> Result<()> {
+        if let Some(listener) = self.transfer_listener.take() {
+            let incoming_transfers = Arc::new(tokio::sync::RwLock::new(HashMap::<
+                Uuid,
+                IncomingTransfer,
+            >::new()));
+
+            // Copy data for the server task
+            let server_incoming = incoming_transfers.clone();
+
+            tokio::spawn(async move {
+                info!("📡 Transfer server started, accepting connections...");
+
+                loop {
+                    match listener.accept().await {
+                        Ok((stream, addr)) => {
+                            info!("🔗 Transfer connection from {}", addr);
+
+                            let transfers = server_incoming.clone();
+                            tokio::spawn(async move {
+                                if let Err(e) =
+                                    Self::handle_transfer_connection(stream, transfers).await
+                                {
+                                    error!("❌ Transfer connection error: {}", e);
+                                }
+                            });
+                        }
+                        Err(e) => {
+                            error!("❌ Transfer server accept error: {}", e);
+                            tokio::time::sleep(Duration::from_secs(1)).await;
+                        }
+                    }
+                }
+            });
+
+            // Update local reference
+            self.incoming_transfers = HashMap::new(); // Will be managed by the server task
+        }
+
+        Ok(())
+    }
+
+    // NEW: Handle dedicated transfer connections
+    async fn handle_transfer_connection(
+        mut stream: TcpStream,
+        incoming_transfers: Arc<tokio::sync::RwLock<HashMap<Uuid, IncomingTransfer>>>,
+    ) -> Result<()> {
+        // Read transfer ID first
+        let mut transfer_id_bytes = [0u8; 16];
+        stream.read_exact(&mut transfer_id_bytes).await?;
+        let transfer_id = Uuid::from_bytes(transfer_id_bytes);
+
+        info!("📥 Transfer connection for transfer {}", transfer_id);
+
+        // Find the incoming transfer
+        let (save_path, metadata) = {
+            let transfers = incoming_transfers.read().await;
+            if let Some(incoming) = transfers.get(&transfer_id) {
+                (incoming.save_path.clone(), incoming.metadata.clone())
+            } else {
+                warn!("⚠️ No incoming transfer found for ID {}", transfer_id);
+                return Ok(());
+            }
+        };
+
+        // Start receiving chunks
+        Self::receive_chunks_dedicated(stream, save_path, metadata).await
+    }
+
+    // FIXED: Dedicated chunk receiving
+    async fn receive_chunks_dedicated(
+        mut stream: TcpStream,
+        save_path: PathBuf,
+        metadata: SimpleFileMetadata,
+    ) -> Result<()> {
+        info!(
+            "📥 Starting dedicated chunk receiver, saving to {:?}",
+            save_path
+        );
+
+        let mut received_chunks = HashMap::new();
+        let mut total_received = 0u64;
+
+        loop {
+            // Read chunk header
+            let chunk_index = match stream.read_u64().await {
+                Ok(idx) => idx,
+                Err(_) => break, // Connection closed
+            };
+
+            let chunk_size = stream.read_u32().await? as usize;
+
+            // Safety check
+            if chunk_size > 10 * 1024 * 1024 {
+                // 10MB max chunk
+                error!("❌ Chunk too large: {} bytes", chunk_size);
+                break;
+            }
+
+            // Read chunk data
+            let mut chunk_data = vec![0u8; chunk_size];
+            stream.read_exact(&mut chunk_data).await?;
+
+            // Store chunk
+            received_chunks.insert(chunk_index, chunk_data);
+            total_received += chunk_size as u64;
+
+            debug!("📥 Received chunk {} ({} bytes)", chunk_index, chunk_size);
+
+            // Check if we have all chunks
+            if total_received >= metadata.size {
+                break;
+            }
+        }
+
+        // Write all chunks to file in order
+        let mut output_file = tokio::fs::File::create(&save_path).await?;
+        let mut sorted_chunks: Vec<_> = received_chunks.into_iter().collect();
+        sorted_chunks.sort_by_key(|(idx, _)| *idx);
+
+        for (chunk_idx, chunk_data) in sorted_chunks {
+            use tokio::io::AsyncWriteExt;
+            output_file.write_all(&chunk_data).await?;
+            debug!("📝 Wrote chunk {} to file", chunk_idx);
+        }
+
+        output_file.flush().await?;
+        info!("✅ File received successfully: {:?}", save_path);
+
+        Ok(())
     }
 
     pub fn set_message_sender(&mut self, sender: mpsc::UnboundedSender<(Uuid, Message)>) {
         self.message_sender = Some(sender);
     }
 
-    // MAIN ENTRY POINT: Send file with adaptive strategy (legacy method)
-    pub async fn send_file(&mut self, peer_id: Uuid, file_path: PathBuf) -> Result<Uuid> {
-        // This method now needs a peer address - it should be called via send_file_with_address
-        Err(FileshareError::Transfer(
-            "Use send_file_with_address instead - peer address required".to_string(),
-        ))
-    }
-
-    // NEW: Send file with explicit peer address
+    // FIXED: Use transfer port in offer response
     pub async fn send_file_with_address(
         &mut self,
         peer_id: Uuid,
@@ -154,7 +290,6 @@ impl AdaptiveTransferManager {
             peer_addr, file_path
         );
 
-        // Get file info
         let file_size = std::fs::metadata(&file_path)?.len();
         if file_size == 0 {
             return Err(FileshareError::FileOperation(
@@ -162,7 +297,6 @@ impl AdaptiveTransferManager {
             ));
         }
 
-        // Create metadata with all required fields
         let metadata = SimpleFileMetadata {
             name: file_path
                 .file_name()
@@ -171,9 +305,9 @@ impl AdaptiveTransferManager {
                 .to_string(),
             size: file_size,
             transfer_id,
-            checksum: None,                               // Optional field
-            mime_type: Self::guess_mime_type(&file_path), // Add MIME type detection
-            target_dir: None,                             // Optional field
+            checksum: None,
+            mime_type: Self::guess_mime_type(&file_path),
+            target_dir: None,
         };
 
         info!(
@@ -183,7 +317,6 @@ impl AdaptiveTransferManager {
             peer_addr
         );
 
-        // Store pending offer with peer address
         self.pending_offers.insert(
             transfer_id,
             PendingOffer {
@@ -191,11 +324,10 @@ impl AdaptiveTransferManager {
                 peer_id,
                 metadata: metadata.clone(),
                 created_at: Instant::now(),
-                peer_addr: Some(peer_addr), // Store peer address
+                peer_addr: Some(peer_addr),
             },
         );
 
-        // Send offer to peer
         if let Some(ref sender) = self.message_sender {
             let offer = Message::new(MessageType::SimpleFileOffer {
                 transfer_id,
@@ -216,10 +348,100 @@ impl AdaptiveTransferManager {
         Ok(transfer_id)
     }
 
-    // Guess MIME type helper
+    // FIXED: Send transfer port in response
+    pub async fn handle_file_offer(
+        &mut self,
+        peer_id: Uuid,
+        transfer_id: Uuid,
+        metadata: SimpleFileMetadata,
+    ) -> Result<()> {
+        info!(
+            "📥 Received file offer: {} ({:.1}MB)",
+            metadata.name,
+            metadata.size as f64 / (1024.0 * 1024.0)
+        );
+
+        let save_path = self.get_save_path(&metadata.name, metadata.target_dir.as_deref())?;
+
+        let incoming_transfer = IncomingTransfer {
+            transfer_id,
+            peer_id,
+            metadata: metadata.clone(),
+            save_path: save_path.clone(),
+            expected_connections: self.calculate_optimal_params(metadata.size).1,
+            received_chunks: HashMap::new(),
+            created_at: Instant::now(),
+        };
+
+        self.incoming_transfers
+            .insert(transfer_id, incoming_transfer);
+
+        if let Some(ref sender) = self.message_sender {
+            let response = Message::new(MessageType::SimpleFileOfferResponse {
+                transfer_id,
+                accepted: true,
+                my_port: self.transfer_port, // Send transfer port, not main port
+            });
+
+            sender
+                .send((peer_id, response))
+                .map_err(|e| FileshareError::Transfer(format!("Failed to send response: {}", e)))?;
+
+            info!("✅ File offer accepted - will save to {:?}", save_path);
+        }
+
+        Ok(())
+    }
+
+    // FIXED: Connect to transfer port
+    pub async fn handle_offer_response(
+        &mut self,
+        peer_id: Uuid,
+        transfer_id: Uuid,
+        accepted: bool,
+        peer_transfer_port: u16,
+    ) -> Result<()> {
+        if !accepted {
+            info!("❌ File offer rejected by peer");
+            self.pending_offers.remove(&transfer_id);
+            return Ok(());
+        }
+
+        info!("✅ File offer accepted, starting transfer");
+
+        let pending_offer = self
+            .pending_offers
+            .remove(&transfer_id)
+            .ok_or_else(|| FileshareError::Transfer("Pending offer not found".to_string()))?;
+
+        // Use peer's transfer port, not main port
+        let target_addr = if let Some(peer_addr) = pending_offer.peer_addr {
+            let mut addr = peer_addr;
+            addr.set_port(peer_transfer_port); // Use transfer port
+            addr
+        } else {
+            return Err(FileshareError::Transfer(
+                "Peer address not stored in pending offer".to_string(),
+            ));
+        };
+
+        info!("🎯 Connecting to peer transfer port at {}", target_addr);
+
+        self.start_outgoing_transfer(
+            transfer_id,
+            peer_id,
+            target_addr,
+            pending_offer.file_path,
+            pending_offer.metadata.size,
+        )
+        .await
+    }
+
+    // Rest of the implementation remains the same...
+    // (keep all the existing methods like start_outgoing_transfer, start_mmap_transfer, etc.)
+
     fn guess_mime_type(file_path: &PathBuf) -> Option<String> {
         let extension = file_path.extension()?.to_str()?.to_lowercase();
-
         match extension.as_str() {
             "txt" => Some("text/plain".to_string()),
             "pdf" => Some("application/pdf".to_string()),
@@ -238,101 +460,7 @@ impl AdaptiveTransferManager {
         }
     }
 
-    // Handle incoming file offer
-    pub async fn handle_file_offer(
-        &mut self,
-        peer_id: Uuid,
-        transfer_id: Uuid,
-        metadata: SimpleFileMetadata,
-    ) -> Result<()> {
-        info!(
-            "📥 Received file offer: {} ({:.1}MB)",
-            metadata.name,
-            metadata.size as f64 / (1024.0 * 1024.0)
-        );
-
-        // Create save path
-        let save_path = self.get_save_path(&metadata.name, metadata.target_dir.as_deref())?;
-
-        // Store incoming transfer info
-        let incoming_transfer = IncomingTransfer {
-            transfer_id,
-            peer_id,
-            metadata: metadata.clone(),
-            save_path: save_path.clone(),
-            expected_connections: self.calculate_optimal_params(metadata.size).1,
-            active_connections: Vec::new(),
-            created_at: Instant::now(),
-        };
-
-        self.incoming_transfers
-            .insert(transfer_id, incoming_transfer);
-
-        // Auto-accept (in real app, you might want user confirmation)
-        if let Some(ref sender) = self.message_sender {
-            let response = Message::new(MessageType::SimpleFileOfferResponse {
-                transfer_id,
-                accepted: true,
-                my_port: self.settings.network.port,
-            });
-
-            sender
-                .send((peer_id, response))
-                .map_err(|e| FileshareError::Transfer(format!("Failed to send response: {}", e)))?;
-
-            info!("✅ File offer accepted - will save to {:?}", save_path);
-        }
-
-        Ok(())
-    }
-
-    // Handle offer response and start transfer
-    pub async fn handle_offer_response(
-        &mut self,
-        peer_id: Uuid,
-        transfer_id: Uuid,
-        accepted: bool,
-        peer_port: u16,
-    ) -> Result<()> {
-        if !accepted {
-            info!("❌ File offer rejected by peer");
-            self.pending_offers.remove(&transfer_id);
-            return Ok(());
-        }
-
-        info!("✅ File offer accepted, starting transfer");
-
-        // Get pending offer
-        let pending_offer = self
-            .pending_offers
-            .remove(&transfer_id)
-            .ok_or_else(|| FileshareError::Transfer("Pending offer not found".to_string()))?;
-
-        // Use stored peer address instead of looking it up
-        let target_addr = if let Some(peer_addr) = pending_offer.peer_addr {
-            let mut addr = peer_addr;
-            addr.set_port(peer_port);
-            addr
-        } else {
-            return Err(FileshareError::Transfer(
-                "Peer address not stored in pending offer".to_string(),
-            ));
-        };
-
-        info!("🎯 Connecting to peer at {}", target_addr);
-
-        // Start the actual transfer
-        self.start_outgoing_transfer(
-            transfer_id,
-            peer_id,
-            target_addr,
-            pending_offer.file_path,
-            pending_offer.metadata.size,
-        )
-        .await
-    }
-
-    // Start outgoing file transfer
+    // Keep all other existing methods unchanged...
     async fn start_outgoing_transfer(
         &mut self,
         transfer_id: Uuid,
@@ -343,16 +471,13 @@ impl AdaptiveTransferManager {
     ) -> Result<()> {
         info!("🚀 Starting outgoing transfer to {}", target_addr);
 
-        // Calculate optimal parameters
         let (chunk_size, connection_count) = self.calculate_optimal_params(file_size);
-
         info!(
             "📊 Using {} connections with {}KB chunks",
             connection_count,
             chunk_size / 1024
         );
 
-        // Create connections
         let mut connections = Vec::new();
         for i in 0..connection_count {
             match TcpStream::connect(target_addr).await {
@@ -377,22 +502,20 @@ impl AdaptiveTransferManager {
 
         info!("🔗 Created {} connections", connections.len());
 
-        // Create transfer state without storing connections
         let transfer_state = Arc::new(TransferState {
             transfer_id,
             peer_id,
             file_path: file_path.clone(),
             total_bytes: file_size,
-            bytes_transferred: Arc::new(AtomicU64::new(0)), // Wrap in Arc
+            bytes_transferred: Arc::new(AtomicU64::new(0)),
             started_at: Instant::now(),
             status: std::sync::RwLock::new(TransferStatus::Active),
-            connection_count: connections.len(), // Store count, not connections
+            connection_count: connections.len(),
         });
 
         self.active_transfers
             .insert(transfer_id, transfer_state.clone());
 
-        // Start the transfer based on file size
         if file_size > self.config.mmap_threshold {
             self.start_mmap_transfer(transfer_state, chunk_size, connections)
                 .await
@@ -402,7 +525,6 @@ impl AdaptiveTransferManager {
         }
     }
 
-    // HIGH PERFORMANCE: Memory-mapped file transfer with proper connection handling
     async fn start_mmap_transfer(
         &self,
         transfer_state: Arc<TransferState>,
@@ -430,10 +552,9 @@ impl AdaptiveTransferManager {
         let mmap = Arc::new(mmap);
         let mut handles = Vec::new();
 
-        // Distribute work directly to connections without cloning
         for (conn_id, stream) in connections.into_iter().enumerate() {
-            let mmap_ref = Arc::clone(&mmap); // Clone the Arc, not the Mmap
-            let bytes_counter = Arc::clone(&transfer_state.bytes_transferred); // Clone the Arc
+            let mmap_ref = Arc::clone(&mmap);
+            let bytes_counter = Arc::clone(&transfer_state.bytes_transferred);
             let transfer_id = transfer_state.transfer_id;
 
             let start_chunk = conn_id * chunks_per_connection;
@@ -457,22 +578,14 @@ impl AdaptiveTransferManager {
             handles.push(handle);
         }
 
-        // Wait for all connections to complete
         for (i, handle) in handles.into_iter().enumerate() {
             match handle.await {
-                Ok(Ok(_)) => {
-                    info!("✅ Connection {} completed successfully", i);
-                }
-                Ok(Err(e)) => {
-                    error!("❌ Connection {} failed: {}", i, e);
-                }
-                Err(e) => {
-                    error!("❌ Connection {} task panicked: {}", i, e);
-                }
+                Ok(Ok(_)) => info!("✅ Connection {} completed successfully", i),
+                Ok(Err(e)) => error!("❌ Connection {} failed: {}", i, e),
+                Err(e) => error!("❌ Connection {} task panicked: {}", i, e),
             }
         }
 
-        // Mark transfer as completed
         {
             let mut status = transfer_state.status.write().unwrap();
             *status = TransferStatus::Completed;
@@ -490,7 +603,6 @@ impl AdaptiveTransferManager {
         Ok(())
     }
 
-    // DIRECT chunk sending - no pipeline overhead!
     async fn send_chunks_direct(
         mut stream: TcpStream,
         mmap: Arc<Mmap>,
@@ -507,7 +619,7 @@ impl AdaptiveTransferManager {
             connection_id, start_chunk, end_chunk
         );
 
-        // Send transfer ID first so receiver knows which transfer this is
+        // Send transfer ID first
         stream.write_all(transfer_id.as_bytes()).await?;
 
         for chunk_idx in start_chunk..end_chunk {
@@ -515,18 +627,14 @@ impl AdaptiveTransferManager {
             let end = std::cmp::min(offset + chunk_size, file_size);
             let actual_chunk_size = end - offset;
 
-            // ZERO-COPY: Direct slice from mmap
             let chunk_data = &mmap[offset..end];
 
-            // Simple protocol: chunk_index (8 bytes) + size (4 bytes) + data
             stream.write_u64(chunk_idx as u64).await?;
             stream.write_u32(actual_chunk_size as u32).await?;
             stream.write_all(chunk_data).await?;
 
-            // Update progress
             bytes_counter.fetch_add(actual_chunk_size as u64, Ordering::Relaxed);
 
-            // Periodic flush for better network utilization
             if chunk_idx % 10 == 0 {
                 stream.flush().await?;
             }
@@ -537,9 +645,7 @@ impl AdaptiveTransferManager {
             );
         }
 
-        // Final flush
         stream.flush().await?;
-
         info!(
             "✅ Connection {} completed {} chunks",
             connection_id,
@@ -548,7 +654,6 @@ impl AdaptiveTransferManager {
         Ok(())
     }
 
-    // Fallback: Buffered transfer for smaller files
     async fn start_buffered_transfer(
         &self,
         transfer_state: Arc<TransferState>,
@@ -561,9 +666,7 @@ impl AdaptiveTransferManager {
         let mut buffer = vec![0u8; chunk_size];
         let mut chunk_index = 0u64;
 
-        // For smaller files, use single connection (take ownership)
         if let Some(mut stream) = connections.pop() {
-            // Send transfer ID first
             stream
                 .write_all(transfer_state.transfer_id.as_bytes())
                 .await?;
@@ -574,12 +677,10 @@ impl AdaptiveTransferManager {
                     break;
                 }
 
-                // Send chunk
                 stream.write_u64(chunk_index).await?;
                 stream.write_u32(bytes_read as u32).await?;
                 stream.write_all(&buffer[..bytes_read]).await?;
 
-                // Update progress
                 transfer_state
                     .bytes_transferred
                     .fetch_add(bytes_read as u64, Ordering::Relaxed);
@@ -594,7 +695,6 @@ impl AdaptiveTransferManager {
             stream.flush().await?;
         }
 
-        // Mark as completed
         {
             let mut status = transfer_state.status.write().unwrap();
             *status = TransferStatus::Completed;
@@ -604,110 +704,14 @@ impl AdaptiveTransferManager {
         Ok(())
     }
 
-    // Handle incoming transfer connections
-    pub async fn handle_incoming_connection(
-        &mut self,
-        mut stream: TcpStream,
-        _peer_addr: std::net::SocketAddr,
-    ) -> Result<()> {
-        info!("📥 Handling incoming transfer connection");
-
-        // Read transfer ID first
-        let mut transfer_id_bytes = [0u8; 16];
-        stream.read_exact(&mut transfer_id_bytes).await?;
-        let transfer_id = Uuid::from_bytes(transfer_id_bytes);
-
-        info!("📥 Incoming connection for transfer {}", transfer_id);
-
-        // Find the incoming transfer
-        if let Some(incoming) = self.incoming_transfers.get_mut(&transfer_id) {
-            // Start receiving data on this connection
-            let save_path = incoming.save_path.clone();
-            let metadata = incoming.metadata.clone();
-
-            tokio::spawn(async move {
-                if let Err(e) =
-                    Self::receive_chunks_on_connection(stream, save_path, metadata).await
-                {
-                    error!("❌ Failed to receive chunks: {}", e);
-                }
-            });
-
-            info!(
-                "✅ Started receiving on connection for transfer {}",
-                transfer_id
-            );
-        } else {
-            warn!("⚠️ No incoming transfer found for ID {}", transfer_id);
-        }
-
-        Ok(())
-    }
-
-    // Receive chunks on a single connection
-    async fn receive_chunks_on_connection(
-        mut stream: TcpStream,
-        save_path: PathBuf,
-        metadata: SimpleFileMetadata,
-    ) -> Result<()> {
-        info!("📥 Starting to receive chunks, saving to {:?}", save_path);
-
-        let mut received_chunks = HashMap::new();
-        let mut total_received = 0u64;
-
-        // Create the output file
-        let mut output_file = tokio::fs::File::create(&save_path).await?;
-
-        loop {
-            // Read chunk header
-            let chunk_index = match stream.read_u64().await {
-                Ok(idx) => idx,
-                Err(_) => break, // Connection closed
-            };
-
-            let chunk_size = stream.read_u32().await? as usize;
-
-            // Read chunk data
-            let mut chunk_data = vec![0u8; chunk_size];
-            stream.read_exact(&mut chunk_data).await?;
-
-            // Store chunk (in a real implementation, you'd write chunks in order)
-            received_chunks.insert(chunk_index, chunk_data);
-            total_received += chunk_size as u64;
-
-            debug!("📥 Received chunk {} ({} bytes)", chunk_index, chunk_size);
-
-            // Check if we have all chunks (simplified - assumes sequential chunks)
-            if total_received >= metadata.size {
-                break;
-            }
-        }
-
-        // Write all chunks to file in order
-        let mut sorted_chunks: Vec<_> = received_chunks.into_iter().collect();
-        sorted_chunks.sort_by_key(|(idx, _)| *idx);
-
-        for (chunk_idx, chunk_data) in sorted_chunks {
-            use tokio::io::AsyncWriteExt;
-            output_file.write_all(&chunk_data).await?;
-            debug!("📝 Wrote chunk {} to file", chunk_idx);
-        }
-
-        output_file.flush().await?;
-        info!("✅ File received successfully: {:?}", save_path);
-
-        Ok(())
-    }
-
-    // Calculate optimal parameters based on file size
     fn calculate_optimal_params(&self, file_size: u64) -> (usize, usize) {
         let file_mb = file_size / (1024 * 1024);
 
         let (chunk_size, connections) = match file_mb {
-            0..=10 => (512 * 1024, 1),          // 512KB chunks, 1 connection
-            11..=100 => (1024 * 1024, 2),       // 1MB chunks, 2 connections
-            101..=1000 => (2 * 1024 * 1024, 3), // 2MB chunks, 3 connections
-            _ => (4 * 1024 * 1024, 4),          // 4MB chunks, 4 connections
+            0..=10 => (512 * 1024, 1),
+            11..=100 => (1024 * 1024, 2),
+            101..=1000 => (2 * 1024 * 1024, 3),
+            _ => (4 * 1024 * 1024, 4),
         };
 
         (
@@ -716,13 +720,11 @@ impl AdaptiveTransferManager {
         )
     }
 
-    // Optimize TCP socket for bulk transfer
     async fn optimize_tcp_socket(&self, stream: &TcpStream) -> Result<()> {
         stream.set_nodelay(true)?;
         Ok(())
     }
 
-    // Get save path for incoming files
     fn get_save_path(&self, filename: &str, target_dir: Option<&str>) -> Result<PathBuf> {
         let save_dir = if let Some(target_dir_str) = target_dir {
             let target_path = PathBuf::from(target_dir_str);
@@ -741,7 +743,6 @@ impl AdaptiveTransferManager {
 
         let mut save_path = save_dir.join(filename);
 
-        // Handle duplicate files
         let mut counter = 1;
         while save_path.exists() {
             let stem = std::path::Path::new(filename)
@@ -773,7 +774,6 @@ impl AdaptiveTransferManager {
             })
     }
 
-    // Get transfer progress
     pub fn get_progress(&self, transfer_id: Uuid) -> Option<TransferProgress> {
         if let Some(state) = self.active_transfers.get(&transfer_id) {
             let bytes_transferred = state.bytes_transferred.load(Ordering::Relaxed);
@@ -791,7 +791,7 @@ impl AdaptiveTransferManager {
                 bytes_transferred,
                 total_bytes: state.total_bytes,
                 speed_mbps: speed,
-                connections_active: state.connection_count, // Use stored count
+                connections_active: state.connection_count,
                 started_at: state.started_at,
                 status,
             })
@@ -800,7 +800,6 @@ impl AdaptiveTransferManager {
         }
     }
 
-    // Cleanup completed transfers
     pub fn cleanup_completed_transfers(&mut self) {
         let initial_count = self.active_transfers.len();
 
@@ -812,12 +811,9 @@ impl AdaptiveTransferManager {
             )
         });
 
-        // Clean up old pending offers
-        let cutoff = Instant::now() - Duration::from_secs(300); // 5 minutes
+        let cutoff = Instant::now() - Duration::from_secs(300);
         self.pending_offers
             .retain(|_, offer| offer.created_at > cutoff);
-
-        // Clean up old incoming transfers
         self.incoming_transfers
             .retain(|_, transfer| transfer.created_at > cutoff);
 
@@ -827,7 +823,6 @@ impl AdaptiveTransferManager {
         }
     }
 
-    // Get all active transfer progress
     pub fn get_all_active_progress(&self) -> Vec<TransferProgress> {
         self.active_transfers
             .keys()
@@ -835,7 +830,6 @@ impl AdaptiveTransferManager {
             .collect()
     }
 
-    // Cancel a transfer
     pub fn cancel_transfer(&mut self, transfer_id: Uuid) -> Result<()> {
         if let Some(state) = self.active_transfers.get(&transfer_id) {
             let mut status = state.status.write().unwrap();
@@ -843,16 +837,12 @@ impl AdaptiveTransferManager {
             info!("🛑 Transfer {} cancelled", transfer_id);
         }
 
-        // Remove pending offer if exists
         self.pending_offers.remove(&transfer_id);
-
-        // Remove incoming transfer if exists
         self.incoming_transfers.remove(&transfer_id);
 
         Ok(())
     }
 
-    // Get transfer statistics
     pub fn get_stats(&self) -> TransferStats {
         TransferStats {
             active_outgoing: self.active_transfers.len(),
@@ -867,7 +857,6 @@ impl AdaptiveTransferManager {
     }
 }
 
-// Transfer statistics
 #[derive(Debug, Clone)]
 pub struct TransferStats {
     pub active_outgoing: usize,

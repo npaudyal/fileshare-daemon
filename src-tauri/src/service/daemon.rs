@@ -79,6 +79,12 @@ impl FileshareDaemon {
         info!("🏷️ Device Name: {}", self.settings.device.name);
         info!("🌐 Listening on port: {}", self.settings.network.port);
 
+        {
+            let mut tm = self.transfer_manager.write().await;
+            tm.start_transfer_server().await?;
+            info!("✅ Transfer server started");
+        }
+
         // Start hotkey manager
         let mut hotkey_manager = HotkeyManager::new()?;
         let peer_manager_for_hotkeys = self.peer_manager.clone();
