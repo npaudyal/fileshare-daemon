@@ -70,6 +70,7 @@ pub struct PeerManager {
 
     // Track pending transfers for file path lookup
     pending_transfers: HashMap<Uuid, PendingTransfer>,
+    pub pending_file_requests: HashMap<Uuid, PendingFileRequest>,
 }
 
 #[derive(Debug, Clone)]
@@ -77,6 +78,14 @@ struct PendingTransfer {
     file_path: PathBuf,
     peer_id: Uuid,
     created_at: Instant,
+}
+
+#[derive(Debug, Clone)]
+pub struct PendingFileRequest {
+    pub request_id: Uuid,
+    pub target_dir: PathBuf,
+    pub original_file_path: PathBuf,
+    pub created_at: Instant,
 }
 
 impl PeerManager {
@@ -118,6 +127,7 @@ impl PeerManager {
             message_rx,
             connections: HashMap::new(),
             pending_transfers: HashMap::new(),
+            pending_file_requests: HashMap::new(), // NEW
         })
     }
 
@@ -757,9 +767,19 @@ impl PeerManager {
         self.pending_transfers
             .retain(|_, pt| pt.created_at > cutoff);
 
+        // NEW: Clean up pending file requests
+        let initial_requests = self.pending_file_requests.len();
+        self.pending_file_requests
+            .retain(|_, req| req.created_at > cutoff);
+
         let removed = initial_count - self.pending_transfers.len();
-        if removed > 0 {
-            debug!("🧹 Cleaned up {} old pending transfers", removed);
+        let removed_requests = initial_requests - self.pending_file_requests.len();
+
+        if removed > 0 || removed_requests > 0 {
+            debug!(
+                "🧹 Cleaned up {} old pending transfers and {} old pending requests",
+                removed, removed_requests
+            );
         }
     }
 
@@ -834,11 +854,72 @@ impl PeerManager {
                 transfer_id,
             } => {
                 if accepted {
-                    info!(
-                        "✅ File request {} accepted with transfer {}",
-                        request_id,
-                        transfer_id.unwrap_or_default()
-                    );
+                    if let Some(transfer_id) = transfer_id {
+                        info!(
+                            "✅ File request {} accepted with transfer {}",
+                            request_id, transfer_id
+                        );
+
+                        // FIXED: Get the stored request details
+                        if let Some(pending_request) =
+                            self.pending_file_requests.remove(&request_id)
+                        {
+                            info!(
+                                "📂 Using stored target directory: {:?}",
+                                pending_request.target_dir
+                            );
+
+                            // Set up incoming transfer record with correct target directory
+                            if let Some(ref transfer_manager) = self.transfer_manager {
+                                if let Some(clipboard_item) = {
+                                    let clipboard_guard = clipboard.network_clipboard.read().await;
+                                    clipboard_guard.clone()
+                                } {
+                                    // Create the actual target file path
+                                    let filename = pending_request
+                                        .original_file_path
+                                        .file_name()
+                                        .unwrap_or_default()
+                                        .to_string_lossy()
+                                        .to_string();
+                                    let target_file_path =
+                                        pending_request.target_dir.join(&filename);
+
+                                    let metadata = crate::network::protocol::SimpleFileMetadata {
+                                        name: filename,
+                                        size: clipboard_item.file_size,
+                                        transfer_id,
+                                        checksum: None,
+                                        mime_type: None,
+                                        target_dir: Some(
+                                            pending_request
+                                                .target_dir
+                                                .to_string_lossy()
+                                                .to_string(),
+                                        ),
+                                    };
+
+                                    // Set up the incoming transfer record
+                                    let mut tm = transfer_manager.write().await;
+                                    tm.handle_file_offer(peer_id, transfer_id, metadata)
+                                        .await
+                                        .map_err(|e| {
+                                            warn!("Failed to set up incoming transfer: {}", e)
+                                        })
+                                        .ok();
+
+                                    info!(
+                                        "✅ Set up incoming transfer record for {} -> {:?}",
+                                        transfer_id, target_file_path
+                                    );
+                                }
+                            }
+                        } else {
+                            warn!("⚠️ No pending request found for {}", request_id);
+                        }
+                    } else {
+                        warn!("❌ File request accepted but no transfer ID provided");
+                    }
                 } else {
                     warn!("❌ File request {} rejected: {:?}", request_id, reason);
                 }

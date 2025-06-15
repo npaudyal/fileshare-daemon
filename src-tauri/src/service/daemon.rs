@@ -323,6 +323,7 @@ impl FileshareDaemon {
         Ok(())
     }
 
+    // In daemon.rs - Update handle_paste_operation_simplified
     async fn handle_paste_operation_simplified(
         clipboard: ClipboardManager,
         peer_manager: Arc<RwLock<PeerManager>>,
@@ -335,21 +336,42 @@ impl FileshareDaemon {
             let (source_file_path, file_size) = {
                 let clipboard_state = clipboard.network_clipboard.read().await;
                 let item = clipboard_state.as_ref().unwrap();
-                (item.file_path.to_string_lossy().to_string(), item.file_size)
+                (item.file_path.clone(), item.file_size)
             };
 
             info!(
-                "🎯 Requesting file: {} ({:.1}MB)",
+                "🎯 Requesting file: {:?} ({:.1}MB)",
                 source_file_path,
                 file_size as f64 / (1024.0 * 1024.0)
             );
 
-            // FIXED: Send SimpleFileRequest instead of SimpleFileOffer
             let request_id = uuid::Uuid::new_v4();
+
+            // Store the pending request details for later use
+            {
+                let mut pm = peer_manager.write().await;
+                let pending_request = crate::network::peer::PendingFileRequest {
+                    request_id,
+                    target_dir: target_path
+                        .parent()
+                        .unwrap_or_else(|| std::path::Path::new("."))
+                        .to_path_buf(),
+                    original_file_path: source_file_path.clone(),
+                    created_at: std::time::Instant::now(),
+                };
+
+                pm.pending_file_requests.insert(request_id, pending_request);
+                info!(
+                    "📝 Stored pending request {} with target dir: {:?}",
+                    request_id,
+                    target_path.parent()
+                );
+            }
+
             let message = crate::network::protocol::Message::new(
                 crate::network::protocol::MessageType::SimpleFileRequest {
                     request_id,
-                    file_path: source_file_path,
+                    file_path: source_file_path.to_string_lossy().to_string(),
                     target_dir: target_path
                         .parent()
                         .unwrap_or_else(|| std::path::Path::new("."))
