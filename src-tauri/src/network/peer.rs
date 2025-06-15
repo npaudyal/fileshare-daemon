@@ -121,6 +121,10 @@ impl PeerManager {
         })
     }
 
+    pub fn get_peer_address_for_transfer(&self, peer_id: Uuid) -> Option<std::net::SocketAddr> {
+        self.peers.get(&peer_id).map(|peer| peer.device_info.addr)
+    }
+
     // Set transfer manager reference
     pub async fn set_transfer_manager(
         &mut self,
@@ -506,7 +510,6 @@ impl PeerManager {
         Ok(())
     }
 
-    // SIMPLIFIED: Send file using adaptive transfer manager
     pub async fn send_file_to_peer(
         &mut self,
         peer_id: Uuid,
@@ -523,9 +526,16 @@ impl PeerManager {
             ));
         }
 
+        // Get peer address for the transfer
+        let peer_addr = peer.device_info.addr;
+
         if let Some(ref transfer_manager) = self.transfer_manager {
             let mut tm = transfer_manager.write().await;
-            let transfer_id = tm.send_file(peer_id, file_path.clone()).await?;
+
+            // NEW: Pass peer address to transfer manager
+            let transfer_id = tm
+                .send_file_with_address(peer_id, file_path.clone(), peer_addr)
+                .await?;
 
             // Store pending transfer for lookup
             self.pending_transfers.insert(
@@ -537,7 +547,10 @@ impl PeerManager {
                 },
             );
 
-            info!("✅ File transfer {} initiated", transfer_id);
+            info!(
+                "✅ File transfer {} initiated to {}",
+                transfer_id, peer_addr
+            );
             Ok(())
         } else {
             Err(FileshareError::Transfer(
@@ -944,7 +957,7 @@ impl PeerManager {
 
         info!("File request accepted, starting adaptive file transfer");
 
-        // Start simplified file transfer
+        // FIXED: Use the new method with address
         self.send_file_to_peer(peer_id, file_path).await?;
 
         Ok(())

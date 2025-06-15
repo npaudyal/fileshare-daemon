@@ -471,13 +471,17 @@ impl FileshareDaemon {
             }
         });
 
-        // Connection handling
+        // UPDATED: Enhanced connection handling for adaptive transfers
         let connection_pm = peer_manager.clone();
+        let connection_tm = transfer_manager.clone();
         let connection_handle = tokio::spawn(async move {
             loop {
                 match listener.accept().await {
                     Ok((stream, addr)) => {
                         info!("🔗 New connection from {}", addr);
+
+                        // Check if this is a regular peer connection or adaptive transfer connection
+                        // For now, treat all as peer connections - adaptive transfers will use separate ports
                         let pm = connection_pm.clone();
 
                         tokio::spawn(async move {
