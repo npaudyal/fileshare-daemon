@@ -58,7 +58,7 @@ pub struct ConnectionStats {
 }
 
 pub struct PeerManager {
-    settings: Arc<Settings>,
+    pub settings: Arc<Settings>,
     peers: HashMap<Uuid, Peer>,
     pub file_transfer: Arc<RwLock<FileTransferManager>>,
     pub message_tx: mpsc::UnboundedSender<(Uuid, Message)>,

@@ -49,6 +49,74 @@ struct DeviceAction {
     params: Option<HashMap<String, String>>,
 }
 
+#[tauri::command]
+async fn get_high_speed_progress(
+    transfer_id: String,
+    state: tauri::State<'_, AppState>,
+) -> Result<Option<HighSpeedProgressInfo>, String> {
+    let transfer_uuid =
+        Uuid::parse_str(&transfer_id).map_err(|e| format!("Invalid transfer ID: {}", e))?;
+
+    if let Some(daemon_ref) = state.daemon_ref.lock().await.as_ref() {
+        if let Some(progress) = daemon_ref.get_high_speed_progress(transfer_uuid).await {
+            Ok(Some(HighSpeedProgressInfo {
+                transfer_id: progress.transfer_id.to_string(),
+                bytes_transferred: progress.bytes_transferred,
+                total_bytes: progress.total_bytes,
+                speed_mbps: progress.speed_mbps,
+                eta_seconds: progress.eta_seconds,
+                cpu_usage: progress.cpu_usage,
+                memory_usage: progress.memory_usage,
+                compression_ratio: progress.compression_ratio,
+                connection_speeds: progress.connection_speeds,
+            }))
+        } else {
+            Ok(None)
+        }
+    } else {
+        Err("Daemon not ready".to_string())
+    }
+}
+
+#[tauri::command]
+async fn get_all_high_speed_transfers(
+    state: tauri::State<'_, AppState>,
+) -> Result<Vec<HighSpeedProgressInfo>, String> {
+    if let Some(daemon_ref) = state.daemon_ref.lock().await.as_ref() {
+        let all_progress = daemon_ref.get_all_high_speed_progress().await;
+
+        Ok(all_progress
+            .into_iter()
+            .map(|progress| HighSpeedProgressInfo {
+                transfer_id: progress.transfer_id.to_string(),
+                bytes_transferred: progress.bytes_transferred,
+                total_bytes: progress.total_bytes,
+                speed_mbps: progress.speed_mbps,
+                eta_seconds: progress.eta_seconds,
+                cpu_usage: progress.cpu_usage,
+                memory_usage: progress.memory_usage,
+                compression_ratio: progress.compression_ratio,
+                connection_speeds: progress.connection_speeds,
+            })
+            .collect())
+    } else {
+        Err("Daemon not ready".to_string())
+    }
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct HighSpeedProgressInfo {
+    transfer_id: String,
+    bytes_transferred: u64,
+    total_bytes: u64,
+    speed_mbps: f64,
+    eta_seconds: f64,
+    cpu_usage: f64,
+    memory_usage: u64,
+    compression_ratio: f64,
+    connection_speeds: Vec<f64>,
+}
+
 // Test commands for debugging
 #[tauri::command]
 async fn test_hotkey_system() -> Result<String, String> {
@@ -951,6 +1019,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             refresh_devices,
             get_system_info,
             get_network_metrics,
+            get_high_speed_progress,
+            get_all_high_speed_transfers,
             update_app_settings,
             pair_device_enhanced,
             test_file_transfer,

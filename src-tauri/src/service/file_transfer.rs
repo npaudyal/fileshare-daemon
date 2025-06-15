@@ -12,6 +12,8 @@ use tokio::sync::mpsc;
 use tokio::time::sleep;
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
+use crate::network::high_speed_streaming::{HighSpeedStreamingManager, HighSpeedConfig};
+
 
 // FIXED: Much more generous timeouts for large files
 const MAX_FILE_SIZE_PHASE1: u64 = 100 * 1024 * 1024; // 100MB limit for Phase 1
@@ -126,6 +128,9 @@ pub struct FileTransferManager {
     // PRODUCTION: Replace circular reference with callbacks
     peer_address_callback: Option<PeerAddressCallback>,
     peer_connected_callback: Option<PeerConnectedCallback>,
+    
+    // High speed streaming manager
+    high_speed_manager: Option<HighSpeedStreamingManager>,
 }
 
 #[derive(Debug, Clone)]
@@ -158,6 +163,10 @@ impl FileTransferManager {
         // Create connection pool
         let connection_pool = Arc::new(ConnectionPoolManager::new());
 
+        let high_speed_config = HighSpeedConfig::default();
+        let high_speed_manager = HighSpeedStreamingManager::new(high_speed_config).await?;
+        
+
         Ok(Self {
             settings,
             active_transfers: HashMap::new(),
@@ -169,6 +178,7 @@ impl FileTransferManager {
             // PRODUCTION: Initialize callbacks as None
             peer_address_callback: None,
             peer_connected_callback: None,
+            high_speed_manager: Some(high_speed_manager),
         })
     }
 
@@ -325,6 +335,13 @@ impl FileTransferManager {
 
         Ok(())
     }
+    pub async fn get_high_speed_progress(&self, transfer_id: Uuid) -> Option<crate::network::HighSpeedProgress> {
+        if let Some(ref manager) = self.high_speed_manager {
+            manager.get_progress(transfer_id).await
+        } else {
+            None
+        }
+    }
 
     fn store_streaming_transfer_metadata(
         &mut self,
@@ -425,69 +442,55 @@ impl FileTransferManager {
         peer_id: Uuid,
         file_path: PathBuf,
     ) -> Result<()> {
-        info!(
-            "🚀 SMART_SEND: Starting validated file transfer to {}: {:?}",
-            peer_id, file_path
-        );
+        info!("🚀 SMART_SEND: Starting validated file transfer to {}: {:?}", peer_id, file_path);
 
-        // Basic file checks
+        // File validation
         if !file_path.exists() {
-            return Err(FileshareError::FileOperation(
-                "File does not exist".to_string(),
-            ));
+            return Err(FileshareError::FileOperation("File does not exist".to_string()));
         }
 
-        if !file_path.is_file() {
-            return Err(FileshareError::FileOperation(
-                "Path is not a file".to_string(),
-            ));
-        }
-
-        let file_size = std::fs::metadata(&file_path)
-            .map_err(|e| FileshareError::FileOperation(format!("Cannot access file: {}", e)))?
-            .len();
-
+        let file_size = std::fs::metadata(&file_path)?.len();
         if file_size == 0 {
-            return Err(FileshareError::FileOperation(
-                "Cannot transfer empty files".to_string(),
-            ));
+            return Err(FileshareError::FileOperation("Cannot transfer empty files".to_string()));
         }
 
-        // FIXED: Smart routing based on file size with proper limits
-        if file_size <= STREAMING_THRESHOLD {
-            // Small files: Use chunked transfer
-            info!(
-                "📦 Using CHUNKED transfer for small file ({:.1}MB ≤ 50MB)",
-                file_size as f64 / (1024.0 * 1024.0)
-            );
-
-            // Apply chunked transfer limit
-            if file_size > MAX_FILE_SIZE_CHUNKED {
-                return Err(FileshareError::FileOperation(format!(
-                    "File size ({:.1} MB) exceeds chunked transfer limit ({} MB). Use streaming for large files.",
-                    file_size as f64 / (1024.0 * 1024.0),
-                    MAX_FILE_SIZE_CHUNKED / (1024 * 1024)
-                )));
+        // ENHANCED: Smart routing with 3 tiers
+        match file_size {
+            // Tier 1: Small files (< 50MB) - Use chunked transfer
+            0..=52_428_800 => {
+                info!("📦 Using CHUNKED transfer for small file ({:.1}MB)", 
+                      file_size as f64 / (1024.0 * 1024.0));
+                self.send_file_chunked(peer_id, file_path).await
             }
-
-            self.send_file_chunked(peer_id, file_path).await
-        } else {
-            // Large files: Use streaming transfer
-            info!(
-                "🚀 Using STREAMING transfer for large file ({:.1}MB > 50MB)",
-                file_size as f64 / (1024.0 * 1024.0)
-            );
-
-            // Apply streaming transfer limit
-            if file_size > MAX_FILE_SIZE_STREAMING {
-                return Err(FileshareError::FileOperation(format!(
-                    "File size ({:.1} GB) exceeds streaming transfer limit ({} GB)",
-                    file_size as f64 / (1024.0 * 1024.0 * 1024.0),
-                    MAX_FILE_SIZE_STREAMING / (1024 * 1024 * 1024)
-                )));
+            
+            // Tier 2: Medium files (50MB - 500MB) - Use regular streaming
+            52_428_801..=524_288_000 => {
+                info!("🌊 Using STREAMING transfer for medium file ({:.1}MB)", 
+                      file_size as f64 / (1024.0 * 1024.0));
+                self.send_file_streaming(peer_id, file_path).await
             }
-
-            self.send_file_streaming(peer_id, file_path).await
+            
+            // Tier 3: Large files (> 500MB) - Use HIGH-SPEED streaming
+            _ => {
+                info!("🚀 Using HIGH-SPEED transfer for large file ({:.1}MB)", 
+                      file_size as f64 / (1024.0 * 1024.0));
+                
+                if let Some(ref high_speed_manager) = self.high_speed_manager {
+                    // Get peer address
+                    let peer_addr = self.get_peer_address(peer_id).await?;
+                    
+                    // Start high-speed transfer
+                    high_speed_manager.start_outgoing_transfer(
+                        Uuid::new_v4(),
+                        peer_id,
+                        file_path,
+                        peer_addr,
+                    ).await
+                } else {
+                    warn!("High-speed manager not available, falling back to streaming");
+                    self.send_file_streaming(peer_id, file_path).await
+                }
+            }
         }
     }
 

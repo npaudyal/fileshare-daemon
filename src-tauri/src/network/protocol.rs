@@ -108,10 +108,52 @@ pub enum MessageType {
         chunk_index: Option<u64>,
     },
 
+    HighSpeedFileRequest {
+        request_id: Uuid,
+        file_path: String,
+        target_path: String,
+        suggested_connections: usize,
+    },
+    HighSpeedFileOffer {
+        transfer_id: Uuid,
+        metadata: HighSpeedFileMetadata,
+        connection_count: usize,
+        peer_connections: Vec<std::net::SocketAddr>,
+    },
+    HighSpeedFileOfferResponse {
+        transfer_id: Uuid,
+        accepted: bool,
+        reason: Option<String>,
+        my_connections: Vec<std::net::SocketAddr>,
+    },
+    HighSpeedTransferComplete {
+        transfer_id: Uuid,
+        total_bytes: u64,
+        duration_seconds: f64,
+        average_speed_mbps: f64,
+    },
+    HighSpeedTransferError {
+        transfer_id: Uuid,
+        error: String,
+        connection_id: Option<usize>,
+    },
+
     // Control
     Ping,
     Pong,
     Disconnect,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HighSpeedFileMetadata {
+    pub name: String,
+    pub size: u64,
+    pub checksum: String,
+    pub chunk_size: usize,
+    pub estimated_chunks: u64,
+    pub suggested_connections: usize,
+    pub created: Option<u64>,
+    pub modified: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
