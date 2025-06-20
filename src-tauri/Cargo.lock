@@ -1315,6 +1315,7 @@ dependencies = [
  "chrono",
  "clap",
  "cocoa",
+ "crc32fast",
  "crossbeam-channel",
  "directories",
  "dirs 5.0.1",

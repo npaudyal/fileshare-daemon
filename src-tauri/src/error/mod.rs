@@ -31,8 +31,40 @@ pub enum FileshareError {
     #[error("Authentication error: {0}")]
     Authentication(String),
 
+    #[error("Streaming error: {0}")]
+    Streaming(#[from] StreamingError), // NEW
+
     #[error("Unknown error: {0}")]
     Unknown(String),
+}
+
+// NEW: Streaming-specific errors
+#[derive(Error, Debug)]
+pub enum StreamingError {
+    #[error("File too large for available memory: {size} bytes")]
+    FileTooLargeForMemory { size: u64 },
+
+    #[error("Streaming interrupted at byte {position}")]
+    StreamingInterrupted { position: u64 },
+
+    #[error("Chunk validation failed: chunk {index}, expected {expected}, got {actual}")]
+    ChunkValidationFailed {
+        index: u64,
+        expected: u32,
+        actual: u32,
+    },
+
+    #[error("File changed during transfer: original size {original}, current size {current}")]
+    FileChangedDuringTransfer { original: u64, current: u64 },
+
+    #[error("Insufficient disk space: need {needed} bytes, available {available} bytes")]
+    InsufficientDiskSpace { needed: u64, available: u64 },
+
+    #[error("Invalid chunk size: {size} bytes")]
+    InvalidChunkSize { size: usize },
+
+    #[error("Stream buffer overflow")]
+    StreamBufferOverflow,
 }
 
 // Implement From for mdns::Error

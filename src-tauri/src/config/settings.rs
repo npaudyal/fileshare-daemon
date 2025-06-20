@@ -12,6 +12,7 @@ pub struct Settings {
     pub network: NetworkSettings,
     pub transfer: TransferSettings,
     pub security: SecuritySettings,
+    pub streaming: StreamingSettings, // NEW
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -44,6 +45,32 @@ pub struct SecuritySettings {
     pub allowed_devices: Vec<Uuid>,
 }
 
+// NEW: Streaming configuration
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StreamingSettings {
+    pub enable_adaptive_chunking: bool,
+    pub max_memory_buffer_mb: usize,
+    pub stream_buffer_size_kb: usize,
+    pub progress_report_interval_ms: u64,
+    pub enable_chunk_validation: bool,
+    pub max_concurrent_chunk_reads: usize,
+    pub enable_streaming_mode: bool, // Master switch for streaming
+}
+
+impl Default for StreamingSettings {
+    fn default() -> Self {
+        Self {
+            enable_adaptive_chunking: true,
+            max_memory_buffer_mb: 100,
+            stream_buffer_size_kb: 64,
+            progress_report_interval_ms: 500,
+            enable_chunk_validation: true,
+            max_concurrent_chunk_reads: 3,
+            enable_streaming_mode: true,
+        }
+    }
+}
+
 impl Default for Settings {
     fn default() -> Self {
         Self {
@@ -59,7 +86,7 @@ impl Default for Settings {
                 timeout_seconds: 30,
             },
             transfer: TransferSettings {
-                chunk_size: 64 * 1024, // 64KB chunks
+                chunk_size: 1024 * 1024, // 1MB default, but will be adaptive
                 max_concurrent_transfers: 5,
                 bandwidth_limit_mbps: None,
                 temp_dir: None,
@@ -69,6 +96,7 @@ impl Default for Settings {
                 encryption_enabled: true,
                 allowed_devices: Vec::new(),
             },
+            streaming: StreamingSettings::default(), // NEW
         }
     }
 }
@@ -84,8 +112,13 @@ impl Settings {
             let content = fs::read_to_string(&path)
                 .map_err(|e| FileshareError::Config(format!("Failed to read config: {}", e)))?;
 
-            let settings: Settings = toml::from_str(&content)
+            let mut settings: Settings = toml::from_str(&content)
                 .map_err(|e| FileshareError::Config(format!("Failed to parse config: {}", e)))?;
+
+            // Ensure streaming settings exist (for migration from older configs)
+            if settings.streaming.max_memory_buffer_mb == 0 {
+                settings.streaming = StreamingSettings::default();
+            }
 
             Ok(settings)
         } else {

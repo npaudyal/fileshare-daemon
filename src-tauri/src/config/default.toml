@@ -9,7 +9,7 @@ service_name = "_fileshare._tcp.local."
 timeout_seconds = 30
 
 [transfer]
-chunk_size = 65536  # 64KB chunks
+chunk_size = 1048576  # 1MB default, but will be adaptive now
 max_concurrent_transfers = 5
 # bandwidth_limit_mbps = 100  # Optional bandwidth limit
 # temp_dir = "/path/to/temp"  # Optional custom temp directory
@@ -18,3 +18,13 @@ max_concurrent_transfers = 5
 require_pairing = false
 encryption_enabled = true
 allowed_devices = []  # UUIDs of allowed devices
+
+# NEW: Streaming configuration
+[streaming]
+enable_adaptive_chunking = true
+max_memory_buffer_mb = 100
+stream_buffer_size_kb = 64
+progress_report_interval_ms = 500
+enable_chunk_validation = true
+max_concurrent_chunk_reads = 3
+enable_streaming_mode = true

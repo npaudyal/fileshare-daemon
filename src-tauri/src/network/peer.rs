@@ -17,10 +17,12 @@ use tokio::time::{interval, timeout};
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
-// Constants for connection health monitoring
+// Constants for connection health monitoring - UPDATED for streaming
 const PING_INTERVAL_SECONDS: u64 = 30; // Ping every 30 seconds
 const PING_TIMEOUT_SECONDS: u64 = 10; // 10 second ping timeout
+const PING_TIMEOUT_LARGE_TRANSFER: u64 = 30; // 30 seconds for large transfers
 const MAX_MISSED_PINGS: u32 = 3; // Disconnect after 3 missed pings
+const MAX_MISSED_PINGS_DURING_TRANSFER: u32 = 5; // More lenient during large transfers
 const RECONNECTION_DELAY_SECONDS: u64 = 5; // Wait 5 seconds before reconnecting
 const MAX_RECONNECTION_ATTEMPTS: u32 = 5; // Try reconnecting 5 times
 
@@ -526,7 +528,7 @@ impl PeerManager {
             .collect()
     }
 
-    // Check health of all peers
+    // ENHANCED: Check health of all peers with streaming awareness
     pub async fn check_peer_health_all(&mut self) -> Result<()> {
         let authenticated_peers: Vec<Uuid> = self
             .peers
@@ -544,16 +546,42 @@ impl PeerManager {
         Ok(())
     }
 
-    // Check individual peer health
+    // ENHANCED: Check individual peer health with streaming support
     async fn check_peer_health(&mut self, peer_id: Uuid) -> Result<()> {
         info!("🩺 Checking health of peer {}", peer_id);
 
+        // Check if peer has active large file transfers (be more lenient)
+        let has_active_large_transfers = {
+            let ft = self.file_transfer.read().await;
+            ft.get_active_transfers().iter().any(|transfer| {
+                transfer.peer_id == peer_id
+                    && matches!(transfer.status, TransferStatus::Active)
+                    && transfer.metadata.size > 100 * 1024 * 1024 // > 100MB
+            })
+        };
+
+        // Use longer timeout for peers with active large transfers
+        let ping_timeout = if has_active_large_transfers {
+            Duration::from_secs(PING_TIMEOUT_LARGE_TRANSFER)
+        } else {
+            Duration::from_secs(PING_TIMEOUT_SECONDS)
+        };
+
         // Send ping and wait for response
-        match self.ping_peer_with_timeout(peer_id).await {
+        match self
+            .ping_peer_with_timeout_custom(peer_id, ping_timeout)
+            .await
+        {
             Ok(response_time) => {
                 info!(
-                    "✅ Peer {} responded to ping in {:?}",
-                    peer_id, response_time
+                    "✅ Peer {} responded to ping in {:?}{}",
+                    peer_id,
+                    response_time,
+                    if has_active_large_transfers {
+                        " (large transfer active)"
+                    } else {
+                        ""
+                    }
                 );
 
                 // Reset ping failures on successful ping
@@ -565,28 +593,28 @@ impl PeerManager {
             }
             Err(_) => {
                 warn!("❌ Peer {} failed to respond to ping", peer_id);
-                self.handle_ping_failure(peer_id).await?;
+                self.handle_ping_failure(peer_id, has_active_large_transfers)
+                    .await?;
             }
         }
 
         Ok(())
     }
 
-    // Ping peer with timeout
-    async fn ping_peer_with_timeout(&mut self, peer_id: Uuid) -> Result<Duration> {
+    // NEW: Custom ping timeout for streaming transfers
+    async fn ping_peer_with_timeout_custom(
+        &mut self,
+        peer_id: Uuid,
+        timeout_duration: Duration,
+    ) -> Result<Duration> {
         let start_time = Instant::now();
         let ping_message = Message::ping();
 
         // Send ping
         self.send_message_to_peer(peer_id, ping_message).await?;
 
-        // Wait for pong response with timeout
-        match timeout(
-            Duration::from_secs(PING_TIMEOUT_SECONDS),
-            self.wait_for_pong(peer_id),
-        )
-        .await
-        {
+        // Wait for pong response with custom timeout
+        match timeout(timeout_duration, self.wait_for_pong(peer_id)).await {
             Ok(_) => {
                 let response_time = start_time.elapsed();
                 Ok(response_time)
@@ -598,6 +626,12 @@ impl PeerManager {
         }
     }
 
+    // Ping peer with timeout (legacy method)
+    async fn ping_peer_with_timeout(&mut self, peer_id: Uuid) -> Result<Duration> {
+        self.ping_peer_with_timeout_custom(peer_id, Duration::from_secs(PING_TIMEOUT_SECONDS))
+            .await
+    }
+
     // Wait for pong response
     async fn wait_for_pong(&mut self, _peer_id: Uuid) -> Result<()> {
         // This would typically wait for a pong message
@@ -607,20 +641,37 @@ impl PeerManager {
         Ok(())
     }
 
-    // Handle ping failure
-    async fn handle_ping_failure(&mut self, peer_id: Uuid) -> Result<()> {
+    // ENHANCED: Handle ping failure with streaming awareness
+    async fn handle_ping_failure(
+        &mut self,
+        peer_id: Uuid,
+        has_active_transfers: bool,
+    ) -> Result<()> {
         if let Some(peer) = self.peers.get_mut(&peer_id) {
             peer.ping_failures += 1;
 
             info!(
-                "❌ Ping failure {} for peer {}",
-                peer.ping_failures, peer_id
+                "❌ Ping failure {} for peer {}{}",
+                peer.ping_failures,
+                peer_id,
+                if has_active_transfers {
+                    " (has active transfers)"
+                } else {
+                    ""
+                }
             );
 
-            if peer.ping_failures >= MAX_MISSED_PINGS {
+            // Use different thresholds for peers with active transfers
+            let max_failures = if has_active_transfers {
+                MAX_MISSED_PINGS_DURING_TRANSFER
+            } else {
+                MAX_MISSED_PINGS
+            };
+
+            if peer.ping_failures >= max_failures {
                 warn!(
-                    "💔 Peer {} exceeded max ping failures, marking as disconnected",
-                    peer_id
+                    "💔 Peer {} exceeded max ping failures ({}/{}), marking as disconnected",
+                    peer_id, peer.ping_failures, max_failures
                 );
                 peer.connection_status = ConnectionStatus::Disconnected;
 
@@ -725,7 +776,7 @@ impl PeerManager {
         stats
     }
 
-    // Enhanced message handling with connection health updates
+    // ENHANCED: Message handling with streaming support
     pub async fn handle_message(
         &mut self,
         peer_id: Uuid,
@@ -819,8 +870,14 @@ impl PeerManager {
                 metadata,
             } => {
                 info!(
-                    "✅ Processing incoming FileOffer from {}: {}",
-                    peer_id, metadata.name
+                    "✅ Processing incoming FileOffer from {}: {} ({})",
+                    peer_id,
+                    metadata.name,
+                    if metadata.supports_streaming {
+                        "Streaming"
+                    } else {
+                        "Legacy"
+                    }
                 );
 
                 // Handle the file offer
@@ -912,6 +969,45 @@ impl PeerManager {
                 );
             }
 
+            // NEW: Streaming message handlers
+            MessageType::TransferProgress {
+                transfer_id,
+                bytes_transferred,
+                chunks_completed,
+                transfer_rate,
+            } => {
+                debug!(
+                    "📊 Received progress update for transfer {}: {} bytes, {} chunks, {:.1} MB/s",
+                    transfer_id,
+                    bytes_transferred,
+                    chunks_completed,
+                    transfer_rate / (1024.0 * 1024.0)
+                );
+
+                // Forward progress to file transfer manager
+                let mut ft = self.file_transfer.write().await;
+                ft.handle_transfer_progress(
+                    peer_id,
+                    transfer_id,
+                    bytes_transferred,
+                    chunks_completed,
+                    transfer_rate,
+                )
+                .await?;
+            }
+
+            MessageType::TransferPause { transfer_id } => {
+                info!("⏸️ Received pause request for transfer {}", transfer_id);
+                let mut ft = self.file_transfer.write().await;
+                ft.handle_transfer_pause(peer_id, transfer_id).await?;
+            }
+
+            MessageType::TransferResume { transfer_id } => {
+                info!("▶️ Received resume request for transfer {}", transfer_id);
+                let mut ft = self.file_transfer.write().await;
+                ft.handle_transfer_resume(peer_id, transfer_id).await?;
+            }
+
             _ => {
                 debug!(
                     "Unhandled message type from {}: {:?}",
@@ -922,6 +1018,7 @@ impl PeerManager {
         Ok(())
     }
 
+    // ENHANCED: File request handling with streaming awareness
     async fn handle_file_request(
         &mut self,
         peer_id: Uuid,
@@ -949,6 +1046,22 @@ impl PeerManager {
             return Ok(());
         }
 
+        // Check file size for streaming recommendation
+        let file_size = std::fs::metadata(&file_path).map(|m| m.len()).unwrap_or(0);
+
+        let size_info = if file_size > 1024 * 1024 * 1024 {
+            format!(
+                " ({}GB - will use streaming)",
+                file_size / (1024 * 1024 * 1024)
+            )
+        } else if file_size > 1024 * 1024 {
+            format!(" ({}MB)", file_size / (1024 * 1024))
+        } else {
+            format!(" ({}KB)", file_size / 1024)
+        };
+
+        info!("File request accepted{}", size_info);
+
         // Accept the request
         let response = Message::new(MessageType::FileRequestResponse {
             request_id,
@@ -970,7 +1083,7 @@ impl PeerManager {
 
         info!("Target directory extracted: {:?}", target_dir);
 
-        // Start file transfer with target directory
+        // Start file transfer with enhanced streaming support
         let mut ft = self.file_transfer.write().await;
         ft.send_file_with_target_dir(peer_id, file_path, target_dir)
             .await?;

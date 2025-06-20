@@ -42,7 +42,7 @@ pub enum MessageType {
         reason: Option<String>,
     },
 
-    // File transfer
+    // File transfer - UPDATED for streaming
     FileOffer {
         transfer_id: Uuid,
         metadata: FileMetadata,
@@ -69,6 +69,20 @@ pub enum MessageType {
         error: String,
     },
 
+    // NEW: Streaming-specific messages
+    TransferProgress {
+        transfer_id: Uuid,
+        bytes_transferred: u64,
+        chunks_completed: u64,
+        transfer_rate: f64,
+    },
+    TransferPause {
+        transfer_id: Uuid,
+    },
+    TransferResume {
+        transfer_id: Uuid,
+    },
+
     // Control
     Ping,
     Pong,
@@ -84,8 +98,13 @@ pub struct FileMetadata {
     pub created: Option<u64>,
     pub modified: Option<u64>,
     pub target_dir: Option<String>,
-    pub chunk_size: usize, // NEW: Include chunk size in metadata
-    pub total_chunks: u64, // NEW: Include total expected chunks
+    pub chunk_size: usize,
+    pub total_chunks: u64,
+    // NEW: Streaming metadata
+    pub stream_chunk_size: usize,  // Optimal chunk size for this file
+    pub estimated_chunks: u64,     // Estimated number of chunks
+    pub file_hash_preview: String, // Hash of first 1KB for quick validation
+    pub supports_streaming: bool,  // Whether sender supports streaming
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -93,6 +112,9 @@ pub struct TransferChunk {
     pub index: u64,
     pub data: Vec<u8>,
     pub is_last: bool,
+    // NEW: Streaming enhancements
+    pub checksum: u32,                  // CRC32 for chunk validation
+    pub compressed_size: Option<usize>, // For future compression support
 }
 
 impl Message {
@@ -125,7 +147,18 @@ impl Message {
 }
 
 impl FileMetadata {
-    pub fn from_path_with_chunk_size(path: &PathBuf, chunk_size: usize) -> crate::Result<Self> {
+    // NEW: Calculate optimal chunk size based on file size
+    pub fn calculate_optimal_chunk_size(file_size: u64) -> usize {
+        match file_size {
+            0..=10_485_760 => 256 * 1024,            // 256KB for files < 10MB
+            10_485_760..=104_857_600 => 1024 * 1024, // 1MB for files < 100MB
+            104_857_600..=1_073_741_824 => 4 * 1024 * 1024, // 4MB for files < 1GB
+            1_073_741_824..=10_737_418_240 => 8 * 1024 * 1024, // 8MB for files < 10GB
+            _ => 16 * 1024 * 1024,                   // 16MB for files > 10GB
+        }
+    }
+
+    pub fn from_path_with_streaming(path: &PathBuf) -> crate::Result<Self> {
         use sha2::{Digest, Sha256};
         use std::fs;
         use std::io::Read;
@@ -139,10 +172,14 @@ impl FileMetadata {
 
         let file_size = metadata.len();
 
-        // Calculate total chunks based on file size and chunk size
-        let total_chunks = (file_size + chunk_size as u64 - 1) / chunk_size as u64;
+        // Calculate optimal chunk size for streaming
+        let stream_chunk_size = Self::calculate_optimal_chunk_size(file_size);
 
-        // Calculate checksum
+        // Calculate total chunks based on optimal chunk size
+        let estimated_chunks =
+            (file_size + stream_chunk_size as u64 - 1) / stream_chunk_size as u64;
+
+        // Calculate checksum of entire file
         let mut file = fs::File::open(path)?;
         let mut hasher = Sha256::new();
         let mut buffer = [0; 8192];
@@ -156,6 +193,14 @@ impl FileMetadata {
         }
 
         let checksum = format!("{:x}", hasher.finalize());
+
+        // Calculate preview hash (first 1KB)
+        let mut file_preview = fs::File::open(path)?;
+        let mut preview_buffer = [0; 1024];
+        let preview_bytes_read = file_preview.read(&mut preview_buffer)?;
+        let mut preview_hasher = Sha256::new();
+        preview_hasher.update(&preview_buffer[..preview_bytes_read]);
+        let file_hash_preview = format!("{:x}", preview_hasher.finalize());
 
         // Get timestamps
         let created = metadata
@@ -181,15 +226,26 @@ impl FileMetadata {
             created,
             modified,
             target_dir: None,
-            chunk_size,   // NEW: Store the chunk size used
-            total_chunks, // NEW: Store expected total chunks
+            chunk_size: stream_chunk_size,  // Legacy compatibility
+            total_chunks: estimated_chunks, // Legacy compatibility
+            stream_chunk_size,
+            estimated_chunks,
+            file_hash_preview,
+            supports_streaming: true,
         })
     }
 
     // Keep the old method for backward compatibility
+    pub fn from_path_with_chunk_size(path: &PathBuf, chunk_size: usize) -> crate::Result<Self> {
+        let mut metadata = Self::from_path_with_streaming(path)?;
+        metadata.chunk_size = chunk_size;
+        metadata.total_chunks = (metadata.size + chunk_size as u64 - 1) / chunk_size as u64;
+        Ok(metadata)
+    }
+
+    // Keep the old method for backward compatibility
     pub fn from_path(path: &PathBuf) -> crate::Result<Self> {
-        // Use default 1MB chunk size for backward compatibility
-        Self::from_path_with_chunk_size(path, 1024 * 1024)
+        Self::from_path_with_streaming(path)
     }
 
     pub fn with_target_dir(mut self, target_dir: Option<String>) -> Self {
