@@ -1359,18 +1359,35 @@ impl FileTransferManager {
                 let actual_end_offset = expected_offset + chunk.data.len() as u64;
                 let actual_file_size = transfer.metadata.size;
 
-                if actual_end_offset > actual_file_size {
+                // For the last chunk, allow it to extend slightly beyond file size (common with compression)
+                // but validate that the start position is within bounds
+                if expected_offset >= actual_file_size {
+                    return Err(FileshareError::Transfer(format!(
+                        "Chunk {} starts beyond file size (offset: {}, file size: {})",
+                        chunk.index, expected_offset, actual_file_size
+                    )));
+                }
+                
+                // For non-last chunks, validate end offset doesn't exceed file size
+                if !chunk.is_last && actual_end_offset > actual_file_size {
                     return Err(FileshareError::Transfer(format!(
                         "Chunk {} too large: exceeds file size (offset: {}, file size: {})",
                         chunk.index, actual_end_offset, actual_file_size
                     )));
                 }
+                
+                // For last chunk, calculate the actual bytes that should be copied
+                let bytes_to_copy = if chunk.is_last {
+                    std::cmp::min(chunk.data.len(), (actual_file_size - expected_offset) as usize)
+                } else {
+                    chunk.data.len()
+                };
 
                 // Copy chunk data directly into the buffer
                 let start_idx = expected_offset as usize;
-                let end_idx = actual_end_offset as usize;
-                transfer.received_data[start_idx..end_idx].copy_from_slice(&chunk.data);
-                transfer.bytes_transferred += chunk.data.len() as u64;
+                let end_idx = expected_offset as usize + bytes_to_copy;
+                transfer.received_data[start_idx..end_idx].copy_from_slice(&chunk.data[..bytes_to_copy]);
+                transfer.bytes_transferred += bytes_to_copy as u64;
             }
 
             // Mark chunk as received
