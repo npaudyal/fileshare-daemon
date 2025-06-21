@@ -1207,7 +1207,7 @@ impl FileTransferManager {
             return Ok(());
         }
 
-        let is_complete = {
+        let (is_complete, debug_info) = {
             let transfer = self.active_transfers.get_mut(&transfer_id).unwrap();
 
             if transfer.peer_id != peer_id {
@@ -1284,14 +1284,27 @@ impl FileTransferManager {
             transfer.chunks_received[chunk.index as usize] = true;
 
             // Check if transfer is complete - ALL chunks must be received
-            transfer.chunks_received.iter().all(|&received| received)
+            let is_complete = transfer.chunks_received.iter().all(|&received| received);
+            
+            // Capture debugging info before releasing the transfer reference
+            let debug_info = if is_complete {
+                let chunks_received_count = transfer.chunks_received.iter().filter(|&&b| b).count();
+                Some((chunks_received_count, transfer.metadata.total_chunks))
+            } else {
+                None
+            };
+            
+            (is_complete, debug_info)
         };
 
         if is_complete {
-            info!(
-                "🎉 RECEIVER: Transfer {} is complete, finalizing...",
-                transfer_id
-            );
+            // Log completion details for debugging
+            if let Some((chunks_received_count, total_chunks)) = debug_info {
+                info!(
+                    "🎉 RECEIVER: Transfer {} is complete! Received {}/{} chunks, finalizing...",
+                    transfer_id, chunks_received_count, total_chunks
+                );
+            }
             self.complete_file_transfer(transfer_id).await?;
         } else {
             // Send acknowledgment through normal message channel
@@ -1368,7 +1381,12 @@ impl FileTransferManager {
 
         // Verify checksum if provided
         if !expected_checksum.is_empty() {
-            let calculated_checksum = self.calculate_file_checksum(&file_path)?;
+            info!(
+                "🔍 CHECKSUM DEBUG: Transfer {} - Expected: {}, Calculated: {}, File size: {} bytes",
+                transfer_id, expected_checksum, calculated_checksum, 
+                tokio::fs::metadata(&file_path).await.map(|m| m.len()).unwrap_or(0)
+            );
+            
             if calculated_checksum != expected_checksum {
                 error!(
                     "❌ RECEIVER: Checksum mismatch for transfer {}: expected {}, got {}",

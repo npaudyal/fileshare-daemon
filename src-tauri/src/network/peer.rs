@@ -440,10 +440,24 @@ impl PeerManager {
             loop {
                 match read_half.read_message().await {
                     Ok(message) => {
-                        info!(
-                            "📥 READ from peer {}: {:?}",
-                            read_peer_id, message.message_type
-                        );
+                        // Only log important messages, not chunks or frequent messages
+                        match &message.message_type {
+                            MessageType::Ping | MessageType::Pong => {
+                                debug!("📥 READ {} from {}", 
+                                       if matches!(message.message_type, MessageType::Ping) { "ping" } else { "pong" },
+                                       read_peer_id);
+                            }
+                            MessageType::FileChunk { transfer_id, chunk } => {
+                                // Only log every 10th chunk to reduce noise
+                                if chunk.index % 10 == 0 || chunk.is_last {
+                                    info!("📥 READ chunk {} for transfer {} ({}B, last: {})",
+                                          chunk.index, transfer_id, chunk.data.len(), chunk.is_last);
+                                }
+                            }
+                            _ => {
+                                info!("📥 READ from peer {}: {:?}", read_peer_id, message.message_type);
+                            }
+                        }
                         if let Err(e) = read_message_tx.send((read_peer_id, message)) {
                             error!(
                                 "Failed to forward message from peer {}: {}",
@@ -465,10 +479,24 @@ impl PeerManager {
         let write_peer_id = peer_id;
         let write_task = tokio::spawn(async move {
             while let Some(message) = conn_rx.recv().await {
-                info!(
-                    "📤 WRITE to peer {}: {:?}",
-                    write_peer_id, message.message_type
-                );
+                // Only log important messages, not chunks or frequent messages
+                match &message.message_type {
+                    MessageType::Ping | MessageType::Pong => {
+                        debug!("📤 WRITE {} to {}", 
+                               if matches!(message.message_type, MessageType::Ping) { "ping" } else { "pong" },
+                               write_peer_id);
+                    }
+                    MessageType::FileChunk { transfer_id, chunk } => {
+                        // Only log every 10th chunk to reduce noise
+                        if chunk.index % 10 == 0 || chunk.is_last {
+                            info!("📤 WRITE chunk {} for transfer {} ({}B, last: {})",
+                                  chunk.index, transfer_id, chunk.data.len(), chunk.is_last);
+                        }
+                    }
+                    _ => {
+                        info!("📤 WRITE to peer {}: {:?}", write_peer_id, message.message_type);
+                    }
+                }
 
                 if let Err(e) = write_half.write_message(&message).await {
                     error!("Failed to write message to peer {}: {}", write_peer_id, e);

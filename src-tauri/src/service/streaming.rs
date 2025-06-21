@@ -176,22 +176,31 @@ impl StreamingFileWriter {
                     warn!("⚠️ Buffer index {} out of bounds (buffer size: {})", buffer_index, self.chunks_buffer.len());
                 }
             } else {
-                // Chunk is too far ahead, but don't reject - just warn and continue
-                warn!("⚠️ Chunk {} is very far ahead (expected around {}), buffering capability exceeded", 
+                // Chunk is too far ahead - expand buffer if reasonable
+                warn!("⚠️ Chunk {} is far ahead (expected around {}), expanding buffer", 
                       index, self.next_write_index);
-                // For now, expand buffer if needed (with limits)
-                if self.chunks_buffer.len() < 1000 { // Reasonable limit
-                    let additional_slots = (buffer_offset as usize + 1) - self.chunks_buffer.len();
-                    self.chunks_buffer.resize(self.chunks_buffer.len() + additional_slots, None);
+                
+                // Calculate how many slots we need
+                let required_buffer_size = (buffer_offset as usize) + 1;
+                
+                if required_buffer_size <= 1000 { // Reasonable limit
+                    // Expand buffer to accommodate this chunk
+                    self.chunks_buffer.resize(required_buffer_size, None);
                     let buffer_index = buffer_offset as usize;
-                    self.chunks_buffer[buffer_index] = Some(decompressed_data);
-                    if self.chunks_buffer.len() % 100 == 0 {  // Only log every 100 buffer expansions
+                    
+                    if buffer_index < self.chunks_buffer.len() {
+                        self.chunks_buffer[buffer_index] = Some(decompressed_data);
                         info!("📦 Expanded buffer to {} slots for chunk {}", self.chunks_buffer.len(), index);
+                    } else {
+                        return Err(FileshareError::Transfer(format!(
+                            "Buffer index calculation error: index {} >= buffer size {}",
+                            buffer_index, self.chunks_buffer.len()
+                        )));
                     }
                 } else {
                     return Err(FileshareError::Transfer(format!(
-                        "Chunk {} is too far ahead (expected around {}) and buffer capacity exceeded",
-                        index, self.next_write_index
+                        "Chunk {} is too far ahead (expected around {}) - would require buffer size {}",
+                        index, self.next_write_index, required_buffer_size
                     )));
                 }
             }
@@ -201,19 +210,22 @@ impl StreamingFileWriter {
     }
     
     async fn flush_buffered_chunks(&mut self) -> Result<()> {
-        while !self.chunks_buffer.is_empty() {
-            // Check if the first buffered chunk is available (next expected chunk)
-            if let Some(Some(data)) = self.chunks_buffer.first().cloned() {
-                // Remove the chunk from buffer and write it
-                self.chunks_buffer.remove(0);
+        while !self.chunks_buffer.is_empty() && self.chunks_buffer[0].is_some() {
+            // Get the first chunk from buffer (which should be the next expected chunk)
+            if let Some(data) = self.chunks_buffer[0].take() {
+                // Write the chunk
                 self.write_data(&data).await?;
                 self.next_write_index += 1;
-                self.chunks_buffer.push(None); // Maintain buffer size
+                
+                // Shift all chunks one position left
+                self.chunks_buffer.remove(0);
+                self.chunks_buffer.push(None); // Add empty slot at the end
+                
                 if (self.next_write_index - 1) % 10 == 0 {  // Only log every 10th flush
                     info!("✅ Flushed buffered chunk {} from buffer", self.next_write_index - 1);
                 }
             } else {
-                // No more consecutive chunks available
+                // First slot is empty, no more consecutive chunks
                 break;
             }
         }
@@ -242,6 +254,8 @@ impl StreamingFileWriter {
     }
     
     pub async fn finalize(mut self) -> Result<String> {
+        // Ensure all buffered chunks are written before finalizing
+        self.flush_buffered_chunks().await?;
         self.file.flush().await?;
         Ok(format!("{:x}", self.hasher.finalize()))
     }
