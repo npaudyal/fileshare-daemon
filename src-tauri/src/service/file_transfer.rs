@@ -513,18 +513,21 @@ impl FileTransferManager {
         let mut chunk_count = 0u64;
         let mut bytes_sent = 0u64;
         let mut last_progress_report = Instant::now();
+        let mut last_chunk_was_sent = false; // NEW: Track if we sent the last chunk
 
         // Send file in chunks using streaming
         while let Some(chunk) = reader.read_next_chunk().await? {
             // Update checksum with chunk data
             hasher.update(&chunk.data);
 
+            let is_last_chunk = chunk.is_last; // Store this before moving chunk
+
             info!(
                 "📤 STREAMING_CHUNKS: Sending chunk {} for transfer {}: {} bytes, is_last: {}",
                 chunk.index,
                 transfer_id,
                 chunk.data.len(),
-                chunk.is_last
+                is_last_chunk
             );
 
             let chunk_data_len = chunk.data.len();
@@ -550,7 +553,17 @@ impl FileTransferManager {
             bytes_sent += chunk_data_len as u64;
             chunk_count += 1;
 
-            // Report progress periodically
+            // Check if this was the last chunk
+            if is_last_chunk {
+                last_chunk_was_sent = true;
+                info!(
+                    "📤 STREAMING_CHUNKS: Last chunk {} sent for transfer {}",
+                    chunk_count - 1,
+                    transfer_id
+                );
+            }
+
+            // Report progress periodically (but not for completion)
             if last_progress_report.elapsed().as_millis() >= progress_interval_ms as u128 {
                 let progress_msg = Message::new(MessageType::TransferProgress {
                     transfer_id,
@@ -563,26 +576,36 @@ impl FileTransferManager {
             }
         }
 
-        // Send completion message through normal channel
-        let checksum = format!("{:x}", hasher.finalize());
-        info!(
-            "✅ STREAMING_CHUNKS: Transfer {} complete. Total bytes sent: {}, Total chunks: {}, Checksum: {}",
-            transfer_id, bytes_sent, chunk_count, checksum
-        );
+        // IMPORTANT: Only send TransferComplete if we actually sent the last chunk
+        if last_chunk_was_sent {
+            // Add a small delay to ensure the last chunk is processed before completion
+            tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
-        let complete_msg = Message::new(MessageType::TransferComplete {
-            transfer_id,
-            checksum,
-        });
-
-        if let Err(e) = message_sender.send((peer_id, complete_msg)) {
-            error!(
-                "❌ STREAMING_CHUNKS: Failed to send transfer complete: {}",
-                e
-            );
-        } else {
+            let checksum = format!("{:x}", hasher.finalize());
             info!(
-                "✅ STREAMING_CHUNKS: Transfer {} completed successfully",
+                "✅ STREAMING_CHUNKS: All chunks sent for transfer {}. Total bytes: {}, Total chunks: {}, Checksum: {}",
+                transfer_id, bytes_sent, chunk_count, checksum
+            );
+
+            let complete_msg = Message::new(MessageType::TransferComplete {
+                transfer_id,
+                checksum,
+            });
+
+            if let Err(e) = message_sender.send((peer_id, complete_msg)) {
+                error!(
+                    "❌ STREAMING_CHUNKS: Failed to send transfer complete: {}",
+                    e
+                );
+            } else {
+                info!(
+                    "✅ STREAMING_CHUNKS: TransferComplete message sent for {}",
+                    transfer_id
+                );
+            }
+        } else {
+            warn!(
+                "⚠️ STREAMING_CHUNKS: No chunks were sent for transfer {}, not sending completion",
                 transfer_id
             );
         }
@@ -699,32 +722,39 @@ impl FileTransferManager {
     }
 
     pub async fn mark_outgoing_transfer_completed(&mut self, transfer_id: Uuid) -> Result<()> {
-        {
+        let should_show_notification =
             if let Some(transfer) = self.active_transfers.get_mut(&transfer_id) {
                 if matches!(transfer.direction, TransferDirection::Outgoing) {
+                    // Check if it's already completed
+                    if matches!(transfer.status, TransferStatus::Completed) {
+                        info!("✅ Transfer {} already marked as completed", transfer_id);
+                        return Ok(());
+                    }
+
                     info!(
                         "✅ SENDER: Marking outgoing transfer {} as completed",
                         transfer_id
                     );
                     transfer.status = TransferStatus::Completed;
                     transfer.last_activity = Instant::now();
+                    true
                 } else {
                     warn!(
                         "⚠️ Attempted to mark non-outgoing transfer {} as completed",
                         transfer_id
                     );
-                    return Ok(());
+                    false
                 }
             } else {
                 warn!(
                     "⚠️ Transfer {} not found when marking as completed",
                     transfer_id
                 );
-                return Ok(());
-            }
-        }
+                false
+            };
 
-        {
+        // Show notification outside the mutable borrow
+        if should_show_notification {
             if let Some(transfer) = self.active_transfers.get(&transfer_id) {
                 if let Err(e) = self.show_transfer_notification(transfer).await {
                     warn!("Failed to show notification: {}", e);
@@ -1162,13 +1192,13 @@ impl FileTransferManager {
         transfer_id: Uuid,
         chunk: TransferChunk,
     ) -> Result<()> {
-        let is_complete = {
+        let (is_chunk_complete, total_received, expected_size, should_show_notification) = {
             let transfer = self.active_transfers.get_mut(&transfer_id).unwrap();
             transfer.last_activity = Instant::now();
 
             // Get streaming writer
             if let Some(ref mut writer) = transfer.streaming_writer {
-                let is_complete = writer.write_chunk(chunk).await?;
+                let is_chunk_complete = writer.write_chunk(chunk).await?;
 
                 // Update transfer progress
                 let (bytes_written, _, _) = writer.get_progress();
@@ -1177,7 +1207,15 @@ impl FileTransferManager {
                     .progress
                     .update(bytes_written, writer.chunks_received() as u64);
 
-                is_complete
+                let should_show_notification =
+                    is_chunk_complete && bytes_written >= transfer.metadata.size;
+
+                (
+                    is_chunk_complete,
+                    bytes_written,
+                    transfer.metadata.size,
+                    should_show_notification,
+                )
             } else {
                 return Err(FileshareError::Transfer(
                     "No streaming writer available".to_string(),
@@ -1185,12 +1223,34 @@ impl FileTransferManager {
             }
         };
 
-        if is_complete {
+        // CHANGED: Don't mark as complete here, wait for TransferComplete message
+        if is_chunk_complete {
             info!(
-                "🎉 RECEIVER: Streaming transfer {} is complete, finalizing...",
-                transfer_id
+                "🎉 RECEIVER: Last chunk processed for transfer {}, but waiting for TransferComplete message. Received: {} of {} bytes",
+                transfer_id, total_received, expected_size
             );
-            self.complete_streaming_transfer(transfer_id).await?;
+
+            // Only mark complete if we have all the data AND this was the last chunk
+            if total_received >= expected_size {
+                if let Some(transfer) = self.active_transfers.get_mut(&transfer_id) {
+                    transfer.status = TransferStatus::Completed;
+                    transfer.last_activity = Instant::now();
+
+                    info!(
+                        "✅ RECEIVER: Transfer {} truly complete - all data received",
+                        transfer_id
+                    );
+                }
+            }
+        }
+
+        // Show notification outside the mutable borrow
+        if should_show_notification {
+            if let Some(transfer) = self.active_transfers.get(&transfer_id) {
+                if let Err(e) = self.show_transfer_notification(transfer).await {
+                    warn!("Failed to show notification: {}", e);
+                }
+            }
         }
 
         Ok(())
@@ -1308,19 +1368,82 @@ impl FileTransferManager {
         &mut self,
         _peer_id: Uuid,
         transfer_id: Uuid,
-        _checksum: String,
+        checksum: String,
     ) -> Result<()> {
-        info!("✅ Transfer {} completed by peer", transfer_id);
+        info!(
+            "✅ Received TransferComplete for transfer {} with checksum: {}",
+            transfer_id, checksum
+        );
+
+        // Only mark as complete if the transfer exists and is not already complete
         if let Some(transfer) = self.active_transfers.get_mut(&transfer_id) {
-            transfer.status = TransferStatus::Completed;
-            transfer.last_activity = Instant::now();
+            match &transfer.status {
+                TransferStatus::Completed => {
+                    info!(
+                        "✅ Transfer {} already marked as complete, ignoring duplicate",
+                        transfer_id
+                    );
+                    return Ok(());
+                }
+                TransferStatus::Error(_) => {
+                    info!(
+                        "⚠️ Transfer {} is in error state, ignoring completion",
+                        transfer_id
+                    );
+                    return Ok(());
+                }
+                TransferStatus::Cancelled => {
+                    info!(
+                        "⚠️ Transfer {} is cancelled, ignoring completion",
+                        transfer_id
+                    );
+                    return Ok(());
+                }
+                _ => {
+                    // For incoming transfers, only mark complete if we've received all expected data
+                    if matches!(transfer.direction, TransferDirection::Incoming) {
+                        let expected_size = transfer.metadata.size;
+                        let received_size = if transfer.is_streaming {
+                            // For streaming, check the streaming writer
+                            transfer
+                                .streaming_writer
+                                .as_ref()
+                                .map(|w| w.get_progress().0)
+                                .unwrap_or(0)
+                        } else {
+                            // For legacy, check bytes_transferred
+                            transfer.bytes_transferred
+                        };
+
+                        if received_size < expected_size {
+                            info!(
+                                "⚠️ Transfer {} not yet complete: received {} of {} bytes, waiting for more chunks",
+                                transfer_id, received_size, expected_size
+                            );
+                            return Ok(());
+                        }
+                    }
+
+                    info!("✅ Marking transfer {} as completed", transfer_id);
+                    transfer.status = TransferStatus::Completed;
+                    transfer.last_activity = Instant::now();
+                }
+            }
+        } else {
+            warn!(
+                "⚠️ Received completion for unknown transfer {}",
+                transfer_id
+            );
+            return Ok(());
         }
 
+        // Show notification only after truly completing
         if let Some(transfer) = self.active_transfers.get(&transfer_id) {
             if let Err(e) = self.show_transfer_notification(transfer).await {
                 warn!("Failed to show notification: {}", e);
             }
         }
+
         Ok(())
     }
 

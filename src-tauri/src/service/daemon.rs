@@ -592,7 +592,7 @@ impl FileshareDaemon {
             }
         });
 
-        // Enhanced message processing with streaming support
+        // FIXED: Enhanced message processing with corrected streaming support
         let message_pm = peer_manager.clone();
         let message_clipboard = clipboard.clone();
         let message_handle = tokio::spawn(async move {
@@ -609,23 +609,10 @@ impl FileshareDaemon {
                         continue;
                     }
 
-                    // Route streaming transfer messages directly
+                    // FIXED: Correct message routing logic
                     match &message.message_type {
-                        crate::network::protocol::MessageType::FileOffer {
-                            transfer_id, ..
-                        }
-                        | crate::network::protocol::MessageType::FileChunk {
-                            transfer_id, ..
-                        }
-                        | crate::network::protocol::MessageType::TransferComplete {
-                            transfer_id,
-                            ..
-                        }
-                        | crate::network::protocol::MessageType::TransferError {
-                            transfer_id,
-                            ..
-                        }
-                        | crate::network::protocol::MessageType::TransferProgress {
+                        // TransferComplete handling - FIXED LOGIC
+                        crate::network::protocol::MessageType::TransferComplete {
                             transfer_id,
                             ..
                         } => {
@@ -638,51 +625,47 @@ impl FileshareDaemon {
                             drop(ft);
 
                             if is_outgoing {
-                                // Handle outgoing transfer messages
-                                if matches!(
-                                    message.message_type,
-                                    crate::network::protocol::MessageType::TransferComplete { .. }
-                                ) {
-                                    info!("🚀 Processing outgoing TransferComplete for streaming transfer {} to peer {}", transfer_id, peer_id);
+                                // FIXED: When we receive TransferComplete for our outgoing transfer,
+                                // it means the peer confirmed they received everything successfully
+                                info!("✅ Received confirmation that peer {} completed our outgoing transfer {}", peer_id, transfer_id);
 
-                                    if let Err(e) =
-                                        pm.send_direct_to_connection(peer_id, message.clone()).await
-                                    {
-                                        error!(
-                                            "❌ Failed to send TransferComplete to peer {}: {}",
-                                            peer_id, e
-                                        );
-                                    }
-
-                                    // Mark streaming transfer as completed
-                                    {
-                                        let mut ft = pm.file_transfer.write().await;
-                                        if let Err(e) =
-                                            ft.mark_outgoing_transfer_completed(*transfer_id).await
-                                        {
-                                            error!("❌ Failed to mark streaming transfer {} as completed: {}", transfer_id, e);
-                                        }
-                                    }
-
-                                    continue;
-                                }
-
-                                // For all other outgoing transfer messages, send directly
+                                let mut ft = pm.file_transfer.write().await;
                                 if let Err(e) =
-                                    pm.send_direct_to_connection(peer_id, message.clone()).await
+                                    ft.mark_outgoing_transfer_completed(*transfer_id).await
                                 {
                                     error!(
-                                        "❌ Failed to send direct message to peer {}: {}",
-                                        peer_id, e
+                                        "❌ Failed to mark outgoing transfer {} as completed: {}",
+                                        transfer_id, e
                                     );
                                 }
+                                // Don't send the message back to peer - they sent it to us!
                                 continue;
+                            } else {
+                                // For incoming transfers, process normally through handle_message
+                                info!("✅ Processing TransferComplete for incoming transfer {} from peer {}", transfer_id, peer_id);
                             }
                         }
-                        _ => {}
+
+                        // Other transfer messages that might need direct routing
+                        crate::network::protocol::MessageType::FileOffer { .. }
+                        | crate::network::protocol::MessageType::FileOfferResponse { .. }
+                        | crate::network::protocol::MessageType::FileChunk { .. }
+                        | crate::network::protocol::MessageType::TransferError { .. }
+                        | crate::network::protocol::MessageType::TransferProgress { .. }
+                        | crate::network::protocol::MessageType::TransferPause { .. }
+                        | crate::network::protocol::MessageType::TransferResume { .. } => {
+                            // All other transfer messages are processed normally through handle_message
+                            // No special routing needed
+                        }
+
+                        // All other message types
+                        _ => {
+                            // Process normally
+                        }
                     }
 
-                    // Process all other messages normally
+                    // Process all messages through the normal handler
+                    // (except TransferComplete for outgoing transfers which we handled above)
                     if let Err(e) = pm
                         .handle_message(peer_id, message, &message_clipboard)
                         .await
