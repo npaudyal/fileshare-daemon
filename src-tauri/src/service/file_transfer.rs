@@ -1381,6 +1381,14 @@ impl FileTransferManager {
                         } else { 
                             format!("{:?}", &chunk.data[..chunk.data.len().min(8)]) 
                         };
+                        let compressed_last = if chunk.data.len() >= 8 { 
+                            let len = chunk.data.len();
+                            format!("{:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x}", 
+                                chunk.data[len-8], chunk.data[len-7], chunk.data[len-6], chunk.data[len-5],
+                                chunk.data[len-4], chunk.data[len-3], chunk.data[len-2], chunk.data[len-1]) 
+                        } else { 
+                            format!("{:?}", chunk.data) 
+                        };
                         let decompressed_first = if decompressed.len() >= 8 { 
                             format!("{:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x}", 
                                 decompressed[0], decompressed[1], decompressed[2], decompressed[3],
@@ -1389,8 +1397,8 @@ impl FileTransferManager {
                             format!("{:?}", &decompressed[..decompressed.len().min(8)]) 
                         };
                         debug!(
-                            "🔧 DECOMP_DEBUG: Chunk {} - Compressed size: {}, first bytes: {} | Decompressed size: {}, first bytes: {}",
-                            chunk.index, chunk.data.len(), compressed_first, decompressed.len(), decompressed_first
+                            "🔧 DECOMP_DEBUG: Chunk {} - Compressed size: {}, first: {}, last: {} | Decompressed size: {}, first: {}",
+                            chunk.index, chunk.data.len(), compressed_first, compressed_last, decompressed.len(), decompressed_first
                         );
                     }
                     
