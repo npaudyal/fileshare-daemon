@@ -1183,7 +1183,12 @@ impl FileTransferManager {
         let received_data = if use_streaming {
             Vec::new() // No pre-allocation for streaming
         } else {
-            vec![0u8; metadata.size as usize] // Keep old behavior for small files
+            let buffer = vec![0u8; metadata.size as usize]; // Keep old behavior for small files
+            info!(
+                "🔧 BUFFER_INIT: Non-streaming mode, allocated buffer of {} bytes (all zeros)",
+                buffer.len()
+            );
+            buffer
         };
 
         // Create streaming writer if needed
@@ -1365,8 +1370,45 @@ impl FileTransferManager {
                     // Decompress chunk data if it's compressed
                 let compression_type = transfer.metadata.compression;
                 let decompressed_data = if chunk.compressed && compression_type.is_some() {
-                    Self::decompress_chunk_data_static(&chunk.data, compression_type.unwrap())?
+                    let decompressed = Self::decompress_chunk_data_static(&chunk.data, compression_type.unwrap())?;
+                    
+                    // Debug: Compare compressed vs decompressed for first few chunks
+                    if chunk.index < 5 || chunk.index >= 25 {
+                        let compressed_first = if chunk.data.len() >= 8 { 
+                            format!("{:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x}", 
+                                chunk.data[0], chunk.data[1], chunk.data[2], chunk.data[3],
+                                chunk.data[4], chunk.data[5], chunk.data[6], chunk.data[7]) 
+                        } else { 
+                            format!("{:?}", &chunk.data[..chunk.data.len().min(8)]) 
+                        };
+                        let decompressed_first = if decompressed.len() >= 8 { 
+                            format!("{:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x}", 
+                                decompressed[0], decompressed[1], decompressed[2], decompressed[3],
+                                decompressed[4], decompressed[5], decompressed[6], decompressed[7]) 
+                        } else { 
+                            format!("{:?}", &decompressed[..decompressed.len().min(8)]) 
+                        };
+                        debug!(
+                            "🔧 DECOMP_DEBUG: Chunk {} - Compressed size: {}, first bytes: {} | Decompressed size: {}, first bytes: {}",
+                            chunk.index, chunk.data.len(), compressed_first, decompressed.len(), decompressed_first
+                        );
+                    }
+                    
+                    decompressed
                 } else {
+                    if chunk.index < 5 || chunk.index >= 25 {
+                        let uncompressed_first = if chunk.data.len() >= 8 { 
+                            format!("{:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x}", 
+                                chunk.data[0], chunk.data[1], chunk.data[2], chunk.data[3],
+                                chunk.data[4], chunk.data[5], chunk.data[6], chunk.data[7]) 
+                        } else { 
+                            format!("{:?}", &chunk.data[..chunk.data.len().min(8)]) 
+                        };
+                        debug!(
+                            "🔧 UNCOMP_DEBUG: Chunk {} - Size: {}, first bytes: {}",
+                            chunk.index, chunk.data.len(), uncompressed_first
+                        );
+                    }
                     chunk.data.clone()
                 };
                 
@@ -1402,8 +1444,33 @@ impl FileTransferManager {
                     // Copy decompressed chunk data into the buffer
                     let start_idx = expected_offset as usize;
                     let end_idx = expected_offset as usize + bytes_to_copy;
+                    
+                    // Debug: Log buffer write operations for first few chunks
+                    if chunk.index < 5 || chunk.index >= 25 {
+                        debug!(
+                            "🔧 BUFFER_WRITE: Chunk {} -> buffer[{}..{}] ({} bytes), compressed_size: {}, decompressed_size: {}",
+                            chunk.index, start_idx, end_idx, bytes_to_copy, chunk.data.len(), decompressed_data.len()
+                        );
+                    }
+                    
                     transfer.received_data[start_idx..end_idx].copy_from_slice(&decompressed_data[..bytes_to_copy]);
                     transfer.bytes_transferred += bytes_to_copy as u64;
+                    
+                    // Debug: Verify buffer content for first few chunks
+                    if chunk.index < 5 || chunk.index >= 25 {
+                        let buffer_slice = &transfer.received_data[start_idx..end_idx];
+                        let first_bytes = if buffer_slice.len() >= 8 { 
+                            format!("{:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x}", 
+                                buffer_slice[0], buffer_slice[1], buffer_slice[2], buffer_slice[3],
+                                buffer_slice[4], buffer_slice[5], buffer_slice[6], buffer_slice[7]) 
+                        } else { 
+                            format!("{:?}", buffer_slice) 
+                        };
+                        debug!(
+                            "🔧 BUFFER_VERIFY: Chunk {} written to buffer, first 8 bytes: {}",
+                            chunk.index, first_bytes
+                        );
+                    }
                     
                     // Mark chunk as received
                     transfer.chunks_received[chunk.index as usize] = true;
@@ -1518,7 +1585,26 @@ impl FileTransferManager {
                 use sha2::{Digest, Sha256};
                 let mut hasher = Sha256::new();
                 hasher.update(&file_data);
-                format!("{:x}", hasher.finalize())
+                let checksum = format!("{:x}", hasher.finalize());
+                
+                // Debug: Log first and last 32 bytes of assembled file data
+                let first_bytes = if file_data.len() >= 32 { 
+                    format!("{:?}", &file_data[..32]) 
+                } else { 
+                    format!("{:?}", &file_data[..file_data.len().min(32)]) 
+                };
+                let last_bytes = if file_data.len() >= 32 { 
+                    format!("{:?}", &file_data[file_data.len()-32..]) 
+                } else { 
+                    format!("{:?}", &file_data[file_data.len().saturating_sub(32)..]) 
+                };
+                
+                debug!(
+                    "🔍 CHECKSUM_DEBUG: File data checksum: {}, size: {}, first_32: {}, last_32: {}",
+                    checksum, file_data.len(), first_bytes, last_bytes
+                );
+                
+                checksum
             };
 
             std::fs::write(&file_path, &file_data).map_err(|e| {
