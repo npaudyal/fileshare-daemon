@@ -70,8 +70,51 @@ impl StreamingFileReader {
         // Seek to the correct position first
         self.seek_to_chunk(chunk_index).await?;
         
-        // Then read the chunk
-        self.read_next_chunk().await
+        // Calculate the size for this specific chunk
+        let start_position = chunk_index * self.chunk_size as u64;
+        let remaining_bytes = self.total_size - start_position;
+        let chunk_size_to_read = std::cmp::min(self.chunk_size as u64, remaining_bytes) as usize;
+        
+        if chunk_size_to_read == 0 {
+            return Ok(None);
+        }
+        
+        info!("🔧 READER_INDEX: Reading chunk {} with target size {} bytes (remaining: {} bytes)", 
+              chunk_index, chunk_size_to_read, remaining_bytes);
+        
+        let mut buffer = vec![0u8; chunk_size_to_read];
+        let mut total_bytes_read = 0;
+        
+        // Keep reading until we fill the entire chunk or reach EOF
+        while total_bytes_read < chunk_size_to_read {
+            let bytes_read = self.file.read(&mut buffer[total_bytes_read..]).await?;
+            if bytes_read == 0 {
+                // EOF reached
+                break;
+            }
+            total_bytes_read += bytes_read;
+        }
+        
+        info!("🔧 READER_INDEX: Successfully read {} bytes for chunk {} (target: {})", 
+              total_bytes_read, chunk_index, chunk_size_to_read);
+        
+        if total_bytes_read == 0 {
+            return Ok(None);
+        }
+        
+        buffer.truncate(total_bytes_read);
+        self.hasher.update(&buffer);
+        
+        let is_last = start_position + total_bytes_read as u64 >= self.total_size;
+        
+        // Apply compression if needed
+        let compressed_data = if let Some(compression) = self.compression {
+            self.compress_chunk(&buffer, compression)?
+        } else {
+            buffer
+        };
+        
+        Ok(Some((compressed_data, is_last)))
     }
 
     pub async fn read_next_chunk(&mut self) -> Result<Option<(Vec<u8>, bool)>> {
@@ -79,17 +122,35 @@ impl StreamingFileReader {
             return Ok(None);
         }
         
-        info!("🔧 READER: Creating buffer of size {} bytes (chunk_size: {})", self.chunk_size, self.chunk_size);
-        let mut buffer = vec![0u8; self.chunk_size];
-        let bytes_read = self.file.read(&mut buffer).await?;
-        info!("🔧 READER: Actually read {} bytes from file", bytes_read);
+        // Calculate how many bytes we should read for this chunk
+        let remaining_bytes = self.total_size - self.bytes_read;
+        let chunk_size_to_read = std::cmp::min(self.chunk_size as u64, remaining_bytes) as usize;
         
-        if bytes_read == 0 {
+        info!("🔧 READER: Reading chunk with target size {} bytes (remaining: {} bytes)", 
+              chunk_size_to_read, remaining_bytes);
+        
+        let mut buffer = vec![0u8; chunk_size_to_read];
+        let mut total_bytes_read = 0;
+        
+        // Keep reading until we fill the entire chunk or reach EOF
+        while total_bytes_read < chunk_size_to_read {
+            let bytes_read = self.file.read(&mut buffer[total_bytes_read..]).await?;
+            if bytes_read == 0 {
+                // EOF reached
+                break;
+            }
+            total_bytes_read += bytes_read;
+        }
+        
+        info!("🔧 READER: Successfully read {} bytes for chunk (target: {})", 
+              total_bytes_read, chunk_size_to_read);
+        
+        if total_bytes_read == 0 {
             return Ok(None);
         }
         
-        buffer.truncate(bytes_read);
-        self.bytes_read += bytes_read as u64;
+        buffer.truncate(total_bytes_read);
+        self.bytes_read += total_bytes_read as u64;
         self.hasher.update(&buffer);
         
         let is_last = self.bytes_read >= self.total_size;
