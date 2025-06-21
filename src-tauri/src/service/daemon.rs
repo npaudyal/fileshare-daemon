@@ -610,6 +610,8 @@ impl FileshareDaemon {
                     }
 
                     // FIXED: Correct message routing logic
+                    let mut should_process_normally = true;
+
                     match &message.message_type {
                         // TransferComplete handling - FIXED LOGIC
                         crate::network::protocol::MessageType::TransferComplete {
@@ -638,15 +640,15 @@ impl FileshareDaemon {
                                         transfer_id, e
                                     );
                                 }
-                                // Don't send the message back to peer - they sent it to us!
-                                continue;
+                                // Don't process this message normally - we handled it
+                                should_process_normally = false;
                             } else {
                                 // For incoming transfers, process normally through handle_message
                                 info!("✅ Processing TransferComplete for incoming transfer {} from peer {}", transfer_id, peer_id);
                             }
                         }
 
-                        // Other transfer messages that might need direct routing
+                        // Other transfer messages that are processed normally
                         crate::network::protocol::MessageType::FileOffer { .. }
                         | crate::network::protocol::MessageType::FileOfferResponse { .. }
                         | crate::network::protocol::MessageType::FileChunk { .. }
@@ -664,13 +666,14 @@ impl FileshareDaemon {
                         }
                     }
 
-                    // Process all messages through the normal handler
-                    // (except TransferComplete for outgoing transfers which we handled above)
-                    if let Err(e) = pm
-                        .handle_message(peer_id, message, &message_clipboard)
-                        .await
-                    {
-                        error!("❌ Error processing message from peer {}: {}", peer_id, e);
+                    // Process messages through the normal handler (unless we handled them specially above)
+                    if should_process_normally {
+                        if let Err(e) = pm
+                            .handle_message(peer_id, message, &message_clipboard)
+                            .await
+                        {
+                            error!("❌ Error processing message from peer {}: {}", peer_id, e);
+                        }
                     }
                 }
             }

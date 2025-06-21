@@ -1019,6 +1019,7 @@ impl PeerManager {
     }
 
     // ENHANCED: File request handling with streaming awareness
+    // In peer.rs, update the handle_file_request method:
     async fn handle_file_request(
         &mut self,
         peer_id: Uuid,
@@ -1062,7 +1063,7 @@ impl PeerManager {
 
         info!("File request accepted{}", size_info);
 
-        // Accept the request
+        // Accept the request first
         let response = Message::new(MessageType::FileRequestResponse {
             request_id,
             accepted: true,
@@ -1074,19 +1075,84 @@ impl PeerManager {
         }
 
         info!(
-            "File request accepted, starting file transfer to peer {} for file: {:?}",
+            "File request accepted, starting direct file transfer to peer {} for file: {:?}",
             peer_id, file_path
         );
 
-        // Extract target directory
+        // FIXED: Send file directly without creating a FileOffer
+        // Extract target directory from target_path
         let target_dir = Self::extract_target_directory(&target_path);
 
-        info!("Target directory extracted: {:?}", target_dir);
+        // Create file metadata for the transfer
+        let metadata = if self
+            .file_transfer
+            .read()
+            .await
+            .settings
+            .streaming
+            .enable_streaming_mode
+        {
+            crate::network::protocol::FileMetadata::from_path_with_streaming(&file_path)?
+        } else {
+            let chunk_size = self.file_transfer.read().await.settings.transfer.chunk_size;
+            crate::network::protocol::FileMetadata::from_path_with_chunk_size(
+                &file_path, chunk_size,
+            )?
+        }
+        .with_target_dir(target_dir);
 
-        // Start file transfer with enhanced streaming support
-        let mut ft = self.file_transfer.write().await;
-        ft.send_file_with_target_dir(peer_id, file_path, target_dir)
-            .await?;
+        let transfer_id = Uuid::new_v4();
+
+        info!(
+            "🚀 Starting direct file transfer {} to peer {} for requested file: {:?}",
+            transfer_id, peer_id, file_path
+        );
+
+        // Create the transfer manually and start sending immediately
+        {
+            let mut ft = self.file_transfer.write().await;
+
+            // Create progress tracker
+            let progress = crate::service::progress::TransferProgress::new(
+                transfer_id,
+                file_path
+                    .file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .to_string(),
+                metadata.size,
+                metadata.estimated_chunks,
+            );
+
+            // Create and store the transfer
+            let transfer = crate::service::file_transfer::FileTransfer {
+                id: transfer_id,
+                peer_id,
+                metadata: metadata.clone(),
+                file_path: file_path.clone(),
+                direction: crate::service::file_transfer::TransferDirection::Outgoing,
+                status: crate::service::file_transfer::TransferStatus::Active, // Start as active
+                bytes_transferred: 0,
+                chunks_received: Vec::new(),
+                file_handle: None,
+                received_data: Vec::new(),
+                created_at: std::time::Instant::now(),
+                retry_state: crate::service::file_transfer::RetryState::default(),
+                last_activity: std::time::Instant::now(),
+                progress,
+                is_streaming: metadata.supports_streaming,
+                streaming_writer: None,
+            };
+
+            ft.active_transfers.insert(transfer_id, transfer);
+            info!(
+                "🚀 Created direct transfer {} for file request",
+                transfer_id
+            );
+
+            // Start the file transfer immediately without FileOffer
+            ft.start_direct_file_transfer(transfer_id).await?;
+        }
 
         Ok(())
     }

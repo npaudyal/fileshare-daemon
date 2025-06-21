@@ -85,7 +85,7 @@ pub enum TransferStatus {
 }
 
 pub struct FileTransferManager {
-    settings: Arc<Settings>,
+    pub settings: Arc<Settings>,
     pub active_transfers: HashMap<Uuid, FileTransfer>,
     message_sender: Option<MessageSender>,
 }
@@ -1251,6 +1251,79 @@ impl FileTransferManager {
                     warn!("Failed to show notification: {}", e);
                 }
             }
+        }
+
+        Ok(())
+    }
+
+    pub async fn start_direct_file_transfer(&mut self, transfer_id: Uuid) -> Result<()> {
+        let (file_path, peer_id, chunk_size, is_streaming, progress_interval) = {
+            let transfer = self
+                .active_transfers
+                .get_mut(&transfer_id)
+                .ok_or_else(|| FileshareError::Transfer("Transfer not found".to_string()))?;
+
+            transfer.status = TransferStatus::Active;
+            transfer.last_activity = Instant::now();
+
+            let chunk_size = if transfer.is_streaming {
+                transfer.metadata.stream_chunk_size
+            } else {
+                transfer.metadata.chunk_size
+            };
+
+            (
+                transfer.file_path.clone(),
+                transfer.peer_id,
+                chunk_size,
+                transfer.is_streaming,
+                self.settings.streaming.progress_report_interval_ms,
+            )
+        };
+
+        let message_sender = self
+            .message_sender
+            .clone()
+            .ok_or_else(|| FileshareError::Transfer("Message sender not configured".to_string()))?;
+
+        info!(
+            "🚀 Starting direct {} transfer for {} with chunk size {}",
+            if is_streaming { "streaming" } else { "legacy" },
+            transfer_id,
+            chunk_size
+        );
+
+        if is_streaming {
+            // Use streaming implementation
+            tokio::spawn(async move {
+                if let Err(e) = Self::send_file_chunks_streaming(
+                    message_sender,
+                    peer_id,
+                    transfer_id,
+                    file_path,
+                    chunk_size,
+                    progress_interval,
+                )
+                .await
+                {
+                    error!("Failed to send streaming file chunks: {}", e);
+                }
+            });
+        } else {
+            // Use legacy implementation
+            tokio::spawn(async move {
+                if let Err(e) = Self::send_file_chunks_legacy(
+                    message_sender,
+                    peer_id,
+                    transfer_id,
+                    file_path,
+                    chunk_size,
+                )
+                .await
+                {
+                    error!("Failed to send legacy file chunks: {}", e);
+                }
+            });
         }
 
         Ok(())
