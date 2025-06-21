@@ -1355,7 +1355,14 @@ impl FileTransferManager {
             } else {
                 // Non-streaming mode - accumulate in memory
                 
-                // Decompress chunk data if it's compressed
+                // Skip duplicate chunks
+                if transfer.chunks_received[chunk.index as usize] {
+                    warn!(
+                        "⚠️ RECEIVER: Skipping duplicate chunk {} for transfer {}",
+                        chunk.index, transfer_id
+                    );
+                } else {
+                    // Decompress chunk data if it's compressed
                 let compression_type = transfer.metadata.compression;
                 let decompressed_data = if chunk.compressed && compression_type.is_some() {
                     Self::decompress_chunk_data_static(&chunk.data, compression_type.unwrap())?
@@ -1392,15 +1399,16 @@ impl FileTransferManager {
                     decompressed_data.len()
                 };
 
-                // Copy decompressed chunk data into the buffer
-                let start_idx = expected_offset as usize;
-                let end_idx = expected_offset as usize + bytes_to_copy;
-                transfer.received_data[start_idx..end_idx].copy_from_slice(&decompressed_data[..bytes_to_copy]);
-                transfer.bytes_transferred += bytes_to_copy as u64;
+                    // Copy decompressed chunk data into the buffer
+                    let start_idx = expected_offset as usize;
+                    let end_idx = expected_offset as usize + bytes_to_copy;
+                    transfer.received_data[start_idx..end_idx].copy_from_slice(&decompressed_data[..bytes_to_copy]);
+                    transfer.bytes_transferred += bytes_to_copy as u64;
+                    
+                    // Mark chunk as received
+                    transfer.chunks_received[chunk.index as usize] = true;
+                }
             }
-
-            // Mark chunk as received
-            transfer.chunks_received[chunk.index as usize] = true;
 
             // Check if transfer is complete - ALL chunks must be received
             let chunks_received_count = transfer.chunks_received.iter().filter(|&&b| b).count();
@@ -1505,6 +1513,14 @@ impl FileTransferManager {
 
             info!("📊 RECEIVER: File data size: {} bytes", file_data.len());
 
+            // Calculate checksum on the data buffer before writing to disk
+            let calculated_checksum = {
+                use sha2::{Digest, Sha256};
+                let mut hasher = Sha256::new();
+                hasher.update(&file_data);
+                format!("{:x}", hasher.finalize())
+            };
+
             std::fs::write(&file_path, &file_data).map_err(|e| {
                 error!("Failed to write file {:?}: {}", file_path, e);
                 FileshareError::FileOperation(format!("Failed to write file: {}", e))
@@ -1512,8 +1528,7 @@ impl FileTransferManager {
 
             info!("✅ RECEIVER: File written successfully to: {:?}", file_path);
 
-            // Calculate checksum
-            self.calculate_file_checksum(&file_path)?
+            calculated_checksum
         };
 
         // Verify checksum if provided
