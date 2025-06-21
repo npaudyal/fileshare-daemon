@@ -1357,12 +1357,12 @@ impl FileTransferManager {
                 let chunk_size = transfer.metadata.chunk_size as u64;
                 let expected_offset = chunk.index * chunk_size;
                 let actual_end_offset = expected_offset + chunk.data.len() as u64;
-                let expected_file_size = transfer.received_data.len() as u64;
+                let actual_file_size = transfer.metadata.size;
 
-                if actual_end_offset > expected_file_size {
+                if actual_end_offset > actual_file_size {
                     return Err(FileshareError::Transfer(format!(
-                        "Chunk {} too large: exceeds file size",
-                        chunk.index
+                        "Chunk {} too large: exceeds file size (offset: {}, file size: {})",
+                        chunk.index, actual_end_offset, actual_file_size
                     )));
                 }
 
