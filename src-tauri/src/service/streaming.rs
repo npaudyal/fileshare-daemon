@@ -139,6 +139,12 @@ impl StreamingFileWriter {
     }
     
     pub async fn write_chunk(&mut self, index: u64, data: Vec<u8>, compressed: bool) -> Result<()> {
+        // Skip chunks that are already written (duplicate handling)
+        if index < self.next_write_index {
+            info!("⚠️ Skipping duplicate chunk {} (already processed up to {})", index, self.next_write_index - 1);
+            return Ok(());
+        }
+        
         // Decompress if needed
         let decompressed_data = if compressed && self.decompression.is_some() {
             self.decompress_chunk(&data, self.decompression.unwrap())?
@@ -153,16 +159,38 @@ impl StreamingFileWriter {
             
             // Check if we have buffered chunks that can now be written
             self.flush_buffered_chunks().await?;
-        } else if index < self.next_write_index + self.chunks_buffer.len() as u64 {
-            // Buffer out-of-order chunks (within reasonable limits)
-            let buffer_index = (index - self.next_write_index) as usize;
-            self.chunks_buffer[buffer_index] = Some(decompressed_data);
-        } else {
-            // Chunk is too far ahead, reject it
-            return Err(FileshareError::Transfer(format!(
-                "Chunk {} is too far ahead (expected around {})",
-                index, self.next_write_index
-            )));
+        } else if index > self.next_write_index {
+            // Calculate buffer index for out-of-order chunks
+            let buffer_offset = index - self.next_write_index;
+            
+            // Check if chunk is within reasonable buffering distance
+            if buffer_offset < self.chunks_buffer.len() as u64 {
+                let buffer_index = buffer_offset as usize;
+                if buffer_index < self.chunks_buffer.len() {
+                    info!("📦 Buffering out-of-order chunk {} at buffer index {} (expecting {})", 
+                          index, buffer_index, self.next_write_index);
+                    self.chunks_buffer[buffer_index] = Some(decompressed_data);
+                } else {
+                    warn!("⚠️ Buffer index {} out of bounds (buffer size: {})", buffer_index, self.chunks_buffer.len());
+                }
+            } else {
+                // Chunk is too far ahead, but don't reject - just warn and continue
+                warn!("⚠️ Chunk {} is very far ahead (expected around {}), buffering capability exceeded", 
+                      index, self.next_write_index);
+                // For now, expand buffer if needed (with limits)
+                if self.chunks_buffer.len() < 1000 { // Reasonable limit
+                    let additional_slots = (buffer_offset as usize + 1) - self.chunks_buffer.len();
+                    self.chunks_buffer.resize(self.chunks_buffer.len() + additional_slots, None);
+                    let buffer_index = buffer_offset as usize;
+                    self.chunks_buffer[buffer_index] = Some(decompressed_data);
+                    info!("📦 Expanded buffer to {} slots for chunk {}", self.chunks_buffer.len(), index);
+                } else {
+                    return Err(FileshareError::Transfer(format!(
+                        "Chunk {} is too far ahead (expected around {}) and buffer capacity exceeded",
+                        index, self.next_write_index
+                    )));
+                }
+            }
         }
         
         Ok(())
@@ -170,13 +198,16 @@ impl StreamingFileWriter {
     
     async fn flush_buffered_chunks(&mut self) -> Result<()> {
         while !self.chunks_buffer.is_empty() {
-            if let Some(Some(_)) = self.chunks_buffer.first() {
-                if let Some(data) = self.chunks_buffer.remove(0) {
-                    self.write_data(&data).await?;
-                    self.next_write_index += 1;
-                    self.chunks_buffer.push(None); // Maintain buffer size
-                }
+            // Check if the first buffered chunk is available (next expected chunk)
+            if let Some(Some(data)) = self.chunks_buffer.first().cloned() {
+                // Remove the chunk from buffer and write it
+                self.chunks_buffer.remove(0);
+                self.write_data(&data).await?;
+                self.next_write_index += 1;
+                self.chunks_buffer.push(None); // Maintain buffer size
+                info!("✅ Flushed buffered chunk {} from buffer", self.next_write_index - 1);
             } else {
+                // No more consecutive chunks available
                 break;
             }
         }

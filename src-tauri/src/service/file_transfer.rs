@@ -901,23 +901,17 @@ impl FileTransferManager {
             }
         }
 
-        // Get final checksum
+        // Get final checksum for logging
         let checksum = reader.get_checksum();
 
         info!(
-            "✅ SEQUENTIAL: Transfer {} complete - {} chunks, {} bytes, checksum: {}",
+            "✅ SEQUENTIAL: All chunks sent for transfer {} - {} chunks, {} bytes, checksum: {} (waiting for receiver confirmation)",
             transfer_id, chunk_index, bytes_sent, checksum
         );
 
-        let complete_msg = Message::new(MessageType::TransferComplete {
-            transfer_id,
-            checksum,
-        });
-
-        if let Err(e) = message_sender.send((peer_id, complete_msg)) {
-            error!("❌ Failed to send transfer complete: {}", e);
-        }
-
+        // Note: We don't send TransferComplete here - the receiver will send it to us
+        // when it has successfully received and written all chunks
+        
         Ok(())
     }
 
@@ -1036,24 +1030,18 @@ impl FileTransferManager {
             // In a real implementation, we'd retry the failed chunks here
         }
 
-        // Calculate final checksum (simplified - in reality we'd need to combine all readers)
+        // Calculate final checksum for logging (simplified - in reality we'd need to combine all readers)
         let checksum = readers.into_iter().next().unwrap().get_checksum();
 
         info!(
-            "✅ PARALLEL: Transfer {} complete - {} chunks, checksum: {}",
+            "✅ PARALLEL: All chunks sent for transfer {} - {} chunks, checksum: {} (waiting for receiver confirmation)",
             transfer_id,
             tracker.completed_chunks.len(),
             checksum
         );
 
-        let complete_msg = Message::new(MessageType::TransferComplete {
-            transfer_id,
-            checksum,
-        });
-
-        if let Err(e) = message_sender.send((peer_id, complete_msg)) {
-            error!("❌ Failed to send transfer complete: {}", e);
-        }
+        // Note: We don't send TransferComplete here - the receiver will send it to us
+        // when it has successfully received and written all chunks
 
         Ok(())
     }
@@ -1283,8 +1271,8 @@ impl FileTransferManager {
             // Mark chunk as received
             transfer.chunks_received[chunk.index as usize] = true;
 
-            // Check if transfer is complete
-            chunk.is_last || transfer.chunks_received.iter().all(|&received| received)
+            // Check if transfer is complete - ALL chunks must be received
+            transfer.chunks_received.iter().all(|&received| received)
         };
 
         if is_complete {

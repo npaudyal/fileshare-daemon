@@ -745,8 +745,20 @@ impl PeerManager {
         match message.message_type {
             MessageType::Ping => {
                 debug!("Received ping from {}", peer_id);
+                // Rate limit pong responses to prevent flooding
+                if let Some(peer) = self.peers.get(&peer_id) {
+                    if let Some(last_pong) = peer.last_ping {
+                        // Only respond to ping if it's been at least 5 seconds since last pong
+                        if last_pong.elapsed().as_secs() < 5 {
+                            debug!("Rate limiting pong response to {}", peer_id);
+                            return Ok(());
+                        }
+                    }
+                }
+                
                 if let Some(conn) = self.connections.get(&peer_id) {
                     let _ = conn.send(Message::pong());
+                    info!("📤 WRITE to peer {}: Pong", peer_id);
                 }
             }
             MessageType::Pong => {
