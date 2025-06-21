@@ -799,7 +799,7 @@ impl FileTransferManager {
 
         // Get parallel chunks setting from configuration
         let parallel_chunks = settings.transfer.parallel_chunks;
-        let use_parallel = parallel_chunks > 1 && total_chunks > 10; // Only use parallel for larger files
+        let use_parallel = false; // Temporarily disable parallel mode to test sequential fixes
 
         info!(
             "📊 File: {} bytes, streaming: {}, compression: {:?}, parallel: {} (chunks: {})",
@@ -965,15 +965,11 @@ impl FileTransferManager {
             // Read chunks for this batch
             for (i, &chunk_index) in batch.iter().enumerate() {
                 let reader_index = i % readers.len();
-                let reader_len = readers.len();
+                let _reader_len = readers.len();
 
-                // Skip to the correct chunk
-                let _offset = chunk_index * chunk_size as u64;
-                // Note: In a real implementation, we'd need to seek to the correct position
-                // For now, this is a simplified version
-
+                // Read chunk at the specific index (with proper seeking)
                 if let Some((chunk_data, _is_last)) =
-                    readers[reader_index].read_next_chunk().await?
+                    readers[reader_index].read_chunk_at_index(chunk_index).await?
                 {
                     let chunk = TransferChunk {
                         index: chunk_index,
@@ -1284,12 +1280,30 @@ impl FileTransferManager {
             transfer.chunks_received[chunk.index as usize] = true;
 
             // Check if transfer is complete - ALL chunks must be received
-            let is_complete = transfer.chunks_received.iter().all(|&received| received);
+            let chunks_received_count = transfer.chunks_received.iter().filter(|&&b| b).count();
+            let total_chunks = transfer.metadata.total_chunks as usize;
+            let is_complete = chunks_received_count == total_chunks;
+            
+            // Enhanced debugging to track which chunks are missing
+            if chunk.index % 10 == 0 || chunk.is_last || is_complete {
+                let missing_chunks: Vec<usize> = transfer.chunks_received
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, &received)| !received)
+                    .map(|(idx, _)| idx)
+                    .collect();
+                
+                info!(
+                    "📊 CHUNK_STATUS: Transfer {} - Received {}/{} chunks, Missing: {:?}",
+                    transfer_id, chunks_received_count, total_chunks, 
+                    if missing_chunks.len() <= 10 { format!("{:?}", missing_chunks) } 
+                    else { format!("{} chunks missing", missing_chunks.len()) }
+                );
+            }
             
             // Capture debugging info before releasing the transfer reference
             let debug_info = if is_complete {
-                let chunks_received_count = transfer.chunks_received.iter().filter(|&&b| b).count();
-                Some((chunks_received_count, transfer.metadata.total_chunks))
+                Some((chunks_received_count, total_chunks as u64))
             } else {
                 None
             };

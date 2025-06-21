@@ -43,6 +43,34 @@ impl StreamingFileReader {
         })
     }
     
+    pub async fn seek_to_chunk(&mut self, chunk_index: u64) -> Result<()> {
+        use tokio::io::AsyncSeekExt;
+        
+        let seek_position = chunk_index * self.chunk_size as u64;
+        if seek_position >= self.total_size {
+            return Err(FileshareError::FileOperation(format!(
+                "Seek position {} beyond file size {}", seek_position, self.total_size
+            )));
+        }
+        
+        // Get the inner file from the BufReader to seek
+        let mut file = self.file.get_mut();
+        file.seek(std::io::SeekFrom::Start(seek_position)).await?;
+        
+        // Update our tracking
+        self.bytes_read = seek_position;
+        
+        Ok(())
+    }
+    
+    pub async fn read_chunk_at_index(&mut self, chunk_index: u64) -> Result<Option<(Vec<u8>, bool)>> {
+        // Seek to the correct position first
+        self.seek_to_chunk(chunk_index).await?;
+        
+        // Then read the chunk
+        self.read_next_chunk().await
+    }
+
     pub async fn read_next_chunk(&mut self) -> Result<Option<(Vec<u8>, bool)>> {
         if self.bytes_read >= self.total_size {
             return Ok(None);
