@@ -267,29 +267,49 @@ impl StreamingFileWriter {
             self.flush_buffered_chunks().await?;
         } else if index > self.next_write_index {
             // Calculate buffer index for out-of-order chunks
-            // buffer[0] = next_write_index + 1, buffer[1] = next_write_index + 2, etc.
-            let buffer_index = (index - self.next_write_index - 1) as usize;
+            // buffer[0] = next_write_index, buffer[1] = next_write_index + 1, etc.
+            let buffer_index = (index - self.next_write_index) as usize;
+            
+            // Validate the buffer index calculation
+            if buffer_index == 0 {
+                // This should not happen since we already checked index == self.next_write_index
+                warn!("⚠️ Buffer index calculation error: chunk {} maps to buffer index 0 but next_write_index is {}", 
+                      index, self.next_write_index);
+                return Err(FileshareError::Transfer(format!(
+                    "Buffer index calculation error for chunk {}",
+                    index
+                )));
+            }
+            
+            let adjusted_buffer_index = buffer_index - 1; // Adjust since buffer[0] = next_write_index + 1
             
             // Check if chunk is within reasonable buffering distance
-            if buffer_index < self.chunks_buffer.len() {
+            if adjusted_buffer_index < self.chunks_buffer.len() {
                 if index % 10 == 0 {  // Only log every 10th buffered chunk
-                    info!("📦 Buffering out-of-order chunk {} at buffer index {} (expecting {})", 
-                          index, buffer_index, self.next_write_index);
+                    info!("📦 Buffering out-of-order chunk {} at buffer index {} (expecting {}, gap: {})", 
+                          index, adjusted_buffer_index, self.next_write_index, buffer_index);
                 }
-                self.chunks_buffer[buffer_index] = Some(decompressed_data);
+                
+                // Check if slot is already occupied
+                if self.chunks_buffer[adjusted_buffer_index].is_some() {
+                    warn!("⚠️ Buffer slot {} already occupied for chunk {} (expected {}) - overwriting", 
+                          adjusted_buffer_index, index, self.next_write_index);
+                }
+                
+                self.chunks_buffer[adjusted_buffer_index] = Some(decompressed_data);
             } else {
                 // Chunk is too far ahead - expand buffer if reasonable
-                warn!("⚠️ Chunk {} is far ahead (expected around {}), expanding buffer", 
-                      index, self.next_write_index);
+                warn!("⚠️ Chunk {} is far ahead (expected around {}), expanding buffer from {} to {}", 
+                      index, self.next_write_index, self.chunks_buffer.len(), adjusted_buffer_index + 1);
                 
                 // Calculate how many slots we need
-                let required_buffer_size = buffer_index + 1;
+                let required_buffer_size = adjusted_buffer_index + 1;
                 
                 if required_buffer_size <= 1000 { // Reasonable limit
                     // Expand buffer to accommodate this chunk
                     self.chunks_buffer.resize(required_buffer_size, None);
                     
-                    self.chunks_buffer[buffer_index] = Some(decompressed_data);
+                    self.chunks_buffer[adjusted_buffer_index] = Some(decompressed_data);
                     info!("📦 Expanded buffer to {} slots for chunk {}", self.chunks_buffer.len(), index);
                 } else {
                     return Err(FileshareError::Transfer(format!(
@@ -304,12 +324,15 @@ impl StreamingFileWriter {
     }
     
     async fn flush_buffered_chunks(&mut self) -> Result<()> {
+        let mut consecutive_flushes = 0;
+        
         while !self.chunks_buffer.is_empty() && self.chunks_buffer[0].is_some() {
             // Get the first chunk from buffer (which should be the next expected chunk)
             if let Some(data) = self.chunks_buffer[0].take() {
                 // Write the chunk
                 self.write_data(&data).await?;
                 self.next_write_index += 1;
+                consecutive_flushes += 1;
                 
                 // Shift all chunks one position left
                 self.chunks_buffer.remove(0);
@@ -323,6 +346,11 @@ impl StreamingFileWriter {
                 break;
             }
         }
+        
+        if consecutive_flushes > 0 {
+            debug!("🔄 Flushed {} consecutive chunks, next expected: {}", consecutive_flushes, self.next_write_index);
+        }
+        
         Ok(())
     }
     
@@ -348,9 +376,39 @@ impl StreamingFileWriter {
     }
     
     pub async fn finalize(mut self) -> Result<String> {
+        info!("📝 FINALIZE: Starting finalization with {} bytes written, next_write_index: {}", 
+              self.bytes_written, self.next_write_index);
+        
         // Ensure all buffered chunks are written before finalizing
         self.flush_buffered_chunks().await?;
+        
+        // Check if there are any remaining chunks in buffer (this shouldn't happen)
+        let remaining_chunks: usize = self.chunks_buffer.iter().filter(|chunk| chunk.is_some()).count();
+        if remaining_chunks > 0 {
+            warn!("⚠️ FINALIZE: {} chunks still in buffer after final flush!", remaining_chunks);
+            
+            // Collect remaining chunk data to avoid borrowing issues
+            let mut remaining_data = Vec::new();
+            for (i, chunk_opt) in self.chunks_buffer.iter_mut().enumerate() {
+                if let Some(data) = chunk_opt.take() {
+                    warn!("🔧 FINALIZE: Found remaining chunk at buffer index {}", i);
+                    remaining_data.push(data);
+                }
+            }
+            
+            // Force write any remaining chunks in order
+            for data in remaining_data {
+                self.write_data(&data).await?;
+                self.next_write_index += 1;
+            }
+        }
+        
+        // Final flush of file buffer
         self.file.flush().await?;
+        
+        info!("📝 FINALIZE: Completed with {} bytes written, expected: {}", 
+              self.bytes_written, self.total_size);
+        
         Ok(format!("{:x}", self.hasher.finalize()))
     }
     
