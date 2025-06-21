@@ -214,7 +214,6 @@ impl FileTransferManager {
         Duration::from_millis(delay_ms)
     }
 
-    // NEW: Enhanced send_file_with_target_dir using streaming
     pub async fn send_file_with_target_dir(
         &mut self,
         peer_id: Uuid,
@@ -319,44 +318,26 @@ impl FileTransferManager {
             transfer_id, peer_id
         );
 
-        // Send FileOffer through normal message channel
-        if let Some(ref sender) = self.message_sender {
-            let file_offer = Message::new(MessageType::FileOffer {
-                transfer_id,
-                metadata: metadata.clone(),
-            });
-
-            info!(
-                "🚀 STREAMING_SEND: Sending FileOffer {} to message channel for peer {}",
-                transfer_id, peer_id
-            );
-
-            if let Err(e) = sender.send((peer_id, file_offer)) {
-                error!("Failed to send file offer: {}", e);
-                self.active_transfers.remove(&transfer_id);
-                return Err(FileshareError::Transfer(format!(
-                    "Failed to send file offer: {}",
-                    e
-                )));
-            }
-
-            info!(
-                "🚀 STREAMING_SEND: FileOffer {} sent to message channel for peer {}",
-                transfer_id, peer_id
-            );
-        } else {
-            self.active_transfers.remove(&transfer_id);
-            return Err(FileshareError::Transfer(
-                "Message sender not configured".to_string(),
-            ));
-        }
-
+        // FIXED: Return the FileOffer message instead of sending it through message channel
+        // The caller (peer manager) will send it directly through the connection
         Ok(())
     }
 
     pub async fn send_file(&mut self, peer_id: Uuid, file_path: PathBuf) -> Result<()> {
         self.send_file_with_target_dir(peer_id, file_path, None)
             .await
+    }
+
+    pub fn create_file_offer_for_transfer(&self, transfer_id: Uuid) -> Result<Message> {
+        let transfer = self
+            .active_transfers
+            .get(&transfer_id)
+            .ok_or_else(|| FileshareError::Transfer("Transfer not found".to_string()))?;
+
+        Ok(Message::new(MessageType::FileOffer {
+            transfer_id,
+            metadata: transfer.metadata.clone(),
+        }))
     }
 
     pub async fn handle_file_offer_response(

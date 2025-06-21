@@ -1082,10 +1082,72 @@ impl PeerManager {
 
         info!("Target directory extracted: {:?}", target_dir);
 
-        // FIXED: Use the normal file transfer flow which properly sets up both sides
-        let mut ft = self.file_transfer.write().await;
-        ft.send_file_with_target_dir(peer_id, file_path, target_dir)
-            .await?;
+        // FIXED: Create the transfer and get the FileOffer, then send it directly
+        let (transfer_id, file_offer) = {
+            let mut ft = self.file_transfer.write().await;
+
+            // Create the transfer
+            ft.send_file_with_target_dir(peer_id, file_path, target_dir)
+                .await?;
+
+            // Find the transfer we just created (it will be the most recent one for this peer)
+            let transfer_id = ft
+                .active_transfers
+                .iter()
+                .filter(|(_, t)| {
+                    t.peer_id == peer_id && matches!(t.direction, TransferDirection::Outgoing)
+                })
+                .max_by_key(|(_, t)| t.created_at)
+                .map(|(id, _)| *id)
+                .ok_or_else(|| {
+                    FileshareError::Transfer("Failed to find created transfer".to_string())
+                })?;
+
+            // Create FileOffer message
+            let file_offer = ft.create_file_offer_for_transfer(transfer_id)?;
+
+            (transfer_id, file_offer)
+        };
+
+        // FIXED: Send FileOffer directly through connection, not message channel
+        if let Some(conn) = self.connections.get(&peer_id) {
+            info!(
+                "🚀 STREAMING_SEND: Sending FileOffer {} directly to peer {}",
+                transfer_id, peer_id
+            );
+
+            if let Err(e) = conn.send(file_offer) {
+                error!(
+                    "Failed to send FileOffer directly to peer {}: {}",
+                    peer_id, e
+                );
+
+                // Clean up the transfer since we couldn't send the offer
+                let mut ft = self.file_transfer.write().await;
+                ft.active_transfers.remove(&transfer_id);
+
+                return Err(FileshareError::Transfer(format!(
+                    "Failed to send FileOffer: {}",
+                    e
+                )));
+            }
+
+            info!(
+                "✅ STREAMING_SEND: FileOffer {} sent directly to peer {}",
+                transfer_id, peer_id
+            );
+        } else {
+            error!("No connection found for peer {} to send FileOffer", peer_id);
+
+            // Clean up the transfer
+            let mut ft = self.file_transfer.write().await;
+            ft.active_transfers.remove(&transfer_id);
+
+            return Err(FileshareError::Transfer(format!(
+                "No connection to peer {}",
+                peer_id
+            )));
+        }
 
         Ok(())
     }
