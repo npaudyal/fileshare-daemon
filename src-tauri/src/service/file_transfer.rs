@@ -1467,8 +1467,8 @@ impl FileTransferManager {
                             format!("{:?}", buffer_slice) 
                         };
                         debug!(
-                            "🔧 BUFFER_VERIFY: Chunk {} written to buffer, first 8 bytes: {}",
-                            chunk.index, first_bytes
+                            "🔧 BUFFER_VERIFY: Chunk {} written to file position {} (buffer[{}..{}]), first 8 bytes: {}",
+                            chunk.index, expected_offset, start_idx, end_idx, first_bytes
                         );
                     }
                     
