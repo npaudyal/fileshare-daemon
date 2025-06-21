@@ -73,30 +73,12 @@ impl StreamingFileReader {
             self.current_position, bytes_to_read
         );
 
-        let bytes_read = self
-            .file
-            .read(&mut self.buffer[..bytes_to_read])
-            .await
-            .map_err(|e| {
-                error!(
-                    "Failed to read from file at position {}: {}",
-                    self.current_position, e
-                );
-                StreamingError::StreamingInterrupted {
-                    position: self.current_position,
-                }
-            })?;
+        // FIXED: Use read_exact_or_remaining to ensure we read the full chunk
+        let bytes_read = self.read_exact_or_remaining(bytes_to_read).await?;
 
         if bytes_read == 0 {
             debug!("📄 No more data to read");
             return Ok(None);
-        }
-
-        if bytes_read != bytes_to_read {
-            warn!(
-                "⚠️ Read {} bytes but expected {}",
-                bytes_read, bytes_to_read
-            );
         }
 
         let chunk_data = self.buffer[..bytes_read].to_vec();
@@ -125,6 +107,43 @@ impl StreamingFileReader {
         Ok(Some(chunk))
     }
 
+    // NEW: Helper method to read exactly the requested amount or until EOF
+    async fn read_exact_or_remaining(&mut self, bytes_to_read: usize) -> Result<usize> {
+        let mut total_read = 0;
+
+        while total_read < bytes_to_read {
+            let remaining = bytes_to_read - total_read;
+            let bytes_read = self
+                .file
+                .read(&mut self.buffer[total_read..total_read + remaining])
+                .await
+                .map_err(|e| {
+                    error!(
+                        "Failed to read from file at position {}: {}",
+                        self.current_position + total_read as u64,
+                        e
+                    );
+                    StreamingError::StreamingInterrupted {
+                        position: self.current_position + total_read as u64,
+                    }
+                })?;
+
+            if bytes_read == 0 {
+                // EOF reached
+                break;
+            }
+
+            total_read += bytes_read;
+        }
+
+        debug!(
+            "📖 Successfully read {} bytes (requested: {})",
+            total_read, bytes_to_read
+        );
+
+        Ok(total_read)
+    }
+
     pub fn get_progress(&self) -> (u64, u64, f64) {
         let percentage = if self.file_size == 0 {
             100.0
@@ -143,7 +162,7 @@ impl StreamingFileReader {
     }
 }
 
-// Streaming File Writer
+// Streaming File Writer (keeping existing implementation but fixing seek)
 #[derive(Debug)]
 pub struct StreamingFileWriter {
     file: File,
@@ -337,7 +356,6 @@ impl StreamingFileWriter {
 
     async fn get_available_disk_space(path: &PathBuf) -> Result<u64> {
         // For now, return a large value - in production you'd implement platform-specific disk space checking
-        // This is a simplified version to keep the implementation focused on streaming
         debug!("💽 Checking disk space for {:?}", path);
 
         #[cfg(target_os = "windows")]

@@ -150,11 +150,11 @@ impl FileMetadata {
     // NEW: Calculate optimal chunk size based on file size
     pub fn calculate_optimal_chunk_size(file_size: u64) -> usize {
         match file_size {
-            0..=10_485_760 => 256 * 1024,            // 256KB for files < 10MB
-            10_485_760..=104_857_600 => 1024 * 1024, // 1MB for files < 100MB
-            104_857_600..=1_073_741_824 => 4 * 1024 * 1024, // 4MB for files < 1GB
-            1_073_741_824..=10_737_418_240 => 8 * 1024 * 1024, // 8MB for files < 10GB
-            _ => 16 * 1024 * 1024,                   // 16MB for files > 10GB
+            0..10_485_760 => 256 * 1024,                   // 256KB for files < 10MB
+            10_485_760..104_857_600 => 1024 * 1024,        // 1MB for files < 100MB
+            104_857_600..1_073_741_824 => 4 * 1024 * 1024, // 4MB for files < 1GB
+            1_073_741_824..10_737_418_240 => 8 * 1024 * 1024, // 8MB for files < 10GB
+            _ => 16 * 1024 * 1024,                         // 16MB for files > 10GB
         }
     }
 

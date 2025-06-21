@@ -45,7 +45,6 @@ pub struct SecuritySettings {
     pub allowed_devices: Vec<Uuid>,
 }
 
-// NEW: Streaming configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StreamingSettings {
     pub enable_adaptive_chunking: bool,
@@ -54,7 +53,7 @@ pub struct StreamingSettings {
     pub progress_report_interval_ms: u64,
     pub enable_chunk_validation: bool,
     pub max_concurrent_chunk_reads: usize,
-    pub enable_streaming_mode: bool, // Master switch for streaming
+    pub enable_streaming_mode: bool,
 }
 
 impl Default for StreamingSettings {

@@ -6,4 +6,4 @@ pub mod network;
 pub mod service;
 pub mod utils;
 
-pub use error::{FileshareError, Result};
+pub use error::{FileshareError, Result, StreamingError};

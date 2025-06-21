@@ -38,9 +38,11 @@ pub enum FileshareError {
     Unknown(String),
 }
 
-// NEW: Streaming-specific errors
 #[derive(Error, Debug)]
 pub enum StreamingError {
+    #[error("Invalid chunk size: {size} bytes")]
+    InvalidChunkSize { size: usize },
+
     #[error("File too large for available memory: {size} bytes")]
     FileTooLargeForMemory { size: u64 },
 
@@ -59,12 +61,6 @@ pub enum StreamingError {
 
     #[error("Insufficient disk space: need {needed} bytes, available {available} bytes")]
     InsufficientDiskSpace { needed: u64, available: u64 },
-
-    #[error("Invalid chunk size: {size} bytes")]
-    InvalidChunkSize { size: usize },
-
-    #[error("Stream buffer overflow")]
-    StreamBufferOverflow,
 }
 
 // Implement From for mdns::Error
