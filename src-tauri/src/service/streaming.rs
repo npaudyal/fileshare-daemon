@@ -31,6 +31,9 @@ impl StreamingFileReader {
         let metadata = file.metadata().await?;
         let total_size = metadata.len();
         
+        info!("🔧 READER_INIT: Created StreamingFileReader with chunk_size={} for file size={} bytes", 
+              chunk_size, total_size);
+        
         let buffered = BufReader::with_capacity(BUFFER_SIZE, file);
         
         Ok(Self {
@@ -76,8 +79,10 @@ impl StreamingFileReader {
             return Ok(None);
         }
         
+        info!("🔧 READER: Creating buffer of size {} bytes (chunk_size: {})", self.chunk_size, self.chunk_size);
         let mut buffer = vec![0u8; self.chunk_size];
         let bytes_read = self.file.read(&mut buffer).await?;
+        info!("🔧 READER: Actually read {} bytes from file", bytes_read);
         
         if bytes_read == 0 {
             return Ok(None);

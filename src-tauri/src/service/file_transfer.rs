@@ -596,8 +596,11 @@ impl FileTransferManager {
         let transfer_id = Uuid::new_v4();
 
         info!(
-            "🚀 SEND_FILE: Created transfer {} for peer {}, file size: {} bytes, chunk size: {} bytes, total chunks: {}",
-            transfer_id, peer_id, metadata.size, metadata.chunk_size, metadata.total_chunks
+            "🚀 SEND_FILE_METADATA: Created transfer {} for peer {}", transfer_id, peer_id
+        );
+        info!(
+            "📊 METADATA: file_size={} bytes, calculated_chunk_size={} bytes, stored_chunk_size={} bytes, total_chunks={}",
+            metadata.size, chunk_size, metadata.chunk_size, metadata.total_chunks
         );
 
         // Check for existing transfer with same file to same peer
@@ -743,7 +746,7 @@ impl FileTransferManager {
     }
 
     async fn start_file_transfer(&mut self, transfer_id: Uuid) -> Result<()> {
-        let (file_path, peer_id, chunk_size) = {
+        let (file_path, peer_id, metadata) = {
             let transfer = self
                 .active_transfers
                 .get_mut(&transfer_id)
@@ -752,10 +755,8 @@ impl FileTransferManager {
             transfer.status = TransferStatus::Active;
             transfer.last_activity = Instant::now();
 
-            // Use the chunk size from the metadata (what was agreed upon)
-            let chunk_size = transfer.metadata.chunk_size;
-
-            (transfer.file_path.clone(), transfer.peer_id, chunk_size)
+            // Use the original metadata to ensure consistency
+            (transfer.file_path.clone(), transfer.peer_id, transfer.metadata.clone())
         };
 
         let message_sender = self
@@ -767,7 +768,7 @@ impl FileTransferManager {
 
         tokio::spawn(async move {
             if let Err(e) =
-                Self::send_file_chunks(message_sender, peer_id, transfer_id, file_path, chunk_size, settings)
+                Self::send_file_chunks_with_metadata(message_sender, peer_id, transfer_id, file_path, metadata, settings)
                     .await
             {
                 error!("Failed to send file chunks: {}", e);
@@ -775,6 +776,60 @@ impl FileTransferManager {
         });
 
         Ok(())
+    }
+
+    async fn send_file_chunks_with_metadata(
+        message_sender: MessageSender,
+        peer_id: Uuid,
+        transfer_id: Uuid,
+        file_path: PathBuf,
+        metadata: FileMetadata,
+        settings: Arc<Settings>,
+    ) -> Result<()> {
+        info!(
+            "🚀 STREAMING_SENDER: Starting streaming file transfer {} to peer {}",
+            transfer_id, peer_id
+        );
+        info!("📄 File path: {:?}, using original metadata - chunk size: {}, total chunks: {}", 
+              file_path, metadata.chunk_size, metadata.total_chunks);
+
+        let chunk_size = metadata.chunk_size;
+        let compression = metadata.compression;
+        let use_streaming = metadata.streaming_mode;
+        let total_chunks = metadata.total_chunks;
+
+        // Get parallel chunks setting from configuration
+        let parallel_chunks = settings.transfer.parallel_chunks;
+        let use_parallel = false; // Temporarily disable parallel mode to test sequential fixes
+
+        info!(
+            "📊 File: {} bytes, streaming: {}, compression: {:?}, parallel: {} (chunks: {})",
+            metadata.size, use_streaming, compression, use_parallel, parallel_chunks
+        );
+
+        if use_parallel {
+            Self::send_file_chunks_parallel(
+                message_sender,
+                peer_id,
+                transfer_id,
+                file_path,
+                chunk_size,
+                compression,
+                parallel_chunks,
+                total_chunks,
+            )
+            .await
+        } else {
+            Self::send_file_chunks_sequential(
+                message_sender,
+                peer_id,
+                transfer_id,
+                file_path,
+                chunk_size,
+                compression,
+            )
+            .await
+        }
     }
 
     async fn send_file_chunks(
