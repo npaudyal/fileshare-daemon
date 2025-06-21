@@ -167,8 +167,10 @@ impl StreamingFileWriter {
             if buffer_offset < self.chunks_buffer.len() as u64 {
                 let buffer_index = buffer_offset as usize;
                 if buffer_index < self.chunks_buffer.len() {
-                    info!("📦 Buffering out-of-order chunk {} at buffer index {} (expecting {})", 
-                          index, buffer_index, self.next_write_index);
+                    if index % 10 == 0 {  // Only log every 10th buffered chunk
+                        info!("📦 Buffering out-of-order chunk {} at buffer index {} (expecting {})", 
+                              index, buffer_index, self.next_write_index);
+                    }
                     self.chunks_buffer[buffer_index] = Some(decompressed_data);
                 } else {
                     warn!("⚠️ Buffer index {} out of bounds (buffer size: {})", buffer_index, self.chunks_buffer.len());
@@ -183,7 +185,9 @@ impl StreamingFileWriter {
                     self.chunks_buffer.resize(self.chunks_buffer.len() + additional_slots, None);
                     let buffer_index = buffer_offset as usize;
                     self.chunks_buffer[buffer_index] = Some(decompressed_data);
-                    info!("📦 Expanded buffer to {} slots for chunk {}", self.chunks_buffer.len(), index);
+                    if self.chunks_buffer.len() % 100 == 0 {  // Only log every 100 buffer expansions
+                        info!("📦 Expanded buffer to {} slots for chunk {}", self.chunks_buffer.len(), index);
+                    }
                 } else {
                     return Err(FileshareError::Transfer(format!(
                         "Chunk {} is too far ahead (expected around {}) and buffer capacity exceeded",
@@ -205,7 +209,9 @@ impl StreamingFileWriter {
                 self.write_data(&data).await?;
                 self.next_write_index += 1;
                 self.chunks_buffer.push(None); // Maintain buffer size
-                info!("✅ Flushed buffered chunk {} from buffer", self.next_write_index - 1);
+                if (self.next_write_index - 1) % 10 == 0 {  // Only log every 10th flush
+                    info!("✅ Flushed buffered chunk {} from buffer", self.next_write_index - 1);
+                }
             } else {
                 // No more consecutive chunks available
                 break;

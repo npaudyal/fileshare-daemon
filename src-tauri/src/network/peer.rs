@@ -737,10 +737,20 @@ impl PeerManager {
             peer.last_seen = Instant::now();
         }
 
-        info!(
-            "📥 Processing message from {}: {:?}",
-            peer_id, message.message_type
-        );
+        // Only log important messages, not chunks or frequent messages
+        match &message.message_type {
+            MessageType::Ping | MessageType::Pong => {
+                debug!("📥 Processing {} from {}", 
+                       if matches!(message.message_type, MessageType::Ping) { "ping" } else { "pong" },
+                       peer_id);
+            }
+            MessageType::FileChunk { .. } => {
+                // Don't log individual chunks - too noisy
+            }
+            _ => {
+                info!("📥 Processing message from {}: {:?}", peer_id, message.message_type);
+            }
+        }
 
         match message.message_type {
             MessageType::Ping => {
@@ -758,7 +768,7 @@ impl PeerManager {
                 
                 if let Some(conn) = self.connections.get(&peer_id) {
                     let _ = conn.send(Message::pong());
-                    info!("📤 WRITE to peer {}: Pong", peer_id);
+                    debug!("📤 WRITE to peer {}: Pong", peer_id);
                 }
             }
             MessageType::Pong => {

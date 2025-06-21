@@ -20,7 +20,7 @@ const MAX_RETRY_DELAY_MS: u64 = 8000; // 8 seconds max delay
 const TRANSFER_TIMEOUT_SECONDS: u64 = 3600; // Base timeout: 1 hour per transfer
 const MIN_TRANSFER_TIMEOUT_SECONDS: u64 = 300; // Minimum 5 minutes
 const MAX_TRANSFER_TIMEOUT_SECONDS: u64 = 28800; // Maximum 8 hours
-const CHUNK_TIMEOUT_SECONDS: u64 = 60; // 60 seconds per chunk
+const CHUNK_TIMEOUT_SECONDS: u64 = 300; // 5 minutes per chunk (more reasonable for large files)
 const PROGRESS_UPDATE_INTERVAL_MS: u64 = 500; // Update progress every 500ms
 
 // Use simple message sender instead of DirectPeerSender
@@ -309,12 +309,17 @@ impl FileTransferManager {
             }
 
             // Check for inactive transfers (no activity for chunk timeout)
-            if now.duration_since(transfer.last_activity).as_secs() > CHUNK_TIMEOUT_SECONDS {
+            // But only if the transfer has been running for at least twice the chunk timeout
+            // to prevent recovery loops on newly started transfers
+            let transfer_age = now.duration_since(transfer.created_at).as_secs();
+            let inactivity_duration = now.duration_since(transfer.last_activity).as_secs();
+            
+            if inactivity_duration > CHUNK_TIMEOUT_SECONDS && transfer_age > (CHUNK_TIMEOUT_SECONDS * 2) {
                 match transfer.status {
                     TransferStatus::Active | TransferStatus::Pending => {
                         warn!(
-                            "⚠️ Transfer {} inactive for {} seconds, marking for recovery",
-                            transfer_id, CHUNK_TIMEOUT_SECONDS
+                            "⚠️ Transfer {} inactive for {} seconds (transfer age: {}s), marking for recovery",
+                            transfer_id, inactivity_duration, transfer_age
                         );
                         stale_transfers.push(*transfer_id);
                     }
@@ -1171,14 +1176,17 @@ impl FileTransferManager {
         transfer_id: Uuid,
         chunk: TransferChunk,
     ) -> Result<()> {
-        info!(
-            "📥 RECEIVER: Chunk {} for transfer {} ({} bytes, compressed: {}, is_last: {})",
-            chunk.index,
-            transfer_id,
-            chunk.data.len(),
-            chunk.compressed,
-            chunk.is_last
-        );
+        // Only log every 10th chunk to reduce noise, or important chunks
+        if chunk.index % 10 == 0 || chunk.is_last {
+            info!(
+                "📥 RECEIVER: Chunk {} for transfer {} ({} bytes, compressed: {}, is_last: {})",
+                chunk.index,
+                transfer_id,
+                chunk.data.len(),
+                chunk.compressed,
+                chunk.is_last
+            );
+        }
 
         // Check if transfer exists and is incoming
         let transfer = self.active_transfers.get(&transfer_id);
@@ -1239,14 +1247,18 @@ impl FileTransferManager {
                 transfer.bytes_transferred = bytes_written;
                 transfer.chunks_completed += 1;
 
-                info!(
-                    "📊 STREAMING: Chunk {} written ({}/{} bytes, {}/{} chunks)",
-                    chunk.index,
-                    bytes_written,
-                    total_bytes,
-                    transfer.chunks_completed,
-                    transfer.metadata.total_chunks
-                );
+                // Only log progress every 50 chunks or on completion
+                if transfer.chunks_completed % 50 == 0 || chunk.is_last {
+                    let progress_pct = (bytes_written as f64 / total_bytes as f64 * 100.0);
+                    info!(
+                        "📊 TRANSFER_PROGRESS: {:.1}% complete - {}/{} chunks ({:.1}MB/{:.1}MB)",
+                        progress_pct,
+                        transfer.chunks_completed,
+                        transfer.metadata.total_chunks,
+                        bytes_written as f64 / (1024.0 * 1024.0),
+                        total_bytes as f64 / (1024.0 * 1024.0)
+                    );
+                }
             } else {
                 // Non-streaming mode - accumulate in memory
                 let chunk_size = transfer.metadata.chunk_size as u64;
@@ -1571,17 +1583,44 @@ impl FileTransferManager {
     }
 
     pub fn debug_active_transfers(&self) {
-        info!("=== ACTIVE TRANSFERS DEBUG ===");
-        for (transfer_id, transfer) in &self.active_transfers {
+        if self.active_transfers.is_empty() {
+            info!("📋 TRANSFER_STATUS: No active transfers");
+            return;
+        }
+        
+        info!("📋 TRANSFER_STATUS: {} active transfers", self.active_transfers.len());
+        for (id, transfer) in &self.active_transfers {
+            let progress_pct = if transfer.metadata.size > 0 {
+                (transfer.bytes_transferred as f64 / transfer.metadata.size as f64 * 100.0)
+            } else {
+                0.0
+            };
+            
+            let chunks_received_count = transfer.chunks_received.iter().filter(|&&b| b).count();
+            let age_secs = transfer.created_at.elapsed().as_secs();
+            let inactive_secs = transfer.last_activity.elapsed().as_secs();
+            
             info!(
-                "Transfer {}: {:?} -> {:?} (Status: {:?}, Retry: {})",
-                transfer_id,
-                transfer.direction,
-                transfer.file_path.file_name().unwrap_or_default(),
-                transfer.status,
-                transfer.retry_state.attempt_count
+                "  📁 {}: {:.1}% | {} | {:.1}MB/{:.1}MB | {}/{} chunks | Age: {}s | Inactive: {}s | Retry: {} | {:?}",
+                id.to_string().split('-').next().unwrap_or("unknown"),
+                progress_pct,
+                match &transfer.status {
+                    TransferStatus::Active => "🟢 ACTIVE",
+                    TransferStatus::Pending => "🟡 PENDING", 
+                    TransferStatus::Paused => "⏸️ PAUSED",
+                    TransferStatus::Completed => "✅ DONE",
+                    TransferStatus::Error(e) => "❌ ERROR",
+                    TransferStatus::Cancelled => "🚫 CANCELLED",
+                },
+                transfer.bytes_transferred as f64 / (1024.0 * 1024.0),
+                transfer.metadata.size as f64 / (1024.0 * 1024.0),
+                chunks_received_count,
+                transfer.metadata.total_chunks,
+                age_secs,
+                inactive_secs,
+                transfer.retry_state.attempt_count,
+                transfer.direction
             );
         }
-        info!("=== END TRANSFERS DEBUG ===");
     }
 }
