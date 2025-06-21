@@ -332,6 +332,7 @@ impl StreamingFileWriter {
     
     async fn flush_buffered_chunks(&mut self) -> Result<()> {
         let mut consecutive_flushes = 0;
+        let start_write_index = self.next_write_index;
         
         // Keep flushing chunks that are now ready to be written sequentially
         while !self.chunks_buffer.is_empty() && self.chunks_buffer[0].is_some() {
@@ -339,8 +340,9 @@ impl StreamingFileWriter {
             if let Some(data) = self.chunks_buffer[0].take() {
                 let chunk_index = self.next_write_index;
                 
-                if chunk_index % 10 == 0 || chunk_index < 5 {
-                    debug!("🔄 FLUSH: Writing buffered chunk {} from buffer position 0", chunk_index);
+                if chunk_index % 10 == 0 || chunk_index < 5 || chunk_index >= 25 {
+                    debug!("🔄 FLUSH: Writing buffered chunk {} from buffer position 0 ({} bytes)", 
+                           chunk_index, data.len());
                 }
                 
                 // Write the chunk
@@ -351,6 +353,17 @@ impl StreamingFileWriter {
                 // Shift all chunks one position left
                 self.chunks_buffer.remove(0);
                 self.chunks_buffer.push(None); // Add empty slot at the end
+                
+                // Debug: Show buffer state after shift for critical chunks
+                if chunk_index < 5 || chunk_index >= 25 {
+                    let occupied_slots: Vec<usize> = self.chunks_buffer.iter()
+                        .enumerate()
+                        .filter_map(|(i, slot)| if slot.is_some() { Some(i) } else { None })
+                        .take(10)  // Only show first 10 occupied slots
+                        .collect();
+                    debug!("🔄 FLUSH: After writing chunk {}, buffer occupied slots: {:?}", 
+                           chunk_index, occupied_slots);
+                }
             } else {
                 // First slot is empty, no more consecutive chunks
                 break;
@@ -360,7 +373,7 @@ impl StreamingFileWriter {
         if consecutive_flushes > 0 {
             info!("🔄 FLUSH: Flushed {} consecutive chunks ({}..{}), next expected: {}", 
                   consecutive_flushes, 
-                  self.next_write_index - consecutive_flushes as u64,
+                  start_write_index,
                   self.next_write_index - 1,
                   self.next_write_index);
         }
@@ -410,19 +423,36 @@ impl StreamingFileWriter {
                 let missing_chunks: Vec<u64> = (self.next_write_index..expected_chunks).collect();
                 error!("❌ FINALIZE: Still missing chunks after flush: {:?}", missing_chunks);
                 
-                // Check if any missing chunks are in the buffer
+                // Show current buffer state
+                let occupied_slots: Vec<(usize, bool)> = self.chunks_buffer.iter()
+                    .enumerate()
+                    .map(|(i, slot)| (i, slot.is_some()))
+                    .take(30)  // Show first 30 slots
+                    .collect();
+                warn!("🔧 FINALIZE: Buffer state (occupied=true): {:?}", occupied_slots);
+                
+                // Check if any missing chunks are in the buffer and write them directly
                 for missing_idx in &missing_chunks {
                     let buffer_pos = (*missing_idx - self.next_write_index) as usize;
                     if buffer_pos < self.chunks_buffer.len() {
                         if let Some(data) = self.chunks_buffer[buffer_pos].take() {
-                            warn!("🔧 FINALIZE: Found missing chunk {} in buffer at position {}", 
+                            warn!("🔧 FINALIZE: Found missing chunk {} in buffer at position {}, writing directly", 
                                   missing_idx, buffer_pos);
-                            // Write it now
-                            self.write_data(&data).await?;
-                            self.next_write_index += 1;
+                            // Write it directly at the correct file position
+                            use tokio::io::AsyncSeekExt;
+                            let file_position = *missing_idx * self.chunk_size as u64;
+                            self.file.seek(std::io::SeekFrom::Start(file_position)).await?;
+                            self.file.write_all(&data).await?;
+                            self.hasher.update(&data);
+                            self.bytes_written += data.len() as u64;
+                            info!("✅ FINALIZE: Successfully wrote missing chunk {} at file position {}", 
+                                  missing_idx, file_position);
                         }
                     }
                 }
+                
+                // Update next_write_index to expected_chunks since we've handled all missing chunks
+                self.next_write_index = expected_chunks;
             }
         }
         
