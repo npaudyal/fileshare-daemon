@@ -35,6 +35,10 @@ pub struct TransferSettings {
     pub max_concurrent_transfers: usize,
     pub bandwidth_limit_mbps: Option<u32>,
     pub temp_dir: Option<PathBuf>,
+    pub adaptive_chunk_size: bool,
+    pub compression_enabled: bool,
+    pub parallel_chunks: usize,
+    pub resume_enabled: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -59,10 +63,14 @@ impl Default for Settings {
                 timeout_seconds: 30,
             },
             transfer: TransferSettings {
-                chunk_size: 64 * 1024, // 64KB chunks
+                chunk_size: 1024 * 1024, // 1MB default chunk size
                 max_concurrent_transfers: 5,
                 bandwidth_limit_mbps: None,
                 temp_dir: None,
+                adaptive_chunk_size: true,
+                compression_enabled: true,
+                parallel_chunks: 4,
+                resume_enabled: true,
             },
             security: SecuritySettings {
                 require_pairing: false,

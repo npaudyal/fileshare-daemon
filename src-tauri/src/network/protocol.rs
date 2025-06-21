@@ -2,6 +2,13 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use uuid::Uuid;
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
+pub enum CompressionType {
+    None,
+    Zstd,
+    Lz4,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Message {
     pub id: Uuid,
@@ -60,6 +67,11 @@ pub enum MessageType {
         transfer_id: Uuid,
         chunk_index: u64,
     },
+    // Batch acknowledgment for multiple chunks
+    FileChunkBatchAck {
+        transfer_id: Uuid,
+        chunk_indices: Vec<u64>,
+    },
     TransferComplete {
         transfer_id: Uuid,
         checksum: String,
@@ -67,6 +79,22 @@ pub enum MessageType {
     TransferError {
         transfer_id: Uuid,
         error: String,
+    },
+    // Progress reporting
+    TransferProgress {
+        transfer_id: Uuid,
+        bytes_transferred: u64,
+        chunks_completed: u64,
+        speed_bps: u64, // bytes per second
+        eta_seconds: Option<u64>,
+    },
+    // Resume support
+    TransferResume {
+        transfer_id: Uuid,
+        completed_chunks: Vec<u64>,
+    },
+    TransferPause {
+        transfer_id: Uuid,
     },
 
     // Control
@@ -84,8 +112,10 @@ pub struct FileMetadata {
     pub created: Option<u64>,
     pub modified: Option<u64>,
     pub target_dir: Option<String>,
-    pub chunk_size: usize, // NEW: Include chunk size in metadata
-    pub total_chunks: u64, // NEW: Include total expected chunks
+    pub chunk_size: usize,
+    pub total_chunks: u64,
+    pub streaming_mode: bool, // Enable streaming for large files
+    pub compression: Option<CompressionType>, // Optional compression
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -93,6 +123,8 @@ pub struct TransferChunk {
     pub index: u64,
     pub data: Vec<u8>,
     pub is_last: bool,
+    pub compressed: bool, // Whether this chunk is compressed
+    pub checksum: Option<String>, // Optional per-chunk checksum for integrity
 }
 
 impl Message {
@@ -173,6 +205,16 @@ impl FileMetadata {
         // Guess MIME type
         let mime_type = Self::guess_mime_type(&name);
 
+        // Determine if streaming mode should be used (files > 10MB)
+        let streaming_mode = file_size > 10 * 1024 * 1024;
+        
+        // Determine compression type based on file type and size
+        let compression = if file_size > 1024 * 1024 && !Self::is_compressed_format(&name) {
+            Some(CompressionType::Zstd)
+        } else {
+            None
+        };
+
         Ok(Self {
             name,
             size: file_size,
@@ -181,8 +223,10 @@ impl FileMetadata {
             created,
             modified,
             target_dir: None,
-            chunk_size,   // NEW: Store the chunk size used
-            total_chunks, // NEW: Store expected total chunks
+            chunk_size,
+            total_chunks,
+            streaming_mode,
+            compression,
         })
     }
 
@@ -216,5 +260,18 @@ impl FileMetadata {
             "xml" => Some("application/xml".to_string()),
             _ => None,
         }
+    }
+
+    fn is_compressed_format(filename: &str) -> bool {
+        let extension = std::path::Path::new(filename)
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|e| e.to_lowercase())
+            .unwrap_or_default();
+
+        matches!(
+            extension.as_str(),
+            "zip" | "gz" | "bz2" | "xz" | "7z" | "rar" | "tar" | "jpg" | "jpeg" | "png" | "mp4" | "mp3" | "avi" | "mkv"
+        )
     }
 }
