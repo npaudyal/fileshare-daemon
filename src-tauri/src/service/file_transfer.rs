@@ -1343,6 +1343,9 @@ impl FileTransferManager {
                 let (bytes_written, total_bytes) = writer.progress();
                 transfer.bytes_transferred = bytes_written;
                 transfer.chunks_completed += 1;
+                
+                // CRITICAL FIX: Mark chunk as received in chunks_received array for streaming mode
+                transfer.chunks_received[chunk.index as usize] = true;
 
                 // Only log progress every 50 chunks or on completion
                 if transfer.chunks_completed % 50 == 0 || chunk.is_last {
