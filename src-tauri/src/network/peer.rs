@@ -912,6 +912,52 @@ impl PeerManager {
                 );
             }
 
+            MessageType::FileChunkBatchAck {
+                transfer_id,
+                chunk_indices,
+            } => {
+                debug!(
+                    "Received batch chunk ack for transfer {} - {} chunks",
+                    transfer_id, chunk_indices.len()
+                );
+            }
+
+            MessageType::TransferProgress {
+                transfer_id,
+                bytes_transferred,
+                chunks_completed,
+                speed_bps,
+                eta_seconds,
+            } => {
+                let speed_mbps = speed_bps as f64 / (1024.0 * 1024.0);
+                let eta_text = eta_seconds.map_or("unknown".to_string(), |s| format!("{}s", s));
+                debug!(
+                    "Transfer {} progress: {} bytes, {} chunks, {:.1} MB/s, ETA: {}",
+                    transfer_id, bytes_transferred, chunks_completed, speed_mbps, eta_text
+                );
+            }
+
+            MessageType::TransferResume {
+                transfer_id,
+                completed_chunks,
+            } => {
+                info!(
+                    "Received resume request for transfer {} with {} completed chunks",
+                    transfer_id, completed_chunks.len()
+                );
+                // TODO: Implement resume functionality
+            }
+
+            MessageType::TransferPause {
+                transfer_id,
+            } => {
+                info!(
+                    "Received pause request for transfer {}",
+                    transfer_id
+                );
+                // TODO: Implement pause functionality
+            }
+
             _ => {
                 debug!(
                     "Unhandled message type from {}: {:?}",
@@ -1048,7 +1094,8 @@ impl PeerConnection {
         let message_len = u32::from_be_bytes(len_bytes) as usize;
 
         // Validate message length to prevent memory attacks
-        if message_len > 100_000_000 {
+        // Increased from 100MB to 50MB to support 8MB chunks with metadata overhead
+        if message_len > 50_000_000 {
             return Err(FileshareError::Transfer("Message too large".to_string()));
         }
 
@@ -1071,7 +1118,8 @@ impl PeerConnectionReadHalf {
         let message_len = u32::from_be_bytes(len_bytes) as usize;
 
         // Validate message length to prevent memory attacks
-        if message_len > 100_000_000 {
+        // Increased from 100MB to 50MB to support 8MB chunks with metadata overhead
+        if message_len > 50_000_000 {
             return Err(FileshareError::Transfer("Message too large".to_string()));
         }
 

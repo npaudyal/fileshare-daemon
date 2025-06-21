@@ -82,6 +82,37 @@ impl Default for Settings {
 }
 
 impl Settings {
+    pub fn validate_transfer_settings(&self) -> Result<()> {
+        let transfer = &self.transfer;
+        
+        // Validate chunk size (64KB to 16MB)
+        if transfer.chunk_size < 64 * 1024 {
+            return Err(FileshareError::Config(
+                "Chunk size must be at least 64KB".to_string()
+            ));
+        }
+        if transfer.chunk_size > 16 * 1024 * 1024 {
+            return Err(FileshareError::Config(
+                "Chunk size must not exceed 16MB".to_string()
+            ));
+        }
+        
+        // Validate max concurrent transfers (1-10)
+        if transfer.max_concurrent_transfers == 0 || transfer.max_concurrent_transfers > 10 {
+            return Err(FileshareError::Config(
+                "Max concurrent transfers must be between 1 and 10".to_string()
+            ));
+        }
+        
+        // Validate parallel chunks (1-8)
+        if transfer.parallel_chunks == 0 || transfer.parallel_chunks > 8 {
+            return Err(FileshareError::Config(
+                "Parallel chunks must be between 1 and 8".to_string()
+            ));
+        }
+        
+        Ok(())
+    }
     pub fn load(config_path: Option<&str>) -> Result<Self> {
         let path = match config_path {
             Some(path) => PathBuf::from(path),
@@ -95,6 +126,9 @@ impl Settings {
             let settings: Settings = toml::from_str(&content)
                 .map_err(|e| FileshareError::Config(format!("Failed to parse config: {}", e)))?;
 
+            // Validate settings before returning
+            settings.validate_transfer_settings()?;
+            
             Ok(settings)
         } else {
             let settings = Self::default();

@@ -285,14 +285,12 @@ impl FileshareDaemon {
         };
 
         if let Some(item) = clipboard_item {
-            // Validate file size before broadcasting
-            if item.file_size > 100 * 1024 * 1024 {
-                // 100MB limit
-                warn!(
-                    "⚠️ File size {} exceeds Phase 1 limit, broadcasting anyway",
-                    item.file_size
-                );
-            }
+            // Log file size info (no limit with streaming support)
+            let file_size_mb = item.file_size as f64 / (1024.0 * 1024.0);
+            info!(
+                "📊 Broadcasting file: {:.1} MB (streaming enabled for large files)",
+                file_size_mb
+            );
 
             // Broadcast clipboard update to healthy peers only
             let healthy_peer_ids = {
@@ -392,13 +390,12 @@ impl FileshareDaemon {
                 (item.file_path.to_string_lossy().to_string(), item.file_size)
             };
 
-            // Validate file size for Phase 1
-            if file_size > 100 * 1024 * 1024 {
-                return Err(crate::FileshareError::Transfer(format!(
-                    "File size ({:.1} MB) exceeds Phase 1 limit (100 MB)",
-                    file_size as f64 / (1024.0 * 1024.0)
-                )));
-            }
+            // Log file size info (no limit with streaming support)
+            let file_size_mb = file_size as f64 / (1024.0 * 1024.0);
+            info!(
+                "📊 Requesting file transfer: {:.1} MB (streaming enabled)",
+                file_size_mb
+            );
 
             // Send file request to source device
             let request_id = uuid::Uuid::new_v4();

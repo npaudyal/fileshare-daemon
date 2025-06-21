@@ -1,6 +1,6 @@
 import React from 'react';
 import { motion } from 'framer-motion';
-import { Wifi, RefreshCw, CheckSquare } from 'lucide-react'; // Remove X import
+import { Wifi, RefreshCw, CheckSquare, Download } from 'lucide-react';
 
 interface HeaderProps {
     connectionStatus: boolean;
@@ -9,8 +9,10 @@ interface HeaderProps {
     lastUpdate: Date;
     filteredDevicesCount: number;
     deviceName?: string;
+    showTransferProgress?: boolean;
     onRefresh: () => void;
     onSelectAll: () => void;
+    onToggleTransferProgress?: () => void;
 }
 
 const Header: React.FC<HeaderProps> = ({
@@ -20,8 +22,10 @@ const Header: React.FC<HeaderProps> = ({
     lastUpdate,
     filteredDevicesCount,
     deviceName,
+    showTransferProgress,
     onRefresh,
-    onSelectAll
+    onSelectAll,
+    onToggleTransferProgress
 }) => {
     return (
         <div className="p-4 border-b border-white/10 bg-slate-900/50">
@@ -53,12 +57,28 @@ const Header: React.FC<HeaderProps> = ({
                     )}
                 </div>
                 <div className="flex items-center space-x-3">
+                    {onToggleTransferProgress && (
+                        <motion.button
+                            whileHover={{ scale: 1.1 }}
+                            whileTap={{ scale: 0.9 }}
+                            onClick={onToggleTransferProgress}
+                            className={`p-1 rounded transition-colors ${
+                                showTransferProgress 
+                                    ? 'text-blue-400 bg-blue-500/20' 
+                                    : 'text-gray-400 hover:text-white hover:bg-white/10'
+                            }`}
+                            title="Toggle Transfer Progress"
+                        >
+                            <Download className="w-4 h-4" />
+                        </motion.button>
+                    )}
                     <motion.button
                         whileHover={{ scale: 1.1, rotate: 180 }}
                         whileTap={{ scale: 0.9 }}
                         onClick={onRefresh}
                         disabled={isRefreshing}
                         className="text-gray-400 hover:text-white p-1 rounded hover:bg-white/10 transition-colors"
+                        title="Refresh Devices"
                     >
                         <RefreshCw className={`w-4 h-4 ${isRefreshing ? 'animate-spin' : ''}`} />
                     </motion.button>
@@ -68,6 +88,7 @@ const Header: React.FC<HeaderProps> = ({
                             whileTap={{ scale: 0.9 }}
                             onClick={onSelectAll}
                             className="text-gray-400 hover:text-white p-1 rounded hover:bg-white/10 transition-colors"
+                            title="Select All Devices"
                         >
                             <CheckSquare className="w-4 h-4" />
                         </motion.button>

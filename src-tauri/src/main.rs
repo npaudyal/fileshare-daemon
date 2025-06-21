@@ -231,7 +231,7 @@ async fn test_file_transfer(state: tauri::State<'_, AppState>) -> Result<String,
             "📊 Transfer System Status:\n\
             Connections: {} total ({} healthy)\n\
             Active Transfers: {}\n\
-            System: Ready for Phase 1 (100MB limit)",
+            System: Ready with streaming support (unlimited file size)",
             stats.total,
             stats.authenticated,
             active_transfers.len()
@@ -295,6 +295,11 @@ async fn update_app_settings(
     app_settings.transfer.max_concurrent_transfers = settings.max_concurrent_transfers;
     app_settings.security.require_pairing = settings.require_pairing;
     app_settings.security.encryption_enabled = settings.encryption_enabled;
+
+    // Validate settings before saving
+    app_settings
+        .validate_transfer_settings()
+        .map_err(|e| format!("Invalid settings: {}", e))?;
 
     // Save to file
     app_settings
@@ -852,6 +857,108 @@ async fn refresh_devices(_state: tauri::State<'_, AppState>) -> Result<(), Strin
     Ok(())
 }
 
+// Transfer progress and control commands
+#[tauri::command]
+async fn get_active_transfers(state: tauri::State<'_, AppState>) -> Result<Vec<serde_json::Value>, String> {
+    if let Some(daemon_ref) = state.daemon_ref.lock().await.as_ref() {
+        let pm = daemon_ref.peer_manager.read().await;
+        let ft = pm.file_transfer.read().await;
+        let active_transfers = ft.get_active_transfers();
+        
+        let mut transfers = Vec::new();
+        for transfer in active_transfers {
+            let progress = ft.get_transfer_progress(transfer.id).unwrap_or(0.0);
+            let speed = transfer.speed_bps;
+            let direction = match transfer.direction {
+                fileshare_daemon::service::file_transfer::TransferDirection::Outgoing => "upload",
+                fileshare_daemon::service::file_transfer::TransferDirection::Incoming => "download",
+            };
+            let status = match &transfer.status {
+                fileshare_daemon::service::file_transfer::TransferStatus::Active => "active",
+                fileshare_daemon::service::file_transfer::TransferStatus::Paused => "paused",
+                fileshare_daemon::service::file_transfer::TransferStatus::Completed => "completed",
+                fileshare_daemon::service::file_transfer::TransferStatus::Error(_) => "error",
+                fileshare_daemon::service::file_transfer::TransferStatus::Cancelled => "error",
+                _ => "pending",
+            };
+            
+            transfers.push(serde_json::json!({
+                "id": transfer.id.to_string(),
+                "fileName": transfer.file_path.file_name().unwrap_or_default().to_string_lossy(),
+                "fileSize": transfer.metadata.size,
+                "progress": progress,
+                "speed": speed,
+                "direction": direction,
+                "status": status,
+                "peerId": transfer.peer_id.to_string(),
+                "peerName": "Unknown Device", // TODO: Get actual peer name
+                "startTime": transfer.created_at.elapsed().as_secs(),
+                "error": match &transfer.status {
+                    fileshare_daemon::service::file_transfer::TransferStatus::Error(msg) => Some(msg.clone()),
+                    _ => None,
+                }
+            }));
+        }
+        
+        Ok(transfers)
+    } else {
+        Err("Daemon not ready".to_string())
+    }
+}
+
+#[tauri::command]
+async fn toggle_transfer_pause(transfer_id: String, state: tauri::State<'_, AppState>) -> Result<(), String> {
+    let transfer_uuid = Uuid::parse_str(&transfer_id)
+        .map_err(|e| format!("Invalid transfer ID: {}", e))?;
+    
+    if let Some(daemon_ref) = state.daemon_ref.lock().await.as_ref() {
+        let pm = daemon_ref.peer_manager.read().await;
+        let mut ft = pm.file_transfer.write().await;
+        
+        if let Some(transfer) = ft.active_transfers.get_mut(&transfer_uuid) {
+            match &transfer.status {
+                fileshare_daemon::service::file_transfer::TransferStatus::Active => {
+                    transfer.status = fileshare_daemon::service::file_transfer::TransferStatus::Paused;
+                    info!("⏸️ Transfer {} paused", transfer_id);
+                },
+                fileshare_daemon::service::file_transfer::TransferStatus::Paused => {
+                    transfer.status = fileshare_daemon::service::file_transfer::TransferStatus::Active;
+                    info!("▶️ Transfer {} resumed", transfer_id);
+                },
+                _ => {
+                    return Err("Transfer cannot be paused/resumed in current state".to_string());
+                }
+            }
+            Ok(())
+        } else {
+            Err("Transfer not found".to_string())
+        }
+    } else {
+        Err("Daemon not ready".to_string())
+    }
+}
+
+#[tauri::command]
+async fn cancel_transfer(transfer_id: String, state: tauri::State<'_, AppState>) -> Result<(), String> {
+    let transfer_uuid = Uuid::parse_str(&transfer_id)
+        .map_err(|e| format!("Invalid transfer ID: {}", e))?;
+    
+    if let Some(daemon_ref) = state.daemon_ref.lock().await.as_ref() {
+        let pm = daemon_ref.peer_manager.read().await;
+        let mut ft = pm.file_transfer.write().await;
+        
+        if let Some(transfer) = ft.active_transfers.get_mut(&transfer_uuid) {
+            transfer.status = fileshare_daemon::service::file_transfer::TransferStatus::Cancelled;
+            info!("🚫 Transfer {} cancelled", transfer_id);
+            Ok(())
+        } else {
+            Err("Transfer not found".to_string())
+        }
+    } else {
+        Err("Daemon not ready".to_string())
+    }
+}
+
 #[tauri::command]
 async fn quit_app(app: tauri::AppHandle) -> Result<(), String> {
     info!("🚪 UI requested app quit");
@@ -959,6 +1066,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             import_settings,
             test_hotkey_system,
             test_isolated_hotkey,
+            get_active_transfers,
+            toggle_transfer_pause,
+            cancel_transfer,
             quit_app,
             hide_window
         ])

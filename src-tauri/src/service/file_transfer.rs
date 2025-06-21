@@ -17,7 +17,9 @@ use crate::service::streaming::{
 const MAX_RETRY_ATTEMPTS: u32 = 3;
 const RETRY_BASE_DELAY_MS: u64 = 1000; // 1 second base delay
 const MAX_RETRY_DELAY_MS: u64 = 8000; // 8 seconds max delay
-const TRANSFER_TIMEOUT_SECONDS: u64 = 3600; // 1 hour per transfer (for large files)
+const TRANSFER_TIMEOUT_SECONDS: u64 = 3600; // Base timeout: 1 hour per transfer
+const MIN_TRANSFER_TIMEOUT_SECONDS: u64 = 300; // Minimum 5 minutes
+const MAX_TRANSFER_TIMEOUT_SECONDS: u64 = 28800; // Maximum 8 hours
 const CHUNK_TIMEOUT_SECONDS: u64 = 60; // 60 seconds per chunk
 const PROGRESS_UPDATE_INTERVAL_MS: u64 = 500; // Update progress every 500ms
 
@@ -91,6 +93,15 @@ pub struct FileTransferManager {
 }
 
 impl FileTransferManager {
+    // Calculate adaptive timeout based on file size
+    fn calculate_transfer_timeout(file_size: u64) -> u64 {
+        // Base calculation: 1 hour + 1 minute per 100MB
+        let size_mb = file_size / (1024 * 1024);
+        let adaptive_timeout = TRANSFER_TIMEOUT_SECONDS + (size_mb * 60 / 100);
+        
+        // Clamp between min and max values
+        adaptive_timeout.clamp(MIN_TRANSFER_TIMEOUT_SECONDS, MAX_TRANSFER_TIMEOUT_SECONDS)
+    }
     pub async fn new(settings: Arc<Settings>) -> Result<Self> {
         Ok(Self {
             settings,
@@ -283,11 +294,15 @@ impl FileTransferManager {
                 _ => {} // Continue monitoring active/pending transfers
             }
 
-            // Check for overall transfer timeout
-            if now.duration_since(transfer.created_at).as_secs() > TRANSFER_TIMEOUT_SECONDS {
+            // Check for overall transfer timeout (adaptive based on file size)
+            let adaptive_timeout = Self::calculate_transfer_timeout(transfer.metadata.size);
+            if now.duration_since(transfer.created_at).as_secs() > adaptive_timeout {
                 error!(
-                    "⏰ Transfer {} timed out after {} seconds",
-                    transfer_id, TRANSFER_TIMEOUT_SECONDS
+                    "⏰ Transfer {} timed out after {} seconds (adaptive timeout: {}s for {}MB file)",
+                    transfer_id, 
+                    now.duration_since(transfer.created_at).as_secs(),
+                    adaptive_timeout,
+                    transfer.metadata.size / (1024 * 1024)
                 );
                 timed_out_transfers.push(*transfer_id);
                 continue;
@@ -743,9 +758,11 @@ impl FileTransferManager {
             .clone()
             .ok_or_else(|| FileshareError::Transfer("Message sender not configured".to_string()))?;
 
+        let settings = self.settings.clone();
+
         tokio::spawn(async move {
             if let Err(e) =
-                Self::send_file_chunks(message_sender, peer_id, transfer_id, file_path, chunk_size)
+                Self::send_file_chunks(message_sender, peer_id, transfer_id, file_path, chunk_size, settings)
                     .await
             {
                 error!("Failed to send file chunks: {}", e);
@@ -761,6 +778,7 @@ impl FileTransferManager {
         transfer_id: Uuid,
         file_path: PathBuf,
         chunk_size: usize,
+        settings: Arc<Settings>,
     ) -> Result<()> {
         info!(
             "🚀 STREAMING_SENDER: Starting streaming file transfer {} to peer {}",
@@ -774,8 +792,8 @@ impl FileTransferManager {
         let use_streaming = metadata.streaming_mode;
         let total_chunks = metadata.total_chunks;
 
-        // Get parallel chunks setting (hardcoded to 4 for now, should come from settings)
-        let parallel_chunks = 4usize;
+        // Get parallel chunks setting from configuration
+        let parallel_chunks = settings.transfer.parallel_chunks;
         let use_parallel = parallel_chunks > 1 && total_chunks > 10; // Only use parallel for larger files
 
         info!(
