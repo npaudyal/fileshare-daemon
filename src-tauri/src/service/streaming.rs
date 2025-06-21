@@ -263,6 +263,10 @@ impl StreamingFileWriter {
             self.write_data(&decompressed_data).await?;
             self.next_write_index += 1;
             
+            if index < 5 {
+                debug!("🔄 DIRECT_WRITE: After writing chunk {}, next_write_index is now {}", index, self.next_write_index);
+            }
+            
             // Check if we have buffered chunks that can now be written
             self.flush_buffered_chunks().await?;
         } else if index > self.next_write_index {
@@ -291,19 +295,28 @@ impl StreamingFileWriter {
             // chunks_buffer[1] should hold next_write_index + 2, etc.
             let buffer_position = gap - 1;
             
-            if index % 10 == 0 || gap > 10 {  // Log significant gaps
-                info!("📦 Buffering out-of-order chunk {} at position {} (expecting {}, gap: {})", 
+            if index % 10 == 0 || gap > 10 || index < 5 {  // Log significant gaps and first 5
+                info!("📦 BUFFER: Storing chunk {} at buffer[{}] (expecting {}, gap: {})", 
                       index, buffer_position, self.next_write_index, gap);
             }
             
             // Check if slot is already occupied (shouldn't happen with correct logic)
             if buffer_position < self.chunks_buffer.len() && self.chunks_buffer[buffer_position].is_some() {
-                warn!("⚠️ Buffer position {} already occupied when storing chunk {} - this indicates a bug!", 
+                warn!("⚠️ BUFFER: Position {} already occupied when storing chunk {} - this indicates a bug!", 
                       buffer_position, index);
             }
             
             if buffer_position < self.chunks_buffer.len() {
                 self.chunks_buffer[buffer_position] = Some(decompressed_data);
+                
+                if index < 5 {
+                    // Show buffer state for debugging
+                    let occupied_slots: Vec<usize> = self.chunks_buffer.iter()
+                        .enumerate()
+                        .filter_map(|(i, slot)| if slot.is_some() { Some(i) } else { None })
+                        .collect();
+                    debug!("📦 BUFFER_STATE: After storing chunk {}, occupied slots: {:?}", index, occupied_slots);
+                }
             } else {
                 error!("❌ Buffer position {} out of bounds for chunk {} (buffer size: {})", 
                        buffer_position, index, self.chunks_buffer.len());
@@ -320,9 +333,16 @@ impl StreamingFileWriter {
     async fn flush_buffered_chunks(&mut self) -> Result<()> {
         let mut consecutive_flushes = 0;
         
+        // Keep flushing chunks that are now ready to be written sequentially
         while !self.chunks_buffer.is_empty() && self.chunks_buffer[0].is_some() {
             // Get the first chunk from buffer (which should be the next expected chunk)
             if let Some(data) = self.chunks_buffer[0].take() {
+                let chunk_index = self.next_write_index;
+                
+                if chunk_index % 10 == 0 || chunk_index < 5 {
+                    debug!("🔄 FLUSH: Writing buffered chunk {} from buffer position 0", chunk_index);
+                }
+                
                 // Write the chunk
                 self.write_data(&data).await?;
                 self.next_write_index += 1;
@@ -331,10 +351,6 @@ impl StreamingFileWriter {
                 // Shift all chunks one position left
                 self.chunks_buffer.remove(0);
                 self.chunks_buffer.push(None); // Add empty slot at the end
-                
-                if (self.next_write_index - 1) % 10 == 0 {  // Only log every 10th flush
-                    info!("✅ Flushed buffered chunk {} from buffer", self.next_write_index - 1);
-                }
             } else {
                 // First slot is empty, no more consecutive chunks
                 break;
@@ -342,7 +358,11 @@ impl StreamingFileWriter {
         }
         
         if consecutive_flushes > 0 {
-            debug!("🔄 Flushed {} consecutive chunks, next expected: {}", consecutive_flushes, self.next_write_index);
+            info!("🔄 FLUSH: Flushed {} consecutive chunks ({}..{}), next expected: {}", 
+                  consecutive_flushes, 
+                  self.next_write_index - consecutive_flushes as u64,
+                  self.next_write_index - 1,
+                  self.next_write_index);
         }
         
         Ok(())
