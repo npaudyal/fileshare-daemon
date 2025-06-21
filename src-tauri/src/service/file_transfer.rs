@@ -1013,6 +1013,9 @@ impl FileTransferManager {
 
         // Process chunks in batches
         while let Some(batch) = batcher.next_batch() {
+            debug!("🔄 PARALLEL: Processing batch with {} chunks: {:?}", 
+                   batch.len(), if batch.len() <= 10 { format!("{:?}", batch) } else { format!("first 10: {:?}", &batch[..10]) });
+            
             tracker.mark_in_progress(&batch);
 
             let mut chunks_to_send = Vec::new();
@@ -1023,17 +1026,26 @@ impl FileTransferManager {
                 let _reader_len = readers.len();
 
                 // Read chunk at the specific index (with proper seeking)
-                if let Some((chunk_data, _is_last)) =
-                    readers[reader_index].read_chunk_at_index(chunk_index).await?
-                {
-                    let chunk = TransferChunk {
-                        index: chunk_index,
-                        data: chunk_data,
-                        is_last: chunk_index == total_chunks - 1,
-                        compressed: compression.is_some(),
-                        checksum: None,
-                    };
-                    chunks_to_send.push((chunk_index, chunk));
+                match readers[reader_index].read_chunk_at_index(chunk_index).await {
+                    Ok(Some((chunk_data, _is_last))) => {
+                        let data_len = chunk_data.len();
+                        let chunk = TransferChunk {
+                            index: chunk_index,
+                            data: chunk_data,
+                            is_last: chunk_index == total_chunks - 1,
+                            compressed: compression.is_some(),
+                            checksum: None,
+                        };
+                        debug!("✅ PARALLEL: Read chunk {} successfully ({} bytes)", chunk_index, data_len);
+                        chunks_to_send.push((chunk_index, chunk));
+                    }
+                    Ok(None) => {
+                        warn!("⚠️ PARALLEL: Read returned None for chunk {}", chunk_index);
+                    }
+                    Err(e) => {
+                        error!("❌ PARALLEL: Failed to read chunk {}: {}", chunk_index, e);
+                        tracker.mark_failed(chunk_index);
+                    }
                 }
             }
 
@@ -1082,8 +1094,38 @@ impl FileTransferManager {
         // Retry failed chunks if any
         let pending = tracker.get_pending_chunks();
         if !pending.is_empty() {
-            warn!("⚠️ PARALLEL: Retrying {} failed chunks", pending.len());
-            // In a real implementation, we'd retry the failed chunks here
+            warn!("⚠️ PARALLEL: Retrying {} failed chunks: {:?}", pending.len(), 
+                  if pending.len() <= 10 { format!("{:?}", pending) } else { format!("first 10: {:?}", &pending[..10]) });
+            
+            // Retry failed chunks sequentially to ensure they're sent
+            for chunk_index in pending {
+                // Use the first reader to read and send the failed chunk
+                if let Some((chunk_data, _)) = readers[0].read_chunk_at_index(chunk_index).await? {
+                    let chunk = TransferChunk {
+                        index: chunk_index,
+                        data: chunk_data,
+                        is_last: chunk_index == total_chunks - 1,
+                        compressed: compression.is_some(),
+                        checksum: None,
+                    };
+                    
+                    let message = Message::new(MessageType::FileChunk { 
+                        transfer_id, 
+                        chunk 
+                    });
+                    
+                    if let Err(e) = message_sender.send((peer_id, message)) {
+                        error!("❌ PARALLEL: Failed to retry chunk {}: {}", chunk_index, e);
+                        // At this point, we should probably fail the entire transfer
+                        return Err(FileshareError::Transfer(format!(
+                            "Failed to send chunk {} after retry: {}", chunk_index, e
+                        )));
+                    } else {
+                        info!("✅ PARALLEL: Successfully retried chunk {}", chunk_index);
+                        tracker.mark_completed(chunk_index);
+                    }
+                }
+            }
         }
 
         // Calculate final checksum for logging (simplified - in reality we'd need to combine all readers)
@@ -1228,7 +1270,7 @@ impl FileTransferManager {
         chunk: TransferChunk,
     ) -> Result<()> {
         // Only log every 10th chunk to reduce noise, or important chunks
-        if chunk.index % 10 == 0 || chunk.is_last {
+        if chunk.index % 10 == 0 || chunk.is_last || chunk.index < 5 {
             info!(
                 "📥 RECEIVER: Chunk {} for transfer {} ({} bytes, compressed: {}, is_last: {})",
                 chunk.index,

@@ -3,7 +3,7 @@ use crate::service::file_transfer::MessageSender;
 use std::sync::Arc;
 use tokio::sync::{Mutex, Semaphore};
 use tokio::task::JoinSet;
-use tracing::{debug, error};
+use tracing::{debug, error, warn};
 use uuid::Uuid;
 
 pub struct ParallelChunkSender {
@@ -34,6 +34,9 @@ impl ParallelChunkSender {
         &self,
         chunks: Vec<(u64, TransferChunk)>,
     ) -> Result<Vec<u64>> {
+        let total_chunks = chunks.len();
+        debug!("📤 PARALLEL_SEND: Sending {} chunks in parallel", total_chunks);
+        
         let mut join_set = JoinSet::new();
         let failed_chunks = Arc::new(Mutex::new(Vec::new()));
 
@@ -48,7 +51,9 @@ impl ParallelChunkSender {
                 // Acquire permit for concurrency control
                 let _permit = semaphore.acquire().await.unwrap();
                 
-                debug!("Sending chunk {} in parallel", index);
+                if index < 5 || index % 10 == 0 {
+                    debug!("📤 Sending chunk {} in parallel", index);
+                }
                 
                 let message = Message::new(MessageType::FileChunk { 
                     transfer_id, 
@@ -56,16 +61,28 @@ impl ParallelChunkSender {
                 });
 
                 if let Err(e) = sender.send((peer_id, message)) {
-                    error!("Failed to send chunk {}: {}", index, e);
+                    error!("❌ Failed to send chunk {}: {}", index, e);
                     failed_chunks.lock().await.push(index);
+                } else if index < 5 {
+                    debug!("✅ Successfully queued chunk {} for sending", index);
                 }
             });
         }
 
         // Wait for all chunks to complete
-        while let Some(_) = join_set.join_next().await {}
+        while let Some(result) = join_set.join_next().await {
+            if let Err(e) = result {
+                error!("❌ PARALLEL_SEND: Task panicked: {:?}", e);
+            }
+        }
 
         let failed_chunks_guard = failed_chunks.lock().await;
+        let failed_count = failed_chunks_guard.len();
+        if failed_count > 0 {
+            warn!("⚠️ PARALLEL_SEND: {} out of {} chunks failed", failed_count, total_chunks);
+        } else {
+            debug!("✅ PARALLEL_SEND: All {} chunks sent successfully", total_chunks);
+        }
         Ok(failed_chunks_guard.clone())
     }
 }
