@@ -1001,12 +1001,9 @@ impl FileTransferManager {
         let mut tracker = TransferTracker::new(transfer_id, total_chunks);
         let mut batcher = ChunkBatcher::new(total_chunks, parallel_chunks);
 
-        // Create multiple readers for parallel access
-        let mut readers = Vec::new();
-        for _ in 0..parallel_chunks {
-            let reader = StreamingFileReader::new(&file_path, chunk_size, compression).await?;
-            readers.push(reader);
-        }
+        // Store file path and parameters for creating readers per chunk
+        let file_path = Arc::new(file_path);
+        let compression = compression;
 
         let start_time = Instant::now();
         let mut last_progress_update = Instant::now();
@@ -1021,12 +1018,12 @@ impl FileTransferManager {
             let mut chunks_to_send = Vec::new();
 
             // Read chunks for this batch
-            for (i, &chunk_index) in batch.iter().enumerate() {
-                let reader_index = i % readers.len();
-                let _reader_len = readers.len();
+            for &chunk_index in batch.iter() {
+                // Create a dedicated reader for each chunk to avoid concurrency issues
+                let mut reader = StreamingFileReader::new(&file_path, chunk_size, compression).await?;
 
                 // Read chunk at the specific index (with proper seeking)
-                match readers[reader_index].read_chunk_at_index(chunk_index).await {
+                match reader.read_chunk_at_index(chunk_index).await {
                     Ok(Some((chunk_data, _is_last))) => {
                         let data_len = chunk_data.len();
                         let chunk = TransferChunk {
@@ -1099,8 +1096,9 @@ impl FileTransferManager {
             
             // Retry failed chunks sequentially to ensure they're sent
             for chunk_index in pending {
-                // Use the first reader to read and send the failed chunk
-                if let Some((chunk_data, _)) = readers[0].read_chunk_at_index(chunk_index).await? {
+                // Create a new reader for the retry to avoid state issues
+                let mut retry_reader = StreamingFileReader::new(&file_path, chunk_size, compression).await?;
+                if let Some((chunk_data, _)) = retry_reader.read_chunk_at_index(chunk_index).await? {
                     let chunk = TransferChunk {
                         index: chunk_index,
                         data: chunk_data,
@@ -1128,8 +1126,9 @@ impl FileTransferManager {
             }
         }
 
-        // Calculate final checksum for logging (simplified - in reality we'd need to combine all readers)
-        let checksum = readers.into_iter().next().unwrap().get_checksum();
+        // Calculate final checksum for logging
+        let checksum_reader = StreamingFileReader::new(&file_path, chunk_size, compression).await?;
+        let checksum = checksum_reader.get_checksum();
 
         info!(
             "✅ PARALLEL: All chunks sent for transfer {} - {} chunks, checksum: {} (waiting for receiver confirmation)",
