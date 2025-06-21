@@ -1354,9 +1354,18 @@ impl FileTransferManager {
                 }
             } else {
                 // Non-streaming mode - accumulate in memory
+                
+                // Decompress chunk data if it's compressed
+                let compression_type = transfer.metadata.compression;
+                let decompressed_data = if chunk.compressed && compression_type.is_some() {
+                    Self::decompress_chunk_data_static(&chunk.data, compression_type.unwrap())?
+                } else {
+                    chunk.data.clone()
+                };
+                
                 let chunk_size = transfer.metadata.chunk_size as u64;
                 let expected_offset = chunk.index * chunk_size;
-                let actual_end_offset = expected_offset + chunk.data.len() as u64;
+                let actual_end_offset = expected_offset + decompressed_data.len() as u64;
                 let actual_file_size = transfer.metadata.size;
 
                 // For the last chunk, allow it to extend slightly beyond file size (common with compression)
@@ -1378,15 +1387,15 @@ impl FileTransferManager {
                 
                 // For last chunk, calculate the actual bytes that should be copied
                 let bytes_to_copy = if chunk.is_last {
-                    std::cmp::min(chunk.data.len(), (actual_file_size - expected_offset) as usize)
+                    std::cmp::min(decompressed_data.len(), (actual_file_size - expected_offset) as usize)
                 } else {
-                    chunk.data.len()
+                    decompressed_data.len()
                 };
 
-                // Copy chunk data directly into the buffer
+                // Copy decompressed chunk data into the buffer
                 let start_idx = expected_offset as usize;
                 let end_idx = expected_offset as usize + bytes_to_copy;
-                transfer.received_data[start_idx..end_idx].copy_from_slice(&chunk.data[..bytes_to_copy]);
+                transfer.received_data[start_idx..end_idx].copy_from_slice(&decompressed_data[..bytes_to_copy]);
                 transfer.bytes_transferred += bytes_to_copy as u64;
             }
 
@@ -1767,6 +1776,23 @@ impl FileTransferManager {
                 transfer.retry_state.attempt_count,
                 transfer.direction
             );
+        }
+    }
+    
+    // Helper method to decompress chunk data (used in non-streaming mode)
+    fn decompress_chunk_data_static(data: &[u8], compression: crate::network::protocol::CompressionType) -> Result<Vec<u8>> {
+        use crate::network::protocol::CompressionType;
+        
+        match compression {
+            CompressionType::None => Ok(data.to_vec()),
+            CompressionType::Zstd => {
+                zstd::decode_all(data)
+                    .map_err(|e| FileshareError::Transfer(format!("Zstd decompression failed: {}", e)))
+            }
+            CompressionType::Lz4 => {
+                lz4::block::decompress(data, None)
+                    .map_err(|e| FileshareError::Transfer(format!("Lz4 decompression failed: {}", e)))
+            }
         }
     }
 }
