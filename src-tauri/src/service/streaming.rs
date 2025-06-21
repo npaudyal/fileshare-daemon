@@ -267,42 +267,30 @@ impl StreamingFileWriter {
             self.flush_buffered_chunks().await?;
         } else if index > self.next_write_index {
             // Calculate buffer index for out-of-order chunks
-            let buffer_offset = index - self.next_write_index;
+            // buffer[0] = next_write_index + 1, buffer[1] = next_write_index + 2, etc.
+            let buffer_index = (index - self.next_write_index - 1) as usize;
             
             // Check if chunk is within reasonable buffering distance
-            if buffer_offset < self.chunks_buffer.len() as u64 {
-                let buffer_index = buffer_offset as usize;
-                if buffer_index < self.chunks_buffer.len() {
-                    if index % 10 == 0 {  // Only log every 10th buffered chunk
-                        info!("📦 Buffering out-of-order chunk {} at buffer index {} (expecting {})", 
-                              index, buffer_index, self.next_write_index);
-                    }
-                    self.chunks_buffer[buffer_index] = Some(decompressed_data);
-                } else {
-                    warn!("⚠️ Buffer index {} out of bounds (buffer size: {})", buffer_index, self.chunks_buffer.len());
+            if buffer_index < self.chunks_buffer.len() {
+                if index % 10 == 0 {  // Only log every 10th buffered chunk
+                    info!("📦 Buffering out-of-order chunk {} at buffer index {} (expecting {})", 
+                          index, buffer_index, self.next_write_index);
                 }
+                self.chunks_buffer[buffer_index] = Some(decompressed_data);
             } else {
                 // Chunk is too far ahead - expand buffer if reasonable
                 warn!("⚠️ Chunk {} is far ahead (expected around {}), expanding buffer", 
                       index, self.next_write_index);
                 
                 // Calculate how many slots we need
-                let required_buffer_size = (buffer_offset as usize) + 1;
+                let required_buffer_size = buffer_index + 1;
                 
                 if required_buffer_size <= 1000 { // Reasonable limit
                     // Expand buffer to accommodate this chunk
                     self.chunks_buffer.resize(required_buffer_size, None);
-                    let buffer_index = buffer_offset as usize;
                     
-                    if buffer_index < self.chunks_buffer.len() {
-                        self.chunks_buffer[buffer_index] = Some(decompressed_data);
-                        info!("📦 Expanded buffer to {} slots for chunk {}", self.chunks_buffer.len(), index);
-                    } else {
-                        return Err(FileshareError::Transfer(format!(
-                            "Buffer index calculation error: index {} >= buffer size {}",
-                            buffer_index, self.chunks_buffer.len()
-                        )));
-                    }
+                    self.chunks_buffer[buffer_index] = Some(decompressed_data);
+                    info!("📦 Expanded buffer to {} slots for chunk {}", self.chunks_buffer.len(), index);
                 } else {
                     return Err(FileshareError::Transfer(format!(
                         "Chunk {} is too far ahead (expected around {}) - would require buffer size {}",
