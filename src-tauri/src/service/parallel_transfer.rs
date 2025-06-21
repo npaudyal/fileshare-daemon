@@ -3,7 +3,7 @@ use crate::service::file_transfer::MessageSender;
 use std::sync::Arc;
 use tokio::sync::{Mutex, Semaphore};
 use tokio::task::JoinSet;
-use tracing::{debug, error, warn};
+use tracing::{debug, error, warn, info};
 use uuid::Uuid;
 
 pub struct ParallelChunkSender {
@@ -82,6 +82,56 @@ impl ParallelChunkSender {
             warn!("⚠️ PARALLEL_SEND: {} out of {} chunks failed", failed_count, total_chunks);
         } else {
             debug!("✅ PARALLEL_SEND: All {} chunks sent successfully", total_chunks);
+        }
+        Ok(failed_chunks_guard.clone())
+    }
+
+    // OPTIMIZATION: Send chunks in batches to reduce message overhead
+    pub async fn send_chunks_batched(
+        &self,
+        chunks: Vec<(u64, TransferChunk)>,
+        batch_size: usize,
+    ) -> Result<Vec<u64>> {
+        let total_chunks = chunks.len();
+        info!("📤 BATCH_SEND: Sending {} chunks in batches of {}", total_chunks, batch_size);
+        
+        let failed_chunks = Arc::new(Mutex::new(Vec::new()));
+        
+        // Process chunks in batches
+        for batch_start in (0..chunks.len()).step_by(batch_size) {
+            let batch_end = (batch_start + batch_size).min(chunks.len());
+            let batch_chunks: Vec<TransferChunk> = chunks[batch_start..batch_end]
+                .iter()
+                .map(|(_, chunk)| chunk.clone())
+                .collect();
+            
+            let batch_indices: Vec<u64> = chunks[batch_start..batch_end]
+                .iter()
+                .map(|(index, _)| *index)
+                .collect();
+            
+            debug!("📦 BATCH_SEND: Sending batch with {} chunks (indices: {:?})", 
+                   batch_chunks.len(), 
+                   if batch_indices.len() <= 5 { format!("{:?}", batch_indices) } else { format!("first 5: {:?}", &batch_indices[..5]) });
+            
+            let message = Message::new(MessageType::FileChunkBatch { 
+                transfer_id: self.transfer_id, 
+                chunks: batch_chunks 
+            });
+            
+            if let Err(e) = self.message_sender.send((self.peer_id, message)) {
+                error!("❌ BATCH_SEND: Failed to send batch: {}", e);
+                // Mark all chunks in this batch as failed
+                failed_chunks.lock().await.extend(batch_indices);
+            }
+        }
+        
+        let failed_chunks_guard = failed_chunks.lock().await;
+        let failed_count = failed_chunks_guard.len();
+        if failed_count > 0 {
+            warn!("⚠️ BATCH_SEND: {} out of {} chunks failed", failed_count, total_chunks);
+        } else {
+            info!("✅ BATCH_SEND: All {} chunks sent successfully in batches", total_chunks);
         }
         Ok(failed_chunks_guard.clone())
     }

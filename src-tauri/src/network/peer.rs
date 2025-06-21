@@ -1008,6 +1008,15 @@ impl PeerManager {
                 // TODO: Implement pause functionality
             }
 
+            // OPTIMIZATION: Handle batched file chunks
+            MessageType::FileChunkBatch { transfer_id, chunks } => {
+                debug!("📦 Received batch of {} chunks for transfer {}", chunks.len(), transfer_id);
+                let mut ft = self.file_transfer.write().await;
+                for chunk in chunks {
+                    ft.handle_file_chunk(peer_id, transfer_id, chunk).await?;
+                }
+            }
+
             _ => {
                 debug!(
                     "Unhandled message type from {}: {:?}",
@@ -1113,7 +1122,59 @@ pub struct PeerConnectionWriteHalf {
 
 impl PeerConnection {
     fn new(stream: TcpStream) -> Self {
+        // OPTIMIZATION: Apply TCP optimizations
+        if let Err(e) = Self::optimize_tcp_connection(&stream) {
+            warn!("Failed to apply TCP optimizations: {}", e);
+        }
         Self { stream }
+    }
+    
+    // OPTIMIZATION: TCP performance tuning
+    fn optimize_tcp_connection(stream: &TcpStream) -> Result<()> {
+        use socket2::Socket;
+        
+        #[cfg(unix)]
+        {
+            use std::os::fd::{AsRawFd, FromRawFd};
+            // Get the raw socket
+            let socket = unsafe { Socket::from_raw_fd(stream.as_raw_fd()) };
+            
+            // Increase TCP buffer sizes for better throughput
+            let _ = socket.set_recv_buffer_size(2 * 1024 * 1024); // 2MB receive buffer
+            let _ = socket.set_send_buffer_size(2 * 1024 * 1024); // 2MB send buffer
+            
+            // Disable Nagle algorithm for lower latency
+            let _ = socket.set_nodelay(true);
+            
+            // Enable TCP keep-alive
+            let _ = socket.set_keepalive(true);
+            
+            // Don't take ownership of the socket
+            std::mem::forget(socket);
+        }
+        
+        #[cfg(windows)]
+        {
+            use std::os::windows::io::{AsRawSocket, FromRawSocket};
+            // Get the raw socket
+            let socket = unsafe { Socket::from_raw_socket(stream.as_raw_socket()) };
+            
+            // Increase TCP buffer sizes for better throughput
+            let _ = socket.set_recv_buffer_size(2 * 1024 * 1024); // 2MB receive buffer
+            let _ = socket.set_send_buffer_size(2 * 1024 * 1024); // 2MB send buffer
+            
+            // Disable Nagle algorithm for lower latency
+            let _ = socket.set_nodelay(true);
+            
+            // Enable TCP keep-alive
+            let _ = socket.set_keepalive(true);
+            
+            // Don't take ownership of the socket
+            std::mem::forget(socket);
+        }
+        
+        info!("✅ TCP optimizations applied: 2MB buffers, nodelay enabled");
+        Ok(())
     }
 
     fn split(self) -> (PeerConnectionReadHalf, PeerConnectionWriteHalf) {

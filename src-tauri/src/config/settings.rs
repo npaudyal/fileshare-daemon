@@ -68,8 +68,8 @@ impl Default for Settings {
                 bandwidth_limit_mbps: None,
                 temp_dir: None,
                 adaptive_chunk_size: true,
-                compression_enabled: true,
-                parallel_chunks: 4,
+                compression_enabled: false,
+                parallel_chunks: 8, // OPTIMIZED: Increased from 4
                 resume_enabled: true,
             },
             security: SecuritySettings {
@@ -84,33 +84,33 @@ impl Default for Settings {
 impl Settings {
     pub fn validate_transfer_settings(&self) -> Result<()> {
         let transfer = &self.transfer;
-        
+
         // Validate chunk size (64KB to 16MB)
         if transfer.chunk_size < 64 * 1024 {
             return Err(FileshareError::Config(
-                "Chunk size must be at least 64KB".to_string()
+                "Chunk size must be at least 64KB".to_string(),
             ));
         }
         if transfer.chunk_size > 16 * 1024 * 1024 {
             return Err(FileshareError::Config(
-                "Chunk size must not exceed 16MB".to_string()
+                "Chunk size must not exceed 16MB".to_string(),
             ));
         }
-        
+
         // Validate max concurrent transfers (1-10)
         if transfer.max_concurrent_transfers == 0 || transfer.max_concurrent_transfers > 10 {
             return Err(FileshareError::Config(
-                "Max concurrent transfers must be between 1 and 10".to_string()
+                "Max concurrent transfers must be between 1 and 10".to_string(),
             ));
         }
-        
-        // Validate parallel chunks (1-8)
-        if transfer.parallel_chunks == 0 || transfer.parallel_chunks > 8 {
+
+        // Validate parallel chunks (1-16)
+        if transfer.parallel_chunks == 0 || transfer.parallel_chunks > 16 {
             return Err(FileshareError::Config(
-                "Parallel chunks must be between 1 and 8".to_string()
+                "Parallel chunks must be between 1 and 16".to_string(),
             ));
         }
-        
+
         Ok(())
     }
     pub fn load(config_path: Option<&str>) -> Result<Self> {
@@ -128,7 +128,7 @@ impl Settings {
 
             // Validate settings before returning
             settings.validate_transfer_settings()?;
-            
+
             Ok(settings)
         } else {
             let settings = Self::default();

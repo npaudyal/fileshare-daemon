@@ -45,6 +45,8 @@ zstd = "0.13"
 lz4 = "1.24"
 # Performance monitoring
 sysinfo = "0.30"
+# Network optimization
+socket2 = "0.5"
 
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.52", features = [

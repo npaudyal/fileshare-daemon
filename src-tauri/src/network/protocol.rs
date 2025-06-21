@@ -96,6 +96,11 @@ pub enum MessageType {
     TransferPause {
         transfer_id: Uuid,
     },
+    // OPTIMIZATION: Batch multiple chunks in single message
+    FileChunkBatch {
+        transfer_id: Uuid,
+        chunks: Vec<TransferChunk>,
+    },
 
     // Control
     Ping,
