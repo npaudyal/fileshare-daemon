@@ -1044,12 +1044,24 @@ impl FileTransferManager {
 
         self.cleanup_stale_transfers_enhanced();
 
-        if self.active_transfers.contains_key(&transfer_id) {
-            warn!(
-                "⚠️ RECEIVER: Transfer {} already exists, ignoring duplicate offer",
-                transfer_id
-            );
-            return Ok(());
+        // FIXED: Check if this is a duplicate of an outgoing transfer
+        if let Some(existing_transfer) = self.active_transfers.get(&transfer_id) {
+            if matches!(existing_transfer.direction, TransferDirection::Outgoing)
+                && existing_transfer.peer_id == peer_id
+            {
+                // This is our own outgoing transfer being reflected back - ignore it
+                warn!(
+                    "⚠️ RECEIVER: Ignoring FileOffer for our own outgoing transfer {} to peer {}",
+                    transfer_id, peer_id
+                );
+                return Ok(());
+            } else {
+                warn!(
+                    "⚠️ RECEIVER: Transfer {} already exists as {:?}, ignoring duplicate offer",
+                    transfer_id, existing_transfer.direction
+                );
+                return Ok(());
+            }
         }
 
         let save_path = self.get_save_path(&metadata.name, metadata.target_dir.as_deref())?;
@@ -1155,18 +1167,36 @@ impl FileTransferManager {
 
         let transfer = self.active_transfers.get(&transfer_id);
         if let Some(transfer) = transfer {
-            if !matches!(transfer.direction, TransferDirection::Incoming) {
+            if matches!(transfer.direction, TransferDirection::Outgoing) {
                 warn!(
                     "⚠️ RECEIVER: Ignoring chunk {} for outgoing transfer {}",
                     chunk.index, transfer_id
                 );
                 return Ok(());
             }
+
+            if transfer.peer_id != peer_id {
+                warn!(
+                    "⚠️ RECEIVER: Chunk {} for transfer {} from wrong peer {} (expected {})",
+                    chunk.index, transfer_id, peer_id, transfer.peer_id
+                );
+                return Ok(());
+            }
         } else {
             warn!(
-                "⚠️ RECEIVER: Received chunk for unknown transfer {}",
-                transfer_id
+                "⚠️ RECEIVER: Received chunk {} for unknown transfer {} from peer {}",
+                chunk.index, transfer_id, peer_id
             );
+
+            // Send an error back to the sender
+            if let Some(ref sender) = self.message_sender {
+                let error_msg = Message::new(MessageType::TransferError {
+                    transfer_id,
+                    error: "Unknown transfer ID".to_string(),
+                });
+                let _ = sender.send((peer_id, error_msg));
+            }
+
             return Ok(());
         }
 
