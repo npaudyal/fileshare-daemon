@@ -79,8 +79,8 @@ impl StreamingFileReader {
             return Ok(None);
         }
         
-        info!("🔧 READER_INDEX: Reading chunk {} with target size {} bytes (remaining: {} bytes)", 
-              chunk_index, chunk_size_to_read, remaining_bytes);
+        debug!("🔧 READER_INDEX: Reading chunk {} with target size {} bytes (remaining: {} bytes)", 
+               chunk_index, chunk_size_to_read, remaining_bytes);
         
         let mut buffer = vec![0u8; chunk_size_to_read];
         let mut total_bytes_read = 0;
@@ -95,8 +95,8 @@ impl StreamingFileReader {
             total_bytes_read += bytes_read;
         }
         
-        info!("🔧 READER_INDEX: Successfully read {} bytes for chunk {} (target: {})", 
-              total_bytes_read, chunk_index, chunk_size_to_read);
+        debug!("🔧 READER_INDEX: Successfully read {} bytes for chunk {} (target: {})", 
+               total_bytes_read, chunk_index, chunk_size_to_read);
         
         if total_bytes_read == 0 {
             return Ok(None);
@@ -126,8 +126,8 @@ impl StreamingFileReader {
         let remaining_bytes = self.total_size - self.bytes_read;
         let chunk_size_to_read = std::cmp::min(self.chunk_size as u64, remaining_bytes) as usize;
         
-        info!("🔧 READER: Reading chunk with target size {} bytes (remaining: {} bytes)", 
-              chunk_size_to_read, remaining_bytes);
+        debug!("🔧 READER: Reading chunk with target size {} bytes (remaining: {} bytes)", 
+               chunk_size_to_read, remaining_bytes);
         
         let mut buffer = vec![0u8; chunk_size_to_read];
         let mut total_bytes_read = 0;
@@ -142,8 +142,8 @@ impl StreamingFileReader {
             total_bytes_read += bytes_read;
         }
         
-        info!("🔧 READER: Successfully read {} bytes for chunk (target: {})", 
-              total_bytes_read, chunk_size_to_read);
+        debug!("🔧 READER: Successfully read {} bytes for chunk (target: {})", 
+               total_bytes_read, chunk_size_to_read);
         
         if total_bytes_read == 0 {
             return Ok(None);
@@ -238,7 +238,9 @@ impl StreamingFileWriter {
     }
     
     pub async fn write_chunk(&mut self, index: u64, data: Vec<u8>, compressed: bool) -> Result<()> {
-        info!("🔧 WRITE_CHUNK: Attempting to write chunk {} (expecting {})", index, self.next_write_index);
+        if index % 10 == 0 || index < 5 {  // Only log every 10th chunk or first 5 chunks
+            debug!("🔧 WRITE_CHUNK: Attempting to write chunk {} (expecting {})", index, self.next_write_index);
+        }
         
         // Skip chunks that are already written (duplicate handling)
         if index < self.next_write_index {
@@ -255,12 +257,13 @@ impl StreamingFileWriter {
         
         // If this is the next expected chunk, write it immediately
         if index == self.next_write_index {
-            info!("✅ DIRECT_WRITE: Writing chunk {} immediately ({} bytes)", index, decompressed_data.len());
+            if index % 10 == 0 || index < 5 {  // Only log every 10th chunk or first 5 chunks
+                debug!("✅ DIRECT_WRITE: Writing chunk {} immediately ({} bytes)", index, decompressed_data.len());
+            }
             self.write_data(&decompressed_data).await?;
             self.next_write_index += 1;
             
             // Check if we have buffered chunks that can now be written
-            info!("🔄 FLUSH_CHECK: Checking for buffered chunks after writing {}", index);
             self.flush_buffered_chunks().await?;
         } else if index > self.next_write_index {
             // Calculate buffer index for out-of-order chunks

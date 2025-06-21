@@ -800,7 +800,7 @@ impl FileTransferManager {
 
         // Get parallel chunks setting from configuration
         let parallel_chunks = settings.transfer.parallel_chunks;
-        let use_parallel = false; // Temporarily disable parallel mode to test sequential fixes
+        let use_parallel = settings.transfer.parallel_chunks > 1; // Enable parallel mode based on configuration
 
         info!(
             "📊 File: {} bytes, streaming: {}, compression: {:?}, parallel: {} (chunks: {})",
@@ -854,7 +854,7 @@ impl FileTransferManager {
 
         // Get parallel chunks setting from configuration
         let parallel_chunks = settings.transfer.parallel_chunks;
-        let use_parallel = false; // Temporarily disable parallel mode to test sequential fixes
+        let use_parallel = settings.transfer.parallel_chunks > 1; // Enable parallel mode based on configuration
 
         info!(
             "📊 File: {} bytes, streaming: {}, compression: {:?}, parallel: {} (chunks: {})",
