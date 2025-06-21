@@ -152,7 +152,12 @@ impl StreamingFileWriter {
         let buffered = BufWriter::with_capacity(BUFFER_SIZE, file);
         
         // Limit chunks buffer size to prevent memory exhaustion
-        let max_buffered_chunks = (MAX_MEMORY_PER_TRANSFER / chunk_size).min(total_chunks as usize);
+        // Ensure we can buffer all chunks needed for the transfer
+        let memory_based_limit = MAX_MEMORY_PER_TRANSFER / chunk_size;
+        let max_buffered_chunks = memory_based_limit.max(total_chunks as usize);
+        
+        info!("📦 BUFFER_INIT: total_chunks={}, memory_limit={}, buffer_size={}", 
+              total_chunks, memory_based_limit, max_buffered_chunks);
         
         Ok(Self {
             file: buffered,
@@ -167,6 +172,8 @@ impl StreamingFileWriter {
     }
     
     pub async fn write_chunk(&mut self, index: u64, data: Vec<u8>, compressed: bool) -> Result<()> {
+        info!("🔧 WRITE_CHUNK: Attempting to write chunk {} (expecting {})", index, self.next_write_index);
+        
         // Skip chunks that are already written (duplicate handling)
         if index < self.next_write_index {
             info!("⚠️ Skipping duplicate chunk {} (already processed up to {})", index, self.next_write_index - 1);
@@ -182,10 +189,12 @@ impl StreamingFileWriter {
         
         // If this is the next expected chunk, write it immediately
         if index == self.next_write_index {
+            info!("✅ DIRECT_WRITE: Writing chunk {} immediately ({} bytes)", index, decompressed_data.len());
             self.write_data(&decompressed_data).await?;
             self.next_write_index += 1;
             
             // Check if we have buffered chunks that can now be written
+            info!("🔄 FLUSH_CHECK: Checking for buffered chunks after writing {}", index);
             self.flush_buffered_chunks().await?;
         } else if index > self.next_write_index {
             // Calculate buffer index for out-of-order chunks
