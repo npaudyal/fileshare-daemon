@@ -3,6 +3,7 @@ use crate::network::protocol::CompressionType;
 use sha2::{Digest, Sha256};
 use std::path::Path;
 use std::sync::Arc;
+use std::collections::HashMap;
 use tokio::fs::File;
 use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader, BufWriter};
 use tokio::sync::mpsc;
@@ -197,7 +198,7 @@ pub struct StreamingFileWriter {
     bytes_written: u64,
     hasher: Sha256,
     decompression: Option<CompressionType>,
-    chunks_buffer: Vec<Option<Vec<u8>>>,
+    chunks_buffer: HashMap<u64, Vec<u8>>,
     next_write_index: u64,
 }
 
@@ -217,13 +218,8 @@ impl StreamingFileWriter {
         let file = File::create(path).await?;
         let buffered = BufWriter::with_capacity(BUFFER_SIZE, file);
         
-        // Limit chunks buffer size to prevent memory exhaustion
-        // Ensure we can buffer all chunks needed for the transfer
-        let memory_based_limit = MAX_MEMORY_PER_TRANSFER / chunk_size;
-        let max_buffered_chunks = memory_based_limit.max(total_chunks as usize);
-        
-        info!("📦 BUFFER_INIT: total_chunks={}, memory_limit={}, buffer_size={}", 
-              total_chunks, memory_based_limit, max_buffered_chunks);
+        // Use HashMap for better chunk management - no size limits needed
+        info!("📦 BUFFER_INIT: total_chunks={}, using HashMap for chunk storage", total_chunks);
         
         Ok(Self {
             file: buffered,
@@ -232,7 +228,7 @@ impl StreamingFileWriter {
             bytes_written: 0,
             hasher: Sha256::new(),
             decompression,
-            chunks_buffer: vec![None; max_buffered_chunks],
+            chunks_buffer: HashMap::new(),
             next_write_index: 0,
         })
     }
@@ -270,60 +266,23 @@ impl StreamingFileWriter {
             // Check if we have buffered chunks that can now be written
             self.flush_buffered_chunks().await?;
         } else if index > self.next_write_index {
-            // Store chunk in a map keyed by chunk index
-            // This avoids issues with buffer slot calculation when chunks arrive very out of order
-            
-            // For now, use the existing buffer but with corrected logic
-            // Calculate the position in buffer where this chunk should go
-            let gap = (index - self.next_write_index) as usize;
-            
-            // Ensure buffer is large enough
-            if gap > self.chunks_buffer.len() {
-                let new_size = gap.min(1000); // Cap at 1000 to prevent memory issues
-                if gap > 1000 {
-                    return Err(FileshareError::Transfer(format!(
-                        "Chunk {} is too far ahead (expected {}), gap of {} exceeds buffer limit",
-                        index, self.next_write_index, gap
-                    )));
-                }
-                self.chunks_buffer.resize(new_size, None);
-                info!("📦 Expanded buffer to {} slots for chunk {} (gap: {})", new_size, index, gap);
+            // Store chunk directly in HashMap by chunk index - much simpler!
+            if index % 10 == 0 || index < 5 {  // Log significant gaps and first 5
+                info!("📦 BUFFER: Storing chunk {} in HashMap (expecting {})", 
+                      index, self.next_write_index);
             }
             
-            // Place chunk at the correct position
-            // chunks_buffer[0] should hold next_write_index + 1
-            // chunks_buffer[1] should hold next_write_index + 2, etc.
-            let buffer_position = gap - 1;
-            
-            if index % 10 == 0 || gap > 10 || index < 5 {  // Log significant gaps and first 5
-                info!("📦 BUFFER: Storing chunk {} at buffer[{}] (expecting {}, gap: {})", 
-                      index, buffer_position, self.next_write_index, gap);
+            // Check if chunk is already stored (shouldn't happen)
+            if self.chunks_buffer.contains_key(&index) {
+                warn!("⚠️ BUFFER: Chunk {} already stored - this indicates a duplicate!", index);
             }
             
-            // Check if slot is already occupied (shouldn't happen with correct logic)
-            if buffer_position < self.chunks_buffer.len() && self.chunks_buffer[buffer_position].is_some() {
-                warn!("⚠️ BUFFER: Position {} already occupied when storing chunk {} - this indicates a bug!", 
-                      buffer_position, index);
-            }
+            self.chunks_buffer.insert(index, decompressed_data);
             
-            if buffer_position < self.chunks_buffer.len() {
-                self.chunks_buffer[buffer_position] = Some(decompressed_data);
-                
-                if index < 5 {
-                    // Show buffer state for debugging
-                    let occupied_slots: Vec<usize> = self.chunks_buffer.iter()
-                        .enumerate()
-                        .filter_map(|(i, slot)| if slot.is_some() { Some(i) } else { None })
-                        .collect();
-                    debug!("📦 BUFFER_STATE: After storing chunk {}, occupied slots: {:?}", index, occupied_slots);
-                }
-            } else {
-                error!("❌ Buffer position {} out of bounds for chunk {} (buffer size: {})", 
-                       buffer_position, index, self.chunks_buffer.len());
-                return Err(FileshareError::Transfer(format!(
-                    "Buffer position calculation error for chunk {}",
-                    index
-                )));
+            if index < 5 {
+                // Show buffer state for debugging
+                let stored_chunks: Vec<u64> = self.chunks_buffer.keys().cloned().collect();
+                debug!("📦 BUFFER_STATE: After storing chunk {}, stored chunks: {:?}", index, stored_chunks);
             }
         }
         
@@ -334,39 +293,25 @@ impl StreamingFileWriter {
         let mut consecutive_flushes = 0;
         let start_write_index = self.next_write_index;
         
-        // Keep flushing chunks that are now ready to be written sequentially
-        while !self.chunks_buffer.is_empty() && self.chunks_buffer[0].is_some() {
-            // Get the first chunk from buffer (which should be the next expected chunk)
-            if let Some(data) = self.chunks_buffer[0].take() {
-                let chunk_index = self.next_write_index;
-                
-                if chunk_index % 10 == 0 || chunk_index < 5 || chunk_index >= 25 {
-                    debug!("🔄 FLUSH: Writing buffered chunk {} from buffer position 0 ({} bytes)", 
-                           chunk_index, data.len());
-                }
-                
-                // Write the chunk
-                self.write_data(&data).await?;
-                self.next_write_index += 1;
-                consecutive_flushes += 1;
-                
-                // Shift all chunks one position left
-                self.chunks_buffer.remove(0);
-                self.chunks_buffer.push(None); // Add empty slot at the end
-                
-                // Debug: Show buffer state after shift for critical chunks
-                if chunk_index < 5 || chunk_index >= 25 {
-                    let occupied_slots: Vec<usize> = self.chunks_buffer.iter()
-                        .enumerate()
-                        .filter_map(|(i, slot)| if slot.is_some() { Some(i) } else { None })
-                        .take(10)  // Only show first 10 occupied slots
-                        .collect();
-                    debug!("🔄 FLUSH: After writing chunk {}, buffer occupied slots: {:?}", 
-                           chunk_index, occupied_slots);
-                }
-            } else {
-                // First slot is empty, no more consecutive chunks
-                break;
+        // Keep writing chunks sequentially if they're available in the HashMap
+        while let Some(data) = self.chunks_buffer.remove(&self.next_write_index) {
+            let chunk_index = self.next_write_index;
+            
+            if chunk_index % 10 == 0 || chunk_index < 5 || chunk_index >= 25 {
+                debug!("🔄 FLUSH: Writing buffered chunk {} from HashMap ({} bytes)", 
+                       chunk_index, data.len());
+            }
+            
+            // Write the chunk
+            self.write_data(&data).await?;
+            self.next_write_index += 1;
+            consecutive_flushes += 1;
+            
+            // Debug: Show remaining chunks in HashMap for critical chunks
+            if chunk_index < 5 || chunk_index >= 25 {
+                let remaining_chunks: Vec<u64> = self.chunks_buffer.keys().cloned().collect();
+                debug!("🔄 FLUSH: After writing chunk {}, remaining chunks in HashMap: {:?}", 
+                       chunk_index, remaining_chunks);
             }
         }
         
@@ -424,30 +369,22 @@ impl StreamingFileWriter {
                 error!("❌ FINALIZE: Still missing chunks after flush: {:?}", missing_chunks);
                 
                 // Show current buffer state
-                let occupied_slots: Vec<(usize, bool)> = self.chunks_buffer.iter()
-                    .enumerate()
-                    .map(|(i, slot)| (i, slot.is_some()))
-                    .take(30)  // Show first 30 slots
-                    .collect();
-                warn!("🔧 FINALIZE: Buffer state (occupied=true): {:?}", occupied_slots);
+                let stored_chunks: Vec<u64> = self.chunks_buffer.keys().cloned().collect();
+                warn!("🔧 FINALIZE: Chunks still in HashMap: {:?}", stored_chunks);
                 
-                // Check if any missing chunks are in the buffer and write them directly
+                // Check if any missing chunks are in the HashMap and write them directly
                 for missing_idx in &missing_chunks {
-                    let buffer_pos = (*missing_idx - self.next_write_index) as usize;
-                    if buffer_pos < self.chunks_buffer.len() {
-                        if let Some(data) = self.chunks_buffer[buffer_pos].take() {
-                            warn!("🔧 FINALIZE: Found missing chunk {} in buffer at position {}, writing directly", 
-                                  missing_idx, buffer_pos);
-                            // Write it directly at the correct file position
-                            use tokio::io::AsyncSeekExt;
-                            let file_position = *missing_idx * self.chunk_size as u64;
-                            self.file.seek(std::io::SeekFrom::Start(file_position)).await?;
-                            self.file.write_all(&data).await?;
-                            self.hasher.update(&data);
-                            self.bytes_written += data.len() as u64;
-                            info!("✅ FINALIZE: Successfully wrote missing chunk {} at file position {}", 
-                                  missing_idx, file_position);
-                        }
+                    if let Some(data) = self.chunks_buffer.remove(missing_idx) {
+                        warn!("🔧 FINALIZE: Found missing chunk {} in HashMap, writing directly", missing_idx);
+                        // Write it directly at the correct file position
+                        use tokio::io::AsyncSeekExt;
+                        let file_position = *missing_idx * self.chunk_size as u64;
+                        self.file.seek(std::io::SeekFrom::Start(file_position)).await?;
+                        self.file.write_all(&data).await?;
+                        self.hasher.update(&data);
+                        self.bytes_written += data.len() as u64;
+                        info!("✅ FINALIZE: Successfully wrote missing chunk {} at file position {}", 
+                              missing_idx, file_position);
                     }
                 }
                 
@@ -456,22 +393,22 @@ impl StreamingFileWriter {
             }
         }
         
-        // Check if there are any remaining chunks in buffer (this shouldn't happen)
-        let remaining_chunks: usize = self.chunks_buffer.iter().filter(|chunk| chunk.is_some()).count();
-        if remaining_chunks > 0 {
-            warn!("⚠️ FINALIZE: {} chunks still in buffer after final flush!", remaining_chunks);
+        // Check if there are any remaining chunks in HashMap (this shouldn't happen)
+        if !self.chunks_buffer.is_empty() {
+            let remaining_chunks: Vec<u64> = self.chunks_buffer.keys().cloned().collect();
+            warn!("⚠️ FINALIZE: {} chunks still in HashMap after final processing: {:?}", 
+                  remaining_chunks.len(), remaining_chunks);
             
-            // Log buffer state for debugging
-            for (i, chunk_opt) in self.chunks_buffer.iter().enumerate() {
-                if chunk_opt.is_some() {
-                    let chunk_index = self.next_write_index + i as u64 + 1;
-                    warn!("🔧 FINALIZE: Buffer[{}] contains chunk {} (size: {} bytes)", 
-                          i, chunk_index, chunk_opt.as_ref().unwrap().len());
-                }
+            // Write any remaining chunks directly
+            for (chunk_index, data) in self.chunks_buffer.drain() {
+                warn!("🔧 FINALIZE: Writing orphaned chunk {} directly", chunk_index);
+                use tokio::io::AsyncSeekExt;
+                let file_position = chunk_index * self.chunk_size as u64;
+                self.file.seek(std::io::SeekFrom::Start(file_position)).await?;
+                self.file.write_all(&data).await?;
+                self.hasher.update(&data);
+                self.bytes_written += data.len() as u64;
             }
-            
-            // Try one more flush
-            self.flush_buffered_chunks().await?;
         }
         
         // Final flush of file buffer
