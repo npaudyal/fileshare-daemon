@@ -993,32 +993,23 @@ impl FileTransferManager {
         total_chunks: u64,
     ) -> Result<()> {
         info!(
-            "🚀 PARALLEL_STREAMING: Starting streaming parallel transfer with {} concurrent chunks",
+            "🚀 PARALLEL_OPTIMIZED: Starting optimized parallel transfer with {} concurrent chunks",
             parallel_chunks
         );
 
-        // Create channel for streaming chunks
-        let (chunk_tx, mut chunk_rx) = tokio::sync::mpsc::channel::<(u64, Vec<u8>, bool)>(parallel_chunks * 2);
+        // OPTIMIZATION: Read all chunks sequentially into memory first (much faster than random I/O)
+        info!("📖 Reading file into memory for optimized parallel transfer...");
+        let mut reader = StreamingFileReader::new(&file_path, chunk_size, compression).await?;
+        let mut all_chunks = Vec::with_capacity(total_chunks as usize);
         
-        // Spawn producer task to read chunks
-        let file_path_clone = file_path.clone();
-        let chunk_size_clone = chunk_size;
-        let compression_clone = compression.clone();
+        // Sequential read is MUCH faster than random access
+        while let Some((chunk_data, is_last)) = reader.read_next_chunk().await? {
+            all_chunks.push(chunk_data);
+            if is_last { break; }
+        }
         
-        let producer_handle = tokio::spawn(async move {
-            let mut reader = StreamingFileReader::new(&file_path_clone, chunk_size_clone, compression_clone).await?;
-            let mut chunk_index = 0u64;
-            
-            while let Some((chunk_data, is_last)) = reader.read_next_chunk().await? {
-                if chunk_tx.send((chunk_index, chunk_data, is_last)).await.is_err() {
-                    break; // Receiver dropped
-                }
-                chunk_index += 1;
-                if is_last { break; }
-            }
-            
-            Ok::<String, FileshareError>(reader.get_checksum())
-        });
+        let file_checksum = reader.get_checksum();
+        info!("✅ File read complete: {} chunks loaded, checksum: {}", all_chunks.len(), file_checksum);
 
         // Create parallel sender and tracker
         let parallel_sender = ParallelChunkSender::new(
@@ -1031,105 +1022,85 @@ impl FileTransferManager {
         let mut tracker = TransferTracker::new(transfer_id, total_chunks);
         let start_time = Instant::now();
         let mut last_progress_update = Instant::now();
-        let mut active_batch = Vec::new();
-        let mut file_checksum = String::new();
 
-        // Process chunks as they arrive from the reader
-        while let Some((chunk_index, chunk_data, is_last)) = chunk_rx.recv().await {
-            let chunk = TransferChunk {
-                index: chunk_index,
-                data: chunk_data,
-                is_last,
-                compressed: compression.is_some(),
-                checksum: None,
-            };
+        // Process chunks in batches - now it's pure network operation
+        for batch_start in (0..all_chunks.len()).step_by(parallel_chunks) {
+            let batch_end = (batch_start + parallel_chunks).min(all_chunks.len());
+            let batch_indices: Vec<u64> = (batch_start..batch_end).map(|i| i as u64).collect();
             
-            active_batch.push((chunk_index, chunk));
+            debug!("🔄 PARALLEL_OPTIMIZED: Processing batch {} to {}", batch_start, batch_end);
             
-            // Send batch when full or on last chunk
-            if active_batch.len() >= parallel_chunks || is_last {
-                let batch_indices: Vec<u64> = active_batch.iter().map(|(idx, _)| *idx).collect();
-                
-                debug!("🔄 PARALLEL_STREAMING: Sending batch of {} chunks", active_batch.len());
-                
-                tracker.mark_in_progress(&batch_indices);
-                
-                // OPTIMIZATION: Use batched sending for better performance
-                // Send chunks in batches to reduce message overhead
-                let batch_size = 4; // Send 4 chunks per message for optimal batching
-                let failed_chunks = if active_batch.len() >= batch_size {
-                    parallel_sender.send_chunks_batched(active_batch, batch_size).await?
-                } else {
-                    // For small batches, use regular parallel sending
-                    parallel_sender.send_chunks_parallel(active_batch).await?
+            tracker.mark_in_progress(&batch_indices);
+
+            let mut chunks_to_send = Vec::new();
+
+            // Prepare chunks for this batch
+            for i in batch_start..batch_end {
+                let chunk_index = i as u64;
+                let chunk = TransferChunk {
+                    index: chunk_index,
+                    data: all_chunks[i].clone(),
+                    is_last: chunk_index == total_chunks - 1,
+                    compressed: compression.is_some(),
+                    checksum: None,
                 };
-                
-                // Update tracker
-                for &chunk_index in &batch_indices {
-                    if !failed_chunks.contains(&chunk_index) {
-                        tracker.mark_completed(chunk_index);
-                    } else {
-                        tracker.mark_failed(chunk_index);
-                    }
-                }
-                
-                // Clear batch for next iteration
-                active_batch = Vec::new();
-                
-                // Send progress update
-                if last_progress_update.elapsed() > Duration::from_millis(PROGRESS_UPDATE_INTERVAL_MS) {
-                    let elapsed = start_time.elapsed().as_secs_f64();
-                    let bytes_transferred = tracker.completed_chunks.len() as u64 * chunk_size as u64;
-                    let speed_bps = if elapsed > 0.0 {
-                        (bytes_transferred as f64 / elapsed) as u64
-                    } else {
-                        0
-                    };
+                chunks_to_send.push((chunk_index, chunk));
+            }
 
-                    let progress_msg = Message::new(MessageType::TransferProgress {
-                        transfer_id,
-                        bytes_transferred,
-                        chunks_completed: tracker.completed_chunks.len() as u64,
-                        speed_bps,
-                        eta_seconds: None,
-                    });
+            // Send chunks in parallel
+            let failed_chunks = parallel_sender.send_chunks_parallel(chunks_to_send).await?;
 
-                    let _ = message_sender.send((peer_id, progress_msg));
-                    last_progress_update = Instant::now();
-
-                    info!(
-                        "📊 PARALLEL_STREAMING: Progress {:.1}% ({}/{} chunks) - Speed: {:.1} MB/s",
-                        tracker.progress_percentage(),
-                        tracker.completed_chunks.len(),
-                        total_chunks,
-                        speed_bps as f64 / (1024.0 * 1024.0)
-                    );
+            // Update tracker
+            for &chunk_index in &batch_indices {
+                if !failed_chunks.contains(&chunk_index) {
+                    tracker.mark_completed(chunk_index);
+                } else {
+                    tracker.mark_failed(chunk_index);
                 }
             }
-            
-            if is_last { break; }
-        }
-        
-        // Wait for producer to finish and get checksum
-        match producer_handle.await {
-            Ok(Ok(checksum)) => file_checksum = checksum,
-            Ok(Err(e)) => error!("Producer task error: {}", e),
-            Err(e) => error!("Producer task panic: {}", e),
+
+            // Send progress update
+            if last_progress_update.elapsed() > Duration::from_millis(PROGRESS_UPDATE_INTERVAL_MS) {
+                let elapsed = start_time.elapsed().as_secs_f64();
+                let bytes_transferred = tracker.completed_chunks.len() as u64 * chunk_size as u64;
+                let speed_bps = if elapsed > 0.0 {
+                    (bytes_transferred as f64 / elapsed) as u64
+                } else {
+                    0
+                };
+
+                let progress_msg = Message::new(MessageType::TransferProgress {
+                    transfer_id,
+                    bytes_transferred,
+                    chunks_completed: tracker.completed_chunks.len() as u64,
+                    speed_bps,
+                    eta_seconds: None,
+                });
+
+                let _ = message_sender.send((peer_id, progress_msg));
+                last_progress_update = Instant::now();
+
+                info!(
+                    "📊 PARALLEL_OPTIMIZED: Progress {:.1}% ({}/{} chunks) - Speed: {:.1} MB/s",
+                    tracker.progress_percentage(),
+                    tracker.completed_chunks.len(),
+                    total_chunks,
+                    speed_bps as f64 / (1024.0 * 1024.0)
+                );
+            }
         }
 
-        // Handle any failed chunks by re-reading them
+        // Retry failed chunks if any
         let pending = tracker.get_pending_chunks();
         if !pending.is_empty() {
-            warn!("⚠️ PARALLEL_STREAMING: Retrying {} failed chunks", pending.len());
+            warn!("⚠️ PARALLEL_OPTIMIZED: Retrying {} failed chunks", pending.len());
             
-            let mut reader = StreamingFileReader::new(&file_path, chunk_size, compression).await?;
-            
+            // Retry failed chunks from our in-memory data
             for chunk_index in pending {
-                // Seek to the specific chunk
-                if let Some((chunk_data, is_last)) = reader.read_chunk_at_index(chunk_index).await? {
+                if chunk_index < all_chunks.len() as u64 {
                     let chunk = TransferChunk {
                         index: chunk_index,
-                        data: chunk_data,
+                        data: all_chunks[chunk_index as usize].clone(),
                         is_last: chunk_index == total_chunks - 1,
                         compressed: compression.is_some(),
                         checksum: None,
@@ -1141,12 +1112,12 @@ impl FileTransferManager {
                     });
                     
                     if let Err(e) = message_sender.send((peer_id, message)) {
-                        error!("❌ PARALLEL_STREAMING: Failed to retry chunk {}: {}", chunk_index, e);
+                        error!("❌ PARALLEL_OPTIMIZED: Failed to retry chunk {}: {}", chunk_index, e);
                         return Err(FileshareError::Transfer(format!(
                             "Failed to send chunk {} after retry: {}", chunk_index, e
                         )));
                     } else {
-                        info!("✅ PARALLEL_STREAMING: Successfully retried chunk {}", chunk_index);
+                        info!("✅ PARALLEL_OPTIMIZED: Successfully retried chunk {}", chunk_index);
                         tracker.mark_completed(chunk_index);
                     }
                 }
@@ -1154,7 +1125,7 @@ impl FileTransferManager {
         }
 
         info!(
-            "✅ PARALLEL_STREAMING: All chunks sent for transfer {} - {} chunks, checksum: {} (waiting for receiver confirmation)",
+            "✅ PARALLEL_OPTIMIZED: All chunks sent for transfer {} - {} chunks, checksum: {} (waiting for receiver confirmation)",
             transfer_id,
             tracker.completed_chunks.len(),
             file_checksum

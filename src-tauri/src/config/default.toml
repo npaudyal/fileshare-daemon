@@ -9,7 +9,7 @@ service_name = "_fileshare._tcp.local."
 timeout_seconds = 30
 
 [transfer]
-chunk_size = 4194304  # 4MB default chunk size (OPTIMIZED)
+chunk_size = 1048576  # 1MB default chunk size
 max_concurrent_transfers = 5
 adaptive_chunk_size = true  # Auto-adjust chunk size based on file size
 compression_enabled = false  # Enable compression for better bandwidth (only for uncompressed files > 1MB)
