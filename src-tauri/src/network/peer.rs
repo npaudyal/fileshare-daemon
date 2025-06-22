@@ -460,8 +460,35 @@ impl PeerManager {
                                           chunk.index, transfer_id, chunk.data.len(), chunk.is_last);
                                 }
                             }
+                            MessageType::FileChunkBatch { transfer_id, chunks } => {
+                                error!("🚨 TCP_READ: Received FileChunkBatch with {} chunks for transfer {} from peer {} via TCP connection", 
+                                       chunks.len(), transfer_id, read_peer_id);
+                            }
                             _ => {
-                                info!("📥 READ from peer {}: {:?}", read_peer_id, message.message_type);
+                                // Log message type name only to keep terminal clean (no chunk data)
+                                let message_name = match &message.message_type {
+                                    MessageType::FileOffer { .. } => "FileOffer",
+                                    MessageType::FileOfferResponse { .. } => "FileOfferResponse",
+                                    MessageType::FileRequest { .. } => "FileRequest",
+                                    MessageType::FileRequestResponse { .. } => "FileRequestResponse",
+                                    MessageType::TransferComplete { .. } => "TransferComplete",
+                                    MessageType::TransferError { .. } => "TransferError",
+                                    MessageType::TransferProgress { .. } => "TransferProgress",
+                                    MessageType::FileChunkAck { .. } => "FileChunkAck",
+                                    MessageType::FileChunkBatchAck { .. } => "FileChunkBatchAck",
+                                    MessageType::TransferResume { .. } => "TransferResume",
+                                    MessageType::TransferPause { .. } => "TransferPause",
+                                    MessageType::Handshake { .. } => "Handshake",
+                                    MessageType::HandshakeResponse { .. } => "HandshakeResponse",
+                                    MessageType::ClipboardUpdate { .. } => "ClipboardUpdate",
+                                    MessageType::ClipboardClear => "ClipboardClear",
+                                    MessageType::Disconnect => "Disconnect",
+                                    MessageType::FileChunk { .. } => "FileChunk",
+                                    MessageType::FileChunkBatch { .. } => "FileChunkBatch",
+                                    MessageType::Ping => "Ping",
+                                    MessageType::Pong => "Pong",
+                                };
+                                info!("📥 READ from peer {}: {}", read_peer_id, message_name);
                             }
                         }
                         if let Err(e) = read_message_tx.send((read_peer_id, message)) {
@@ -499,8 +526,35 @@ impl PeerManager {
                                   chunk.index, transfer_id, chunk.data.len(), chunk.is_last);
                         }
                     }
+                    MessageType::FileChunkBatch { transfer_id, chunks } => {
+                        error!("🚨 TCP_WRITE: About to send FileChunkBatch with {} chunks for transfer {} to peer {}", 
+                               chunks.len(), transfer_id, write_peer_id);
+                    }
                     _ => {
-                        info!("📤 WRITE to peer {}: {:?}", write_peer_id, message.message_type);
+                        // Log message type name only to keep terminal clean (no chunk data)
+                        let message_name = match &message.message_type {
+                            MessageType::FileOffer { .. } => "FileOffer",
+                            MessageType::FileOfferResponse { .. } => "FileOfferResponse",
+                            MessageType::FileRequest { .. } => "FileRequest",
+                            MessageType::FileRequestResponse { .. } => "FileRequestResponse",
+                            MessageType::TransferComplete { .. } => "TransferComplete",
+                            MessageType::TransferError { .. } => "TransferError",
+                            MessageType::TransferProgress { .. } => "TransferProgress",
+                            MessageType::FileChunkAck { .. } => "FileChunkAck",
+                            MessageType::FileChunkBatchAck { .. } => "FileChunkBatchAck",
+                            MessageType::TransferResume { .. } => "TransferResume",
+                            MessageType::TransferPause { .. } => "TransferPause",
+                            MessageType::Handshake { .. } => "Handshake",
+                            MessageType::HandshakeResponse { .. } => "HandshakeResponse",
+                            MessageType::ClipboardUpdate { .. } => "ClipboardUpdate",
+                            MessageType::ClipboardClear => "ClipboardClear",
+                            MessageType::Disconnect => "Disconnect",
+                            MessageType::FileChunk { .. } => "FileChunk",
+                            MessageType::FileChunkBatch { .. } => "FileChunkBatch",
+                            MessageType::Ping => "Ping",
+                            MessageType::Pong => "Pong",
+                        };
+                        info!("📤 WRITE to peer {}: {}", write_peer_id, message_name);
                     }
                 }
 
@@ -781,8 +835,33 @@ impl PeerManager {
             MessageType::FileChunk { .. } => {
                 // Don't log individual chunks - too noisy
             }
+            MessageType::FileChunkBatch { transfer_id, chunks } => {
+                // Special handling for chunk batches to avoid verbose output
+                info!("📥 Processing FileChunkBatch from {}: {} chunks for transfer {}", 
+                      peer_id, chunks.len(), transfer_id);
+            }
             _ => {
-                info!("📥 Processing message from {}: {:?}", peer_id, message.message_type);
+                // Log message type name only to keep terminal clean (no data)
+                let message_name = match &message.message_type {
+                    MessageType::FileOffer { .. } => "FileOffer",
+                    MessageType::FileOfferResponse { .. } => "FileOfferResponse",
+                    MessageType::FileRequest { .. } => "FileRequest",
+                    MessageType::FileRequestResponse { .. } => "FileRequestResponse",
+                    MessageType::TransferComplete { .. } => "TransferComplete",
+                    MessageType::TransferError { .. } => "TransferError",
+                    MessageType::TransferProgress { .. } => "TransferProgress",
+                    MessageType::FileChunkAck { .. } => "FileChunkAck",
+                    MessageType::FileChunkBatchAck { .. } => "FileChunkBatchAck",
+                    MessageType::TransferResume { .. } => "TransferResume",
+                    MessageType::TransferPause { .. } => "TransferPause",
+                    MessageType::Handshake { .. } => "Handshake",
+                    MessageType::HandshakeResponse { .. } => "HandshakeResponse",
+                    MessageType::ClipboardUpdate { .. } => "ClipboardUpdate",
+                    MessageType::ClipboardClear => "ClipboardClear",
+                    MessageType::Disconnect => "Disconnect",
+                    _ => "Unknown",
+                };
+                info!("📥 Processing message from {}: {}", peer_id, message_name);
             }
         }
 
@@ -925,18 +1004,40 @@ impl PeerManager {
             }
 
             MessageType::FileChunkBatch { transfer_id, chunks } => {
-                debug!("Received batch of {} chunks for transfer {} from peer {}", chunks.len(), transfer_id, peer_id);
+                warn!("🚨 CHUNK_REFLECTION: Received batch of {} chunks for transfer {} from peer {} - INVESTIGATING WHY MAC IS SENDING CHUNKS!", 
+                      chunks.len(), transfer_id, peer_id);
+                
+                // CRITICAL: This should never happen for properly configured transfers
+                // If we're receiving chunks, we should be the receiver, not the sender
+                // But somehow Mac is sending chunks back to Windows
                 
                 // Early check: Don't process chunks for outgoing transfers
                 let ft_read = self.file_transfer.read().await;
                 if let Some(transfer) = ft_read.active_transfers.get(&transfer_id) {
+                    error!(
+                        "🚨 CRITICAL: Received chunks for transfer {} direction {:?} from peer {} - this indicates a serious bug!",
+                        transfer_id, transfer.direction, peer_id
+                    );
+                    
                     if matches!(transfer.direction, TransferDirection::Outgoing) {
-                        warn!(
-                            "⚠️ RECEIVER: Ignoring chunk batch for outgoing transfer {} from peer {} - this should not happen",
+                        error!(
+                            "🚨 OUTGOING_REFLECTION: Ignoring chunk batch for OUTGOING transfer {} from peer {} - MAC SHOULD NOT SEND CHUNKS BACK!",
                             transfer_id, peer_id
                         );
                         return Ok(());
                     }
+                    
+                    // Even for incoming transfers, log this as suspicious since we don't expect batch reflection
+                    error!(
+                        "🚨 INCOMING_REFLECTION: Processing chunk batch for INCOMING transfer {} from peer {} - this might be normal reception",
+                        transfer_id, peer_id
+                    );
+                } else {
+                    error!(
+                        "🚨 UNKNOWN_TRANSFER: Received chunks for unknown transfer {} from peer {}",
+                        transfer_id, peer_id
+                    );
+                    return Ok(());
                 }
                 drop(ft_read);
                 

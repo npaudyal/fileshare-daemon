@@ -1024,7 +1024,7 @@ impl FileTransferManager {
         });
 
         // CRITICAL: Verify this is an outgoing transfer before creating parallel sender
-        info!("🔍 Verifying outgoing transfer {} before creating parallel sender", transfer_id);
+        error!("🚨 PARALLEL_SENDER_CREATION: About to create ParallelChunkSender for transfer {} - THIS IS THE SOURCE OF CHUNK BATCHES!", transfer_id);
         
         // Create parallel sender and tracker
         let parallel_sender = ParallelChunkSender::new(
