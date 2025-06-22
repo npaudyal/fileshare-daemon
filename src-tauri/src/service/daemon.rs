@@ -10,7 +10,7 @@ use crate::{
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{broadcast, RwLock};
-use tracing::{debug, error, info, warn};
+use tracing::{error, info, warn};
 pub struct FileshareDaemon {
     settings: Arc<Settings>,
     pub discovery: Option<DiscoveryService>,
@@ -685,9 +685,6 @@ impl FileshareDaemon {
                         | crate::network::protocol::MessageType::FileChunk {
                             transfer_id, ..
                         }
-                        | crate::network::protocol::MessageType::FileChunkBatch {
-                            transfer_id, ..
-                        }
                         | crate::network::protocol::MessageType::TransferComplete {
                             transfer_id,
                             ..
@@ -940,34 +937,6 @@ impl FileshareDaemon {
                                 {
                                     error!(
                                         "❌ Failed to send TransferError to peer {}: {}",
-                                        peer_id, e
-                                    );
-                                }
-                                continue; // Don't process locally
-                            }
-                        }
-
-                        // OPTIMIZATION FIX: Handle FileChunkBatch for outgoing transfers directly
-                        crate::network::protocol::MessageType::FileChunkBatch {
-                            transfer_id, ..
-                        } => {
-                            let is_our_outgoing = {
-                                let ft = pm.file_transfer.read().await;
-                                ft.has_transfer(*transfer_id)
-                                    && matches!(
-                                        ft.get_transfer_direction(*transfer_id),
-                                        Some(TransferDirection::Outgoing)
-                                    )
-                            };
-
-                            if is_our_outgoing {
-                                // Send FileChunkBatch directly to peer to avoid loopback processing
-                                debug!("🚀 Sending outgoing FileChunkBatch for transfer {} directly to peer {}", transfer_id, peer_id);
-                                if let Err(e) =
-                                    pm.send_direct_to_connection(peer_id, message.clone()).await
-                                {
-                                    error!(
-                                        "❌ Failed to send FileChunkBatch to peer {}: {}",
                                         peer_id, e
                                     );
                                 }

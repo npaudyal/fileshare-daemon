@@ -210,11 +210,15 @@ impl FileMetadata {
         // Guess MIME type
         let mime_type = Self::guess_mime_type(&name);
 
-        // Determine if streaming mode should be used (files > 10MB)
-        let streaming_mode = file_size > 10 * 1024 * 1024;
+        // Determine if streaming mode should be used (files > 50MB)
+        let streaming_mode = file_size > 50 * 1024 * 1024;
         
-        // OPTIMIZATION: Disable compression for performance (large files)
-        let compression = None; // Compression disabled for maximum transfer speed
+        // Determine compression type based on file type and size
+        let compression = if file_size > 1024 * 1024 && !Self::is_compressed_format(&name) {
+            Some(CompressionType::Zstd)
+        } else {
+            None
+        };
 
         Ok(Self {
             name,
