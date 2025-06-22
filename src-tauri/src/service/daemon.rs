@@ -685,6 +685,9 @@ impl FileshareDaemon {
                         | crate::network::protocol::MessageType::FileChunk {
                             transfer_id, ..
                         }
+                        | crate::network::protocol::MessageType::FileChunkBatch {
+                            transfer_id, ..
+                        }
                         | crate::network::protocol::MessageType::TransferComplete {
                             transfer_id,
                             ..
