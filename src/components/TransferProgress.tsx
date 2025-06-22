@@ -9,7 +9,12 @@ import {
     Play,
     X,
     FileText,
-    Minimize2
+    Minimize2,
+    Zap,
+    Activity,
+    Clock,
+    Cpu,
+    TrendingUp
 } from 'lucide-react';
 import { invoke } from '@tauri-apps/api/core';
 
@@ -20,11 +25,22 @@ interface Transfer {
     progress: number;
     speed: number;
     direction: 'upload' | 'download';
-    status: 'active' | 'paused' | 'completed' | 'error';
+    status: 'active' | 'paused' | 'completed' | 'error' | 'pending';
     peerId: string;
     peerName: string;
     startTime: number;
     error?: string;
+    // Enhanced streaming features
+    estimatedTimeRemaining?: number;
+    averageSpeed?: number;
+    currentSpeed?: number;
+    isStreaming?: boolean;
+    totalChunks?: number;
+    completedChunks?: number;
+    streamChunkSize?: number;
+    memoryUsage?: number;
+    compressionRatio?: number;
+    peakSpeed?: number;
 }
 
 interface TransferProgressProps {
@@ -74,7 +90,7 @@ const TransferProgress: React.FC<TransferProgressProps> = ({ isVisible, onToggle
     const formatBytes = (bytes: number) => {
         if (bytes === 0) return '0 B';
         const k = 1024;
-        const sizes = ['B', 'KB', 'MB', 'GB'];
+        const sizes = ['B', 'KB', 'MB', 'GB', 'TB', 'PB'];
         const i = Math.floor(Math.log(bytes) / Math.log(k));
         return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i];
     };
@@ -84,11 +100,45 @@ const TransferProgress: React.FC<TransferProgressProps> = ({ isVisible, onToggle
     };
 
     const formatTimeRemaining = (transfer: Transfer) => {
-        if (transfer.speed === 0) return '∞';
-        const remaining = (transfer.fileSize * (1 - transfer.progress / 100)) / transfer.speed;
+        // Use enhanced ETA if available
+        const remaining = transfer.estimatedTimeRemaining ?? 
+            (transfer.speed === 0 ? Infinity : (transfer.fileSize * (1 - transfer.progress / 100)) / transfer.speed);
+        
+        if (!isFinite(remaining)) return '∞';
         if (remaining < 60) return `${Math.round(remaining)}s`;
         if (remaining < 3600) return `${Math.round(remaining / 60)}m`;
-        return `${Math.round(remaining / 3600)}h`;
+        const hours = Math.floor(remaining / 3600);
+        const minutes = Math.round((remaining % 3600) / 60);
+        return hours > 0 ? `${hours}h ${minutes}m` : `${Math.round(remaining / 60)}m`;
+    };
+
+    const getFileSizeCategory = (bytes: number): 'small' | 'medium' | 'large' | 'huge' => {
+        if (bytes < 100 * 1024 * 1024) return 'small'; // < 100MB
+        if (bytes < 1024 * 1024 * 1024) return 'medium'; // < 1GB
+        if (bytes < 10 * 1024 * 1024 * 1024) return 'large'; // < 10GB
+        return 'huge'; // >= 10GB
+    };
+
+    const getFileSizeBadge = (bytes: number) => {
+        const category = getFileSizeCategory(bytes);
+        if (category === 'small' || category === 'medium') return null;
+        
+        const config = {
+            large: { label: '1GB+', className: 'bg-yellow-500/20 text-yellow-300' },
+            huge: { label: '10GB+', className: 'bg-red-500/20 text-red-300' }
+        };
+        
+        return (
+            <span className={`text-xs px-2 py-1 rounded-full ${config[category].className}`}>
+                {config[category].label}
+            </span>
+        );
+    };
+
+    const formatCompressionRatio = (ratio?: number) => {
+        if (!ratio || ratio === 1) return null;
+        const percent = Math.round((1 - ratio) * 100);
+        return `${percent}% compressed`;
     };
 
     const getStatusColor = (status: string) => {
@@ -101,8 +151,164 @@ const TransferProgress: React.FC<TransferProgressProps> = ({ isVisible, onToggle
         }
     };
 
+    const pendingTransfers = transfers.filter(t => t.status === 'pending');
     const activeTransfers = transfers.filter(t => t.status === 'active' || t.status === 'paused');
     const completedTransfers = transfers.filter(t => t.status === 'completed' || t.status === 'error');
+
+    // Enhanced transfer card component
+    const TransferCard: React.FC<{ transfer: Transfer }> = ({ transfer }) => {
+        const isActive = transfer.status === 'active';
+        const isStreaming = transfer.isStreaming && isActive;
+        const fileSizeBadge = getFileSizeBadge(transfer.fileSize);
+        const compressionInfo = formatCompressionRatio(transfer.compressionRatio);
+        
+        return (
+            <motion.div
+                layout
+                className="bg-white/5 rounded-lg p-3 space-y-3 border border-white/5 hover:border-white/10 transition-colors"
+            >
+                {/* Header with file info and controls */}
+                <div className="flex items-center justify-between">
+                    <div className="flex items-center space-x-2 min-w-0 flex-1">
+                        {transfer.direction === 'upload' ? (
+                            <Upload className="w-4 h-4 text-green-400 flex-shrink-0" />
+                        ) : (
+                            <Download className="w-4 h-4 text-blue-400 flex-shrink-0" />
+                        )}
+                        <div className="min-w-0 flex-1">
+                            <div className="flex items-center space-x-2">
+                                <p className="text-white text-sm truncate font-medium">{transfer.fileName}</p>
+                                {fileSizeBadge}
+                                {isStreaming && (
+                                    <div className="flex items-center space-x-1">
+                                        <div className="w-2 h-2 bg-green-400 rounded-full animate-pulse"></div>
+                                        <span className="text-green-400 text-xs font-medium">STREAMING</span>
+                                    </div>
+                                )}
+                            </div>
+                            <div className="flex items-center space-x-2 text-xs text-gray-400">
+                                <span>{transfer.direction === 'upload' ? 'to' : 'from'} {transfer.peerName}</span>
+                                {compressionInfo && (
+                                    <>
+                                        <span>•</span>
+                                        <span className="text-purple-400">{compressionInfo}</span>
+                                    </>
+                                )}
+                            </div>
+                        </div>
+                    </div>
+                    <div className="flex items-center space-x-1">
+                        {(transfer.status === 'active' || transfer.status === 'paused') && (
+                            <>
+                                <button
+                                    onClick={() => handlePauseResume(transfer.id)}
+                                    className="p-1 text-gray-400 hover:text-white transition-colors"
+                                >
+                                    {transfer.status === 'paused' ? (
+                                        <Play className="w-3 h-3" />
+                                    ) : (
+                                        <Pause className="w-3 h-3" />
+                                    )}
+                                </button>
+                                <button
+                                    onClick={() => handleCancel(transfer.id)}
+                                    className="p-1 text-gray-400 hover:text-red-400 transition-colors"
+                                >
+                                    <X className="w-3 h-3" />
+                                </button>
+                            </>
+                        )}
+                    </div>
+                </div>
+
+                {/* Progress section */}
+                {(transfer.status === 'active' || transfer.status === 'paused') && (
+                    <div className="space-y-2">
+                        {/* Status and speeds */}
+                        <div className="flex justify-between text-xs">
+                            <div className="flex items-center space-x-2">
+                                <span className={getStatusColor(transfer.status)}>
+                                    {transfer.progress.toFixed(1)}%
+                                </span>
+                                {transfer.totalChunks && transfer.completedChunks !== undefined && (
+                                    <span className="text-gray-400">
+                                        {transfer.completedChunks}/{transfer.totalChunks} chunks
+                                    </span>
+                                )}
+                            </div>
+                            <div className="flex items-center space-x-2 text-gray-400">
+                                {transfer.currentSpeed !== undefined && transfer.averageSpeed !== undefined ? (
+                                    <>
+                                        <span>{formatSpeed(transfer.currentSpeed)}</span>
+                                        <span>•</span>
+                                        <span>avg {formatSpeed(transfer.averageSpeed)}</span>
+                                    </>
+                                ) : (
+                                    <span>{formatSpeed(transfer.speed)}</span>
+                                )}
+                                <span>•</span>
+                                <span>{formatTimeRemaining(transfer)}</span>
+                            </div>
+                        </div>
+
+                        {/* Progress bar */}
+                        <div className="w-full bg-gray-700 rounded-full h-2 overflow-hidden">
+                            <motion.div
+                                className={`h-2 rounded-full ${
+                                    transfer.status === 'paused' 
+                                        ? 'bg-gradient-to-r from-yellow-500 to-orange-500'
+                                        : isStreaming
+                                            ? 'bg-gradient-to-r from-blue-500 via-purple-500 to-blue-500 bg-[length:200%_100%] animate-gradient'
+                                            : 'bg-gradient-to-r from-blue-500 to-purple-500'
+                                }`}
+                                initial={{ width: 0 }}
+                                animate={{ width: `${transfer.progress}%` }}
+                                transition={{ duration: 0.3, ease: 'easeOut' }}
+                            />
+                        </div>
+
+                        {/* File size info */}
+                        <div className="flex justify-between text-xs text-gray-400">
+                            <span>{formatBytes(transfer.fileSize * transfer.progress / 100)}</span>
+                            <span>{formatBytes(transfer.fileSize)}</span>
+                        </div>
+
+                        {/* Advanced stats for large files */}
+                        {(getFileSizeCategory(transfer.fileSize) === 'large' || getFileSizeCategory(transfer.fileSize) === 'huge') && (
+                            <div className="grid grid-cols-2 gap-2 pt-2 border-t border-white/5">
+                                {transfer.peakSpeed && (
+                                    <div className="flex items-center space-x-1 text-xs">
+                                        <TrendingUp className="w-3 h-3 text-green-400" />
+                                        <span className="text-gray-400">Peak:</span>
+                                        <span className="text-green-400">{formatSpeed(transfer.peakSpeed)}</span>
+                                    </div>
+                                )}
+                                {transfer.memoryUsage && (
+                                    <div className="flex items-center space-x-1 text-xs">
+                                        <Cpu className="w-3 h-3 text-blue-400" />
+                                        <span className="text-gray-400">Memory:</span>
+                                        <span className="text-blue-400">{formatBytes(transfer.memoryUsage)}</span>
+                                    </div>
+                                )}
+                                {transfer.streamChunkSize && (
+                                    <div className="flex items-center space-x-1 text-xs">
+                                        <Activity className="w-3 h-3 text-purple-400" />
+                                        <span className="text-gray-400">Chunk:</span>
+                                        <span className="text-purple-400">{formatBytes(transfer.streamChunkSize)}</span>
+                                    </div>
+                                )}
+                                <div className="flex items-center space-x-1 text-xs">
+                                    <Clock className="w-3 h-3 text-yellow-400" />
+                                    <span className="text-gray-400">Elapsed:</span>
+                                    <span className="text-yellow-400">{Math.floor(transfer.startTime / 60)}m {transfer.startTime % 60}s</span>
+                                </div>
+                            </div>
+                        )}
+                    </div>
+                )}
+            </motion.div>
+        );
+    };
 
     if (!isVisible) return null;
 
@@ -149,76 +355,56 @@ const TransferProgress: React.FC<TransferProgressProps> = ({ isVisible, onToggle
                         exit={{ height: 0 }}
                         className="max-h-96 overflow-y-auto"
                     >
-                        {/* Active Transfers */}
-                        {activeTransfers.length > 0 && (
+                        {/* Pending Transfers */}
+                        {pendingTransfers.length > 0 && (
                             <div className="p-3 space-y-3">
-                                <h4 className="text-xs font-medium text-gray-400 uppercase tracking-wide">
-                                    Active ({activeTransfers.length})
+                                <h4 className="text-xs font-medium text-gray-400 uppercase tracking-wide flex items-center space-x-2">
+                                    <Clock className="w-3 h-3" />
+                                    <span>Queued ({pendingTransfers.length})</span>
                                 </h4>
-                                {activeTransfers.map((transfer) => (
+                                {pendingTransfers.map((transfer) => (
                                     <motion.div
                                         key={transfer.id}
                                         layout
-                                        className="bg-white/5 rounded-lg p-3 space-y-2"
+                                        className="bg-white/5 rounded-lg p-3 border-l-2 border-yellow-500"
                                     >
-                                        <div className="flex items-center justify-between">
-                                            <div className="flex items-center space-x-2 min-w-0 flex-1">
-                                                {transfer.direction === 'upload' ? (
-                                                    <Upload className="w-4 h-4 text-green-400 flex-shrink-0" />
-                                                ) : (
-                                                    <Download className="w-4 h-4 text-blue-400 flex-shrink-0" />
-                                                )}
-                                                <div className="min-w-0 flex-1">
+                                        <div className="flex items-center space-x-2">
+                                            {transfer.direction === 'upload' ? (
+                                                <Upload className="w-4 h-4 text-yellow-400 flex-shrink-0" />
+                                            ) : (
+                                                <Download className="w-4 h-4 text-yellow-400 flex-shrink-0" />
+                                            )}
+                                            <div className="min-w-0 flex-1">
+                                                <div className="flex items-center space-x-2">
                                                     <p className="text-white text-sm truncate">{transfer.fileName}</p>
-                                                    <p className="text-gray-400 text-xs">
-                                                        {transfer.direction === 'upload' ? 'to' : 'from'} {transfer.peerName}
-                                                    </p>
+                                                    {getFileSizeBadge(transfer.fileSize)}
                                                 </div>
+                                                <p className="text-gray-400 text-xs">
+                                                    {transfer.direction === 'upload' ? 'to' : 'from'} {transfer.peerName} • {formatBytes(transfer.fileSize)}
+                                                </p>
                                             </div>
-                                            <div className="flex items-center space-x-1">
-                                                <button
-                                                    onClick={() => handlePauseResume(transfer.id)}
-                                                    className="p-1 text-gray-400 hover:text-white transition-colors"
-                                                >
-                                                    {transfer.status === 'paused' ? (
-                                                        <Play className="w-3 h-3" />
-                                                    ) : (
-                                                        <Pause className="w-3 h-3" />
-                                                    )}
-                                                </button>
-                                                <button
-                                                    onClick={() => handleCancel(transfer.id)}
-                                                    className="p-1 text-gray-400 hover:text-red-400 transition-colors"
-                                                >
-                                                    <X className="w-3 h-3" />
-                                                </button>
-                                            </div>
-                                        </div>
-
-                                        {/* Progress Bar */}
-                                        <div className="space-y-1">
-                                            <div className="flex justify-between text-xs">
-                                                <span className={getStatusColor(transfer.status)}>
-                                                    {transfer.progress.toFixed(1)}%
-                                                </span>
-                                                <span className="text-gray-400">
-                                                    {formatSpeed(transfer.speed)} • {formatTimeRemaining(transfer)}
-                                                </span>
-                                            </div>
-                                            <div className="w-full bg-gray-700 rounded-full h-1.5">
-                                                <motion.div
-                                                    className="bg-blue-500 h-1.5 rounded-full"
-                                                    initial={{ width: 0 }}
-                                                    animate={{ width: `${transfer.progress}%` }}
-                                                    transition={{ duration: 0.3 }}
-                                                />
-                                            </div>
-                                            <div className="flex justify-between text-xs text-gray-400">
-                                                <span>{formatBytes(transfer.fileSize * transfer.progress / 100)}</span>
-                                                <span>{formatBytes(transfer.fileSize)}</span>
-                                            </div>
+                                            <span className="text-yellow-400 text-xs font-medium">QUEUED</span>
                                         </div>
                                     </motion.div>
+                                ))}
+                            </div>
+                        )}
+
+                        {/* Active Transfers */}
+                        {activeTransfers.length > 0 && (
+                            <div className="p-3 space-y-3">
+                                <h4 className="text-xs font-medium text-gray-400 uppercase tracking-wide flex items-center space-x-2">
+                                    <Activity className="w-3 h-3" />
+                                    <span>Active ({activeTransfers.length})</span>
+                                    {activeTransfers.some(t => t.isStreaming) && (
+                                        <div className="flex items-center space-x-1">
+                                            <Zap className="w-3 h-3 text-green-400" />
+                                            <span className="text-green-400 text-xs">STREAMING</span>
+                                        </div>
+                                    )}
+                                </h4>
+                                {activeTransfers.map((transfer) => (
+                                    <TransferCard key={transfer.id} transfer={transfer} />
                                 ))}
                             </div>
                         )}
@@ -229,11 +415,11 @@ const TransferProgress: React.FC<TransferProgressProps> = ({ isVisible, onToggle
                                 <h4 className="text-xs font-medium text-gray-400 uppercase tracking-wide">
                                     Recent
                                 </h4>
-                                {completedTransfers.slice(0, 3).map((transfer) => (
+                                {completedTransfers.slice(0, 5).map((transfer) => (
                                     <motion.div
                                         key={transfer.id}
                                         layout
-                                        className="flex items-center space-x-3 p-2 bg-white/5 rounded"
+                                        className="flex items-center space-x-3 p-2 bg-white/5 rounded hover:bg-white/10 transition-colors"
                                     >
                                         <div className="flex-shrink-0">
                                             {transfer.status === 'completed' ? (
@@ -243,10 +429,21 @@ const TransferProgress: React.FC<TransferProgressProps> = ({ isVisible, onToggle
                                             )}
                                         </div>
                                         <div className="min-w-0 flex-1">
-                                            <p className="text-white text-sm truncate">{transfer.fileName}</p>
-                                            <p className="text-gray-400 text-xs">
-                                                {transfer.status === 'completed' ? 'Completed' : 'Failed'}
-                                            </p>
+                                            <div className="flex items-center space-x-2">
+                                                <p className="text-white text-sm truncate">{transfer.fileName}</p>
+                                                {getFileSizeBadge(transfer.fileSize)}
+                                            </div>
+                                            <div className="flex items-center space-x-2 text-xs text-gray-400">
+                                                <span>{transfer.status === 'completed' ? 'Completed' : 'Failed'}</span>
+                                                <span>•</span>
+                                                <span>{formatBytes(transfer.fileSize)}</span>
+                                                {transfer.averageSpeed && transfer.status === 'completed' && (
+                                                    <>
+                                                        <span>•</span>
+                                                        <span>avg {formatSpeed(transfer.averageSpeed)}</span>
+                                                    </>
+                                                )}
+                                            </div>
                                         </div>
                                     </motion.div>
                                 ))}

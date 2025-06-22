@@ -148,6 +148,41 @@ body {
     }
 }
 
+/* Streaming transfer animations */
+@keyframes gradient {
+    0% {
+        background-position: 0% 50%;
+    }
+    50% {
+        background-position: 100% 50%;
+    }
+    100% {
+        background-position: 0% 50%;
+    }
+}
+
+@keyframes dataFlow {
+    0% {
+        transform: translateX(-100%);
+        opacity: 0;
+    }
+    50% {
+        opacity: 1;
+    }
+    100% {
+        transform: translateX(100%);
+        opacity: 0;
+    }
+}
+
+.animate-gradient {
+    animation: gradient 2s ease infinite;
+}
+
+.animate-data-flow {
+    animation: dataFlow 2s ease-in-out infinite;
+}
+
 .animate-fade-in {
     animation: fadeIn 0.3s ease-in-out;
 }
