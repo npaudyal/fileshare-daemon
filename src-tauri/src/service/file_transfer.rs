@@ -629,6 +629,9 @@ impl FileTransferManager {
         }
 
         // Create and store the transfer BEFORE sending the offer
+        info!("🔧 Creating OUTGOING transfer {} to peer {} for file: {}", 
+              transfer_id, peer_id, metadata.name);
+              
         let transfer = FileTransfer {
             id: transfer_id,
             peer_id,
@@ -1020,6 +1023,9 @@ impl FileTransferManager {
             Ok::<String, FileshareError>(reader.get_checksum())
         });
 
+        // CRITICAL: Verify this is an outgoing transfer before creating parallel sender
+        info!("🔍 Verifying outgoing transfer {} before creating parallel sender", transfer_id);
+        
         // Create parallel sender and tracker
         let parallel_sender = ParallelChunkSender::new(
             message_sender.clone(),
@@ -1226,6 +1232,9 @@ impl FileTransferManager {
             None
         };
 
+        info!("🔧 Creating INCOMING transfer {} from peer {} for file: {}", 
+              transfer_id, peer_id, metadata.name);
+              
         let transfer = FileTransfer {
             id: transfer_id,
             peer_id,

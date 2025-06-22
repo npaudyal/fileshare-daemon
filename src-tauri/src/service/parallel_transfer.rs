@@ -21,6 +21,8 @@ impl ParallelChunkSender {
         transfer_id: Uuid,
         max_parallel: usize,
     ) -> Self {
+        info!("🔧 Creating ParallelChunkSender for transfer {} to peer {} with {} parallel chunks", 
+              transfer_id, peer_id, max_parallel);
         Self {
             message_sender,
             peer_id,
@@ -119,7 +121,7 @@ impl ParallelChunkSender {
                 chunks: batch_chunks 
             });
             
-            debug!("📤 BATCH_SEND: Sending {} chunks to peer {} for transfer {}", 
+            warn!("🚨 BATCH_SEND: About to send {} chunks to peer {} for transfer {} - THIS SHOULD ONLY HAPPEN FROM SENDER!", 
                    batch_indices.len(), self.peer_id, self.transfer_id);
             
             if let Err(e) = self.message_sender.send((self.peer_id, message)) {
