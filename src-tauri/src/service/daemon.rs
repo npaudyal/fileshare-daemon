@@ -664,7 +664,7 @@ impl FileshareDaemon {
         let message_pm = peer_manager.clone();
         let message_clipboard = clipboard.clone();
         let message_handle = tokio::spawn(async move {
-            let mut interval = tokio::time::interval(Duration::from_millis(50)); // Faster processing
+            let mut interval = tokio::time::interval(Duration::from_millis(1)); // Ultra-fast processing for high throughput
             loop {
                 interval.tick().await;
 

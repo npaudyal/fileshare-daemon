@@ -446,9 +446,9 @@ pub struct TransferProgress {
 
 pub fn calculate_adaptive_chunk_size(file_size: u64) -> usize {
     match file_size {
-        0..=10_485_760 => 64 * 1024,                    // <= 10MB: 64KB chunks
-        10_485_761..=104_857_600 => 256 * 1024,         // 10MB-100MB: 256KB chunks  
-        104_857_601..=1_073_741_824 => 1 * 1024 * 1024, // 100MB-1GB: 1MB chunks (OPTIMIZED)
-        _ => 2 * 1024 * 1024,                           // > 1GB: 2MB chunks (REDUCED)
+        0..=10_485_760 => 256 * 1024,                    // <= 10MB: 256KB chunks
+        10_485_761..=104_857_600 => 1 * 1024 * 1024,    // 10MB-100MB: 1MB chunks  
+        104_857_601..=1_073_741_824 => 4 * 1024 * 1024, // 100MB-1GB: 4MB chunks (OPTIMIZED FOR 585MB)
+        _ => 8 * 1024 * 1024,                            // > 1GB: 8MB chunks (MAXIMUM THROUGHPUT)
     }
 }

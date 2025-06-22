@@ -1140,8 +1140,8 @@ impl PeerConnection {
             let socket = unsafe { Socket::from_raw_fd(stream.as_raw_fd()) };
             
             // Increase TCP buffer sizes for better throughput
-            let _ = socket.set_recv_buffer_size(2 * 1024 * 1024); // 2MB receive buffer
-            let _ = socket.set_send_buffer_size(2 * 1024 * 1024); // 2MB send buffer
+            let _ = socket.set_recv_buffer_size(8 * 1024 * 1024); // 8MB receive buffer for high-speed transfers
+            let _ = socket.set_send_buffer_size(8 * 1024 * 1024); // 8MB send buffer for high-speed transfers
             
             // Disable Nagle algorithm for lower latency
             let _ = socket.set_nodelay(true);
@@ -1160,8 +1160,8 @@ impl PeerConnection {
             let socket = unsafe { Socket::from_raw_socket(stream.as_raw_socket()) };
             
             // Increase TCP buffer sizes for better throughput
-            let _ = socket.set_recv_buffer_size(2 * 1024 * 1024); // 2MB receive buffer
-            let _ = socket.set_send_buffer_size(2 * 1024 * 1024); // 2MB send buffer
+            let _ = socket.set_recv_buffer_size(8 * 1024 * 1024); // 8MB receive buffer for high-speed transfers
+            let _ = socket.set_send_buffer_size(8 * 1024 * 1024); // 8MB send buffer for high-speed transfers
             
             // Disable Nagle algorithm for lower latency
             let _ = socket.set_nodelay(true);
