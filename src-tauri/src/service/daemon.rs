@@ -847,32 +847,7 @@ impl FileshareDaemon {
                             }
                         }
 
-                        crate::network::protocol::MessageType::FileChunk {
-                            transfer_id, ..
-                        } => {
-                            let is_our_outgoing = {
-                                let ft = pm.file_transfer.read().await;
-                                ft.has_transfer(*transfer_id)
-                                    && matches!(
-                                        ft.get_transfer_direction(*transfer_id),
-                                        Some(TransferDirection::Outgoing)
-                                    )
-                            };
-
-                            if is_our_outgoing {
-                                info!("🚀 Sending outgoing FileChunk for transfer {} directly to peer {}", transfer_id, peer_id);
-                                // FIXED: Clone message before sending
-                                if let Err(e) =
-                                    pm.send_direct_to_connection(peer_id, message.clone()).await
-                                {
-                                    error!(
-                                        "❌ Failed to send FileChunk to peer {}: {}",
-                                        peer_id, e
-                                    );
-                                }
-                                continue; // Don't process locally
-                            }
-                        }
+                        // NOTE: FileChunk routing removed - incoming chunks should always be processed locally
 
                         crate::network::protocol::MessageType::TransferComplete {
                             transfer_id,
