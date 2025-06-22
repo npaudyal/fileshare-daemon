@@ -21,19 +21,25 @@ use uuid::Uuid;
 fn message_type_name(message_type: &MessageType) -> &'static str {
     match message_type {
         MessageType::Handshake { .. } => "Handshake",
+        MessageType::HandshakeResponse { .. } => "HandshakeResponse",
+        MessageType::ClipboardUpdate { .. } => "ClipboardUpdate",
+        MessageType::ClipboardClear => "ClipboardClear",
+        MessageType::FileRequest { .. } => "FileRequest",
+        MessageType::FileRequestResponse { .. } => "FileRequestResponse",
         MessageType::FileOffer { .. } => "FileOffer",
-        MessageType::FileResponse { .. } => "FileResponse",
+        MessageType::FileOfferResponse { .. } => "FileOfferResponse",
         MessageType::FileChunk { .. } => "FileChunk",
+        MessageType::FileChunkAck { .. } => "FileChunkAck",
+        MessageType::FileChunkBatchAck { .. } => "FileChunkBatchAck",
         MessageType::TransferComplete { .. } => "TransferComplete",
         MessageType::TransferError { .. } => "TransferError",
+        MessageType::TransferProgress { .. } => "TransferProgress",
+        MessageType::TransferResume { .. } => "TransferResume",
+        MessageType::TransferPause { .. } => "TransferPause",
+        MessageType::FileChunkBatch { .. } => "FileChunkBatch",
         MessageType::Ping => "Ping",
         MessageType::Pong => "Pong",
-        MessageType::HealthCheck => "HealthCheck",
-        MessageType::DeviceInfo { .. } => "DeviceInfo",
-        MessageType::ClipboardSync { .. } => "ClipboardSync",
-        MessageType::DeviceList { .. } => "DeviceList",
-        MessageType::DeviceOffline { .. } => "DeviceOffline",
-        MessageType::ChunkBatch { .. } => "ChunkBatch",
+        MessageType::Disconnect => "Disconnect",
     }
 }
 
