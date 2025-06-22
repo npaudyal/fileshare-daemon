@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::{mpsc, RwLock};
-use tokio::time::{interval, timeout};
+use tokio::time::timeout;
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
@@ -508,7 +508,7 @@ impl PeerManager {
 
         // Clean up when connection ends
         let cleanup_peer_id = peer_id;
-        let connections_cleanup = self.connections.clone();
+        let _connections_cleanup = self.connections.clone();
         tokio::spawn(async move {
             tokio::select! {
                 _ = read_task => {
@@ -1140,8 +1140,8 @@ impl PeerConnection {
             let socket = unsafe { Socket::from_raw_fd(stream.as_raw_fd()) };
             
             // Increase TCP buffer sizes for better throughput
-            let _ = socket.set_recv_buffer_size(8 * 1024 * 1024); // 8MB receive buffer for high-speed transfers
-            let _ = socket.set_send_buffer_size(8 * 1024 * 1024); // 8MB send buffer for high-speed transfers
+            let _ = socket.set_recv_buffer_size(16 * 1024 * 1024); // 16MB receive buffer for maximum throughput
+            let _ = socket.set_send_buffer_size(16 * 1024 * 1024); // 16MB send buffer for maximum throughput
             
             // Disable Nagle algorithm for lower latency
             let _ = socket.set_nodelay(true);
@@ -1160,8 +1160,8 @@ impl PeerConnection {
             let socket = unsafe { Socket::from_raw_socket(stream.as_raw_socket()) };
             
             // Increase TCP buffer sizes for better throughput
-            let _ = socket.set_recv_buffer_size(8 * 1024 * 1024); // 8MB receive buffer for high-speed transfers
-            let _ = socket.set_send_buffer_size(8 * 1024 * 1024); // 8MB send buffer for high-speed transfers
+            let _ = socket.set_recv_buffer_size(16 * 1024 * 1024); // 16MB receive buffer for maximum throughput
+            let _ = socket.set_send_buffer_size(16 * 1024 * 1024); // 16MB send buffer for maximum throughput
             
             // Disable Nagle algorithm for lower latency
             let _ = socket.set_nodelay(true);

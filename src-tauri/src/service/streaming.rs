@@ -1,17 +1,15 @@
-use crate::{network::protocol::*, FileshareError, Result};
+use crate::{FileshareError, Result};
 use crate::network::protocol::CompressionType;
 use sha2::{Digest, Sha256};
 use std::path::Path;
-use std::sync::Arc;
 use std::collections::HashMap;
 use tokio::fs::File;
 use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader, BufWriter};
-use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
-const BUFFER_SIZE: usize = 2 * 1024 * 1024; // 2MB buffer for streaming (OPTIMIZED)
-const MAX_MEMORY_PER_TRANSFER: usize = 50 * 1024 * 1024; // 50MB max memory per transfer (REDUCED)
+const BUFFER_SIZE: usize = 8 * 1024 * 1024; // 8MB buffer for streaming (PERFORMANCE OPTIMIZED)
+const MAX_MEMORY_PER_TRANSFER: usize = 100 * 1024 * 1024; // 100MB max memory per transfer (INCREASED)
 
 pub struct StreamingFileReader {
     file: BufReader<File>,
@@ -446,9 +444,9 @@ pub struct TransferProgress {
 
 pub fn calculate_adaptive_chunk_size(file_size: u64) -> usize {
     match file_size {
-        0..=10_485_760 => 256 * 1024,                    // <= 10MB: 256KB chunks
-        10_485_761..=104_857_600 => 1 * 1024 * 1024,    // 10MB-100MB: 1MB chunks  
-        104_857_601..=1_073_741_824 => 4 * 1024 * 1024, // 100MB-1GB: 4MB chunks (OPTIMIZED FOR 585MB)
-        _ => 8 * 1024 * 1024,                            // > 1GB: 8MB chunks (MAXIMUM THROUGHPUT)
+        0..=10_485_760 => 512 * 1024,                    // <= 10MB: 512KB chunks (increased from 256KB)
+        10_485_761..=104_857_600 => 2 * 1024 * 1024,    // 10MB-100MB: 2MB chunks (increased from 1MB)
+        104_857_601..=1_073_741_824 => 8 * 1024 * 1024, // 100MB-1GB: 8MB chunks (increased from 4MB for 585MB files)
+        _ => 16 * 1024 * 1024,                           // > 1GB: 16MB chunks (increased from 8MB for maximum throughput)
     }
 }

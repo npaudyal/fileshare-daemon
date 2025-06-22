@@ -69,7 +69,7 @@ impl Default for Settings {
                 temp_dir: None,
                 adaptive_chunk_size: true,
                 compression_enabled: false,
-                parallel_chunks: 8, // OPTIMIZED: Increased from 4
+                parallel_chunks: 16, // PERFORMANCE: Increased to 16 for maximum throughput
                 resume_enabled: true,
             },
             security: SecuritySettings {
@@ -91,9 +91,9 @@ impl Settings {
                 "Chunk size must be at least 64KB".to_string(),
             ));
         }
-        if transfer.chunk_size > 16 * 1024 * 1024 {
+        if transfer.chunk_size > 32 * 1024 * 1024 {
             return Err(FileshareError::Config(
-                "Chunk size must not exceed 16MB".to_string(),
+                "Chunk size must not exceed 32MB".to_string(),
             ));
         }
 
@@ -104,10 +104,10 @@ impl Settings {
             ));
         }
 
-        // Validate parallel chunks (1-16)
-        if transfer.parallel_chunks == 0 || transfer.parallel_chunks > 16 {
+        // Validate parallel chunks (1-32)
+        if transfer.parallel_chunks == 0 || transfer.parallel_chunks > 32 {
             return Err(FileshareError::Config(
-                "Parallel chunks must be between 1 and 16".to_string(),
+                "Parallel chunks must be between 1 and 32".to_string(),
             ));
         }
 
