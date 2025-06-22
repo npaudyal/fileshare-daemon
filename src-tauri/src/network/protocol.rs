@@ -123,13 +123,25 @@ pub struct FileMetadata {
     pub compression: Option<CompressionType>, // Optional compression
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct TransferChunk {
     pub index: u64,
     pub data: Vec<u8>,
     pub is_last: bool,
     pub compressed: bool, // Whether this chunk is compressed
     pub checksum: Option<String>, // Optional per-chunk checksum for integrity
+}
+
+impl std::fmt::Debug for TransferChunk {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TransferChunk")
+            .field("index", &self.index)
+            .field("data_len", &self.data.len())
+            .field("is_last", &self.is_last)
+            .field("compressed", &self.compressed)
+            .field("checksum", &self.checksum)
+            .finish()
+    }
 }
 
 impl Message {
