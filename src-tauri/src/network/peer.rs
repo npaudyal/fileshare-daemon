@@ -17,6 +17,26 @@ use tokio::time::{interval, timeout};
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
+// Helper function to get message type name without printing large data
+fn message_type_name(message_type: &MessageType) -> &'static str {
+    match message_type {
+        MessageType::Handshake { .. } => "Handshake",
+        MessageType::FileOffer { .. } => "FileOffer",
+        MessageType::FileResponse { .. } => "FileResponse",
+        MessageType::FileChunk { .. } => "FileChunk",
+        MessageType::TransferComplete { .. } => "TransferComplete",
+        MessageType::TransferError { .. } => "TransferError",
+        MessageType::Ping => "Ping",
+        MessageType::Pong => "Pong",
+        MessageType::HealthCheck => "HealthCheck",
+        MessageType::DeviceInfo { .. } => "DeviceInfo",
+        MessageType::ClipboardSync { .. } => "ClipboardSync",
+        MessageType::DeviceList { .. } => "DeviceList",
+        MessageType::DeviceOffline { .. } => "DeviceOffline",
+        MessageType::ChunkBatch { .. } => "ChunkBatch",
+    }
+}
+
 // Constants for connection health monitoring
 const PING_INTERVAL_SECONDS: u64 = 30; // Ping every 30 seconds
 const PING_TIMEOUT_SECONDS: u64 = 10; // 10 second ping timeout
@@ -455,7 +475,7 @@ impl PeerManager {
                                 }
                             }
                             _ => {
-                                info!("📥 READ from peer {}: {:?}", read_peer_id, message.message_type);
+                                info!("📥 READ from peer {}: {}", read_peer_id, message_type_name(&message.message_type));
                             }
                         }
                         if let Err(e) = read_message_tx.send((read_peer_id, message)) {
@@ -494,7 +514,7 @@ impl PeerManager {
                         }
                     }
                     _ => {
-                        info!("📤 WRITE to peer {}: {:?}", write_peer_id, message.message_type);
+                        info!("📤 WRITE to peer {}: {}", write_peer_id, message_type_name(&message.message_type));
                     }
                 }
 
