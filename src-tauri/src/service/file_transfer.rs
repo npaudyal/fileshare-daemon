@@ -629,6 +629,7 @@ impl FileTransferManager {
         }
 
         // Create and store the transfer BEFORE sending the offer
+        error!("🚨 DEBUG: Creating OUTGOING transfer {} for peer {} - file: {:?}", transfer_id, peer_id, file_path);
         let transfer = FileTransfer {
             id: transfer_id,
             peer_id,
