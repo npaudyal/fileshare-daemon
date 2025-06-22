@@ -591,8 +591,11 @@ impl FileTransferManager {
             file_size / (1024 * 1024)
         );
 
-        let metadata = FileMetadata::from_path_with_chunk_size(&file_path, chunk_size)?
-            .with_target_dir(target_dir);
+        let metadata = FileMetadata::from_path_with_chunk_size_and_settings(
+            &file_path, 
+            chunk_size, 
+            self.settings.transfer.compression_enabled
+        )?.with_target_dir(target_dir);
         let transfer_id = Uuid::new_v4();
 
         info!(
@@ -847,7 +850,11 @@ impl FileTransferManager {
         info!("📄 File path: {:?}, chunk size: {}", file_path, chunk_size);
 
         // Get file metadata to determine compression
-        let metadata = FileMetadata::from_path_with_chunk_size(&file_path, chunk_size)?;
+        let metadata = FileMetadata::from_path_with_chunk_size_and_settings(
+            &file_path, 
+            chunk_size, 
+            settings.transfer.compression_enabled
+        )?;
         let compression = metadata.compression;
         let use_streaming = metadata.streaming_mode;
         let total_chunks = metadata.total_chunks;

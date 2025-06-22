@@ -163,6 +163,15 @@ impl Message {
 
 impl FileMetadata {
     pub fn from_path_with_chunk_size(path: &PathBuf, chunk_size: usize) -> crate::Result<Self> {
+        // Call the new method with compression_enabled = false as default
+        Self::from_path_with_chunk_size_and_settings(path, chunk_size, false)
+    }
+
+    pub fn from_path_with_chunk_size_and_settings(
+        path: &PathBuf, 
+        chunk_size: usize, 
+        compression_enabled: bool
+    ) -> crate::Result<Self> {
         use sha2::{Digest, Sha256};
         use std::fs;
         use std::io::Read;
@@ -213,8 +222,10 @@ impl FileMetadata {
         // Determine if streaming mode should be used (files > 50MB)
         let streaming_mode = file_size > 50 * 1024 * 1024;
         
-        // Determine compression type based on file type and size
-        let compression = if file_size > 1024 * 1024 && !Self::is_compressed_format(&name) {
+        // FIXED: Respect global compression setting and don't compress already compressed files
+        let compression = if compression_enabled 
+            && file_size > 1024 * 1024 
+            && !Self::is_compressed_format(&name) {
             Some(CompressionType::Zstd)
         } else {
             None
@@ -276,7 +287,20 @@ impl FileMetadata {
 
         matches!(
             extension.as_str(),
-            "zip" | "gz" | "bz2" | "xz" | "7z" | "rar" | "tar" | "jpg" | "jpeg" | "png" | "mp4" | "mp3" | "avi" | "mkv"
+            // Archive formats
+            "zip" | "gz" | "bz2" | "xz" | "7z" | "rar" | "tar" | "lz4" | "zst" | "zstd" |
+            // Image formats (already compressed)
+            "jpg" | "jpeg" | "png" | "gif" | "webp" | "bmp" | "tiff" | "tif" | "ico" | "svg" |
+            // Video formats (already compressed)
+            "mp4" | "avi" | "mkv" | "mov" | "wmv" | "flv" | "webm" | "m4v" | "3gp" | "f4v" | "asf" |
+            // Audio formats (already compressed)
+            "mp3" | "aac" | "ogg" | "m4a" | "wma" | "flac" | "opus" | "wav" |
+            // Document formats (often compressed)
+            "pdf" | "docx" | "xlsx" | "pptx" | "odt" | "ods" | "odp" |
+            // Application formats
+            "apk" | "jar" | "war" | "ear" | "deb" | "rpm" | "dmg" | "pkg" | "msi" |
+            // Development formats (specific compound extensions)
+            "tgz" | "tbz2" | "txz"
         )
     }
 }
