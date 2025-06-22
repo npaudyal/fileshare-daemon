@@ -678,11 +678,9 @@ impl FileshareDaemon {
                     }
 
                     // Route transfer messages directly with FIXED TransferComplete handling
+                    // NOTE: FileChunk and FileChunkBatch are excluded from routing - incoming chunks should always be processed locally
                     match &message.message_type {
                         crate::network::protocol::MessageType::FileOffer {
-                            transfer_id, ..
-                        }
-                        | crate::network::protocol::MessageType::FileChunk {
                             transfer_id, ..
                         }
                         | crate::network::protocol::MessageType::TransferComplete {
