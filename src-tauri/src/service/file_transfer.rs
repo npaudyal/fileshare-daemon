@@ -1023,12 +1023,14 @@ impl FileTransferManager {
         let start_time = Instant::now();
         let mut last_progress_update = Instant::now();
 
-        // Process chunks in batches - now it's pure network operation
+        // OPTIMIZATION: Process chunks in larger batches and use batch messaging
+        let batch_message_size = 8; // Send 8 chunks per message to reduce protocol overhead (~8-16MB per message)
+        
         for batch_start in (0..all_chunks.len()).step_by(parallel_chunks) {
             let batch_end = (batch_start + parallel_chunks).min(all_chunks.len());
             let batch_indices: Vec<u64> = (batch_start..batch_end).map(|i| i as u64).collect();
             
-            debug!("🔄 PARALLEL_OPTIMIZED: Processing batch {} to {}", batch_start, batch_end);
+            debug!("🔄 PARALLEL_OPTIMIZED: Processing batch {} to {} (using batch messages)", batch_start, batch_end);
             
             tracker.mark_in_progress(&batch_indices);
 
@@ -1047,8 +1049,8 @@ impl FileTransferManager {
                 chunks_to_send.push((chunk_index, chunk));
             }
 
-            // Send chunks in parallel
-            let failed_chunks = parallel_sender.send_chunks_parallel(chunks_to_send).await?;
+            // OPTIMIZATION: Send chunks using batch messages for better performance
+            let failed_chunks = parallel_sender.send_chunks_batched(chunks_to_send, batch_message_size).await?;
 
             // Update tracker
             for &chunk_index in &batch_indices {

@@ -69,7 +69,7 @@ impl Default for Settings {
                 temp_dir: None,
                 adaptive_chunk_size: true,
                 compression_enabled: false,
-                parallel_chunks: 8, // OPTIMIZED: Increased from 4
+                parallel_chunks: 12, // OPTIMIZED: Increased for better throughput
                 resume_enabled: true,
             },
             security: SecuritySettings {
@@ -104,10 +104,10 @@ impl Settings {
             ));
         }
 
-        // Validate parallel chunks (1-16)
-        if transfer.parallel_chunks == 0 || transfer.parallel_chunks > 16 {
+        // Validate parallel chunks (1-20)
+        if transfer.parallel_chunks == 0 || transfer.parallel_chunks > 20 {
             return Err(FileshareError::Config(
-                "Parallel chunks must be between 1 and 16".to_string(),
+                "Parallel chunks must be between 1 and 20".to_string(),
             ));
         }
 
