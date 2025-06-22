@@ -803,11 +803,12 @@ impl FileTransferManager {
         let use_parallel = settings.transfer.parallel_chunks > 1; // Enable parallel mode based on configuration
 
         info!(
-            "📊 File: {} bytes, streaming: {}, compression: {:?}, parallel: {} (chunks: {})",
-            metadata.size, use_streaming, compression, use_parallel, parallel_chunks
+            "📊 TRANSFER_CONFIG: File: {:.1}MB, streaming: {}, compression: {:?}, parallel: {} (chunks: {}), total_chunks: {}",
+            metadata.size as f64 / (1024.0 * 1024.0), use_streaming, compression, use_parallel, parallel_chunks, total_chunks
         );
 
         if use_parallel {
+            info!("🚀 Using OPTIMIZED parallel transfer with {} chunks", parallel_chunks);
             Self::send_file_chunks_parallel(
                 message_sender,
                 peer_id,
@@ -1040,8 +1041,9 @@ impl FileTransferManager {
                 chunks_to_send.push((chunk_index, chunk));
             }
 
-            // Send chunks in parallel
-            let failed_chunks = parallel_sender.send_chunks_parallel(chunks_to_send).await?;
+            // Send chunks in batches for maximum efficiency
+            let batch_size = 4; // Send 4 chunks per message
+            let failed_chunks = parallel_sender.send_chunks_batched(chunks_to_send, batch_size).await?;
 
             // Update tracker
             for &chunk_index in &batch_indices {
