@@ -119,10 +119,15 @@ impl ParallelChunkSender {
                 chunks: batch_chunks 
             });
             
+            debug!("📤 BATCH_SEND: Sending {} chunks to peer {} for transfer {}", 
+                   batch_indices.len(), self.peer_id, self.transfer_id);
+            
             if let Err(e) = self.message_sender.send((self.peer_id, message)) {
-                error!("❌ BATCH_SEND: Failed to send batch: {}", e);
+                error!("❌ BATCH_SEND: Failed to send batch to peer {}: {}", self.peer_id, e);
                 // Mark all chunks in this batch as failed
                 failed_chunks.lock().await.extend(batch_indices);
+            } else {
+                debug!("✅ BATCH_SEND: Successfully queued batch for peer {}", self.peer_id);
             }
         }
         

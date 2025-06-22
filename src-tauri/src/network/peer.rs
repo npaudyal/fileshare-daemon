@@ -181,6 +181,12 @@ impl PeerManager {
     }
 
     pub async fn on_device_discovered(&mut self, device_info: DeviceInfo) -> Result<()> {
+        // Don't add ourselves as a peer
+        if device_info.id == self.settings.device.id {
+            debug!("Ignoring our own device in discovery: {} ({})", device_info.name, device_info.id);
+            return Ok(());
+        }
+        
         // Check if peer already exists
         if let Some(existing_peer) = self.peers.get_mut(&device_info.id) {
             // Update last seen time and device info, but keep connection status
@@ -919,7 +925,21 @@ impl PeerManager {
             }
 
             MessageType::FileChunkBatch { transfer_id, chunks } => {
-                debug!("Received batch of {} chunks for transfer {}", chunks.len(), transfer_id);
+                debug!("Received batch of {} chunks for transfer {} from peer {}", chunks.len(), transfer_id, peer_id);
+                
+                // Early check: Don't process chunks for outgoing transfers
+                let ft_read = self.file_transfer.read().await;
+                if let Some(transfer) = ft_read.active_transfers.get(&transfer_id) {
+                    if matches!(transfer.direction, TransferDirection::Outgoing) {
+                        warn!(
+                            "⚠️ RECEIVER: Ignoring chunk batch for outgoing transfer {} from peer {} - this should not happen",
+                            transfer_id, peer_id
+                        );
+                        return Ok(());
+                    }
+                }
+                drop(ft_read);
+                
                 let mut ft = self.file_transfer.write().await;
                 // Process each chunk in the batch
                 for chunk in chunks {
