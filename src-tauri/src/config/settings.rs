@@ -63,7 +63,7 @@ impl Default for Settings {
                 timeout_seconds: 30,
             },
             transfer: TransferSettings {
-                chunk_size: 1024 * 1024, // 1MB default chunk size
+                chunk_size: 4 * 1024 * 1024, // 4MB default chunk size (OPTIMIZED)
                 max_concurrent_transfers: 5,
                 bandwidth_limit_mbps: None,
                 temp_dir: None,

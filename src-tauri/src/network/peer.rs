@@ -918,6 +918,15 @@ impl PeerManager {
                 ft.handle_file_chunk(peer_id, transfer_id, chunk).await?;
             }
 
+            MessageType::FileChunkBatch { transfer_id, chunks } => {
+                debug!("Received batch of {} chunks for transfer {}", chunks.len(), transfer_id);
+                let mut ft = self.file_transfer.write().await;
+                // Process each chunk in the batch
+                for chunk in chunks {
+                    ft.handle_file_chunk(peer_id, transfer_id, chunk).await?;
+                }
+            }
+
             MessageType::TransferComplete {
                 transfer_id,
                 checksum,
@@ -1129,7 +1138,7 @@ impl PeerConnection {
         Self { stream }
     }
     
-    // OPTIMIZATION: TCP performance tuning
+    // OPTIMIZATION: TCP performance tuning for high-speed transfers
     fn optimize_tcp_connection(stream: &TcpStream) -> Result<()> {
         use socket2::Socket;
         
@@ -1139,12 +1148,21 @@ impl PeerConnection {
             // Get the raw socket
             let socket = unsafe { Socket::from_raw_fd(stream.as_raw_fd()) };
             
-            // Increase TCP buffer sizes for better throughput
-            let _ = socket.set_recv_buffer_size(2 * 1024 * 1024); // 2MB receive buffer
-            let _ = socket.set_send_buffer_size(2 * 1024 * 1024); // 2MB send buffer
+            // Significantly increase TCP buffer sizes for high-speed transfers
+            // 16MB buffers for optimal throughput on local networks
+            let recv_buffer_size = 16 * 1024 * 1024; // 16MB receive buffer
+            let send_buffer_size = 16 * 1024 * 1024; // 16MB send buffer
             
-            // Disable Nagle algorithm for lower latency
-            let _ = socket.set_nodelay(true);
+            if let Err(e) = socket.set_recv_buffer_size(recv_buffer_size) {
+                warn!("Failed to set recv buffer size: {}", e);
+            }
+            if let Err(e) = socket.set_send_buffer_size(send_buffer_size) {
+                warn!("Failed to set send buffer size: {}", e);
+            }
+            
+            // For bulk transfers, we want Nagle's algorithm enabled
+            // This allows TCP to batch small writes together
+            let _ = socket.set_nodelay(false);
             
             // Enable TCP keep-alive
             let _ = socket.set_keepalive(true);
@@ -1159,12 +1177,21 @@ impl PeerConnection {
             // Get the raw socket
             let socket = unsafe { Socket::from_raw_socket(stream.as_raw_socket()) };
             
-            // Increase TCP buffer sizes for better throughput
-            let _ = socket.set_recv_buffer_size(2 * 1024 * 1024); // 2MB receive buffer
-            let _ = socket.set_send_buffer_size(2 * 1024 * 1024); // 2MB send buffer
+            // Significantly increase TCP buffer sizes for high-speed transfers
+            // 16MB buffers for optimal throughput on local networks
+            let recv_buffer_size = 16 * 1024 * 1024; // 16MB receive buffer
+            let send_buffer_size = 16 * 1024 * 1024; // 16MB send buffer
             
-            // Disable Nagle algorithm for lower latency
-            let _ = socket.set_nodelay(true);
+            if let Err(e) = socket.set_recv_buffer_size(recv_buffer_size) {
+                warn!("Failed to set recv buffer size: {}", e);
+            }
+            if let Err(e) = socket.set_send_buffer_size(send_buffer_size) {
+                warn!("Failed to set send buffer size: {}", e);
+            }
+            
+            // For bulk transfers, we want Nagle's algorithm enabled
+            // This allows TCP to batch small writes together
+            let _ = socket.set_nodelay(false);
             
             // Enable TCP keep-alive
             let _ = socket.set_keepalive(true);
@@ -1173,7 +1200,7 @@ impl PeerConnection {
             std::mem::forget(socket);
         }
         
-        info!("✅ TCP optimizations applied: 2MB buffers, nodelay enabled");
+        info!("✅ TCP optimizations applied: 16MB buffers, Nagle enabled for batching");
         Ok(())
     }
 
@@ -1190,10 +1217,25 @@ impl PeerConnection {
         let message_data = bincode::serialize(message)?;
         let message_len = message_data.len() as u32;
 
-        // Write length first, then data
-        self.stream.write_all(&message_len.to_be_bytes()).await?;
-        self.stream.write_all(&message_data).await?;
-        self.stream.flush().await?;
+        // For better performance, combine length and data into a single buffer
+        // This reduces the number of system calls and improves batching
+        let mut combined_buffer = Vec::with_capacity(4 + message_data.len());
+        combined_buffer.extend_from_slice(&message_len.to_be_bytes());
+        combined_buffer.extend_from_slice(&message_data);
+
+        // Write everything in one go
+        self.stream.write_all(&combined_buffer).await?;
+        
+        // Only flush for important messages, not for bulk data chunks
+        match message {
+            Message { message_type: MessageType::FileChunk { .. }, .. } => {
+                // Don't flush for file chunks - let TCP batch them
+            }
+            _ => {
+                // Flush for control messages
+                self.stream.flush().await?;
+            }
+        }
 
         Ok(())
     }
@@ -1251,11 +1293,69 @@ impl PeerConnectionWriteHalf {
         let message_data = bincode::serialize(message)?;
         let message_len = message_data.len() as u32;
 
-        // Write length first, then data
-        self.stream.write_all(&message_len.to_be_bytes()).await?;
-        self.stream.write_all(&message_data).await?;
-        self.stream.flush().await?;
+        // For better performance, combine length and data into a single buffer
+        // This reduces the number of system calls and improves batching
+        let mut combined_buffer = Vec::with_capacity(4 + message_data.len());
+        combined_buffer.extend_from_slice(&message_len.to_be_bytes());
+        combined_buffer.extend_from_slice(&message_data);
 
+        // Write everything in one go
+        self.stream.write_all(&combined_buffer).await?;
+        
+        // Only flush for important messages, not for bulk data chunks
+        match message {
+            Message { message_type: MessageType::FileChunk { .. }, .. } => {
+                // Don't flush for file chunks - let TCP batch them
+            }
+            _ => {
+                // Flush for control messages
+                self.stream.flush().await?;
+            }
+        }
+
+        Ok(())
+    }
+    
+    // OPTIMIZATION: Vectored I/O for batch writing multiple messages
+    pub async fn write_messages_vectored(&mut self, messages: &[Message]) -> Result<()> {
+        use tokio::io::AsyncWriteExt;
+        use std::io::IoSlice;
+        
+        if messages.is_empty() {
+            return Ok(());
+        }
+        
+        // Pre-serialize all messages and prepare IO vectors
+        let mut serialized_messages = Vec::with_capacity(messages.len());
+        let mut total_size = 0;
+        
+        for message in messages {
+            let message_data = bincode::serialize(message)?;
+            let message_len = message_data.len() as u32;
+            total_size += 4 + message_data.len();
+            serialized_messages.push((message_len, message_data));
+        }
+        
+        // Create a single buffer for all data to enable zero-copy
+        let mut combined_buffer = Vec::with_capacity(total_size);
+        
+        for (len, data) in &serialized_messages {
+            combined_buffer.extend_from_slice(&len.to_be_bytes());
+            combined_buffer.extend_from_slice(data);
+        }
+        
+        // Write all messages in a single system call
+        self.stream.write_all(&combined_buffer).await?;
+        
+        // Check if we need to flush (only if any non-chunk messages)
+        let needs_flush = messages.iter().any(|msg| {
+            !matches!(msg.message_type, MessageType::FileChunk { .. })
+        });
+        
+        if needs_flush {
+            self.stream.flush().await?;
+        }
+        
         Ok(())
     }
 }
