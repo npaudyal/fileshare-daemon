@@ -629,9 +629,6 @@ impl FileTransferManager {
         }
 
         // Create and store the transfer BEFORE sending the offer
-        error!("🚨 TRANSFER_CREATION: Creating OUTGOING transfer {} to peer {} for file: {} - THIS SHOULD CREATE PARALLEL SENDER LATER!", 
-              transfer_id, peer_id, metadata.name);
-              
         let transfer = FileTransfer {
             id: transfer_id,
             peer_id,
@@ -707,8 +704,8 @@ impl FileTransferManager {
         accepted: bool,
         reason: Option<String>,
     ) -> Result<()> {
-        error!(
-            "🚨 OFFER_RESPONSE: Received FileOfferResponse for transfer {} from peer {}: accepted={} - THIS TRIGGERS FILE SENDING!",
+        info!(
+            "🚀 RECEIVED FileOfferResponse for transfer {} from peer {}: accepted={}",
             transfer_id, peer_id, accepted
         );
 
@@ -742,8 +739,8 @@ impl FileTransferManager {
             return Ok(());
         }
 
-        error!(
-            "🚨 START_TRANSFER: File offer {} accepted by peer {}, about to start file transfer - THIS WILL CREATE PARALLEL SENDER!",
+        info!(
+            "✅ File offer {} accepted by peer {}, starting file transfer",
             transfer_id, peer_id
         );
 
@@ -1023,12 +1020,6 @@ impl FileTransferManager {
             Ok::<String, FileshareError>(reader.get_checksum())
         });
 
-        // CRITICAL: Verify this is an outgoing transfer before creating parallel sender
-        error!("🚨 PARALLEL_SENDER_CREATION: About to create ParallelChunkSender for transfer {} to peer {} - THIS IS THE SOURCE OF CHUNK BATCHES!", transfer_id, peer_id);
-        
-        // Log call stack to see who called this function
-        error!("🚨 CALL_STACK: send_file_chunks_parallel called for transfer {}", transfer_id);
-        
         // Create parallel sender and tracker
         let parallel_sender = ParallelChunkSender::new(
             message_sender.clone(),
@@ -1235,9 +1226,6 @@ impl FileTransferManager {
             None
         };
 
-        error!("🚨 TRANSFER_CREATION: Creating INCOMING transfer {} from peer {} for file: {} - THIS SHOULD ONLY RECEIVE CHUNKS!", 
-              transfer_id, peer_id, metadata.name);
-              
         let transfer = FileTransfer {
             id: transfer_id,
             peer_id,

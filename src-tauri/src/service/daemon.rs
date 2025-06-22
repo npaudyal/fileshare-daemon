@@ -685,9 +685,6 @@ impl FileshareDaemon {
                         | crate::network::protocol::MessageType::FileChunk {
                             transfer_id, ..
                         }
-                        | crate::network::protocol::MessageType::FileChunkBatch {
-                            transfer_id, ..
-                        }
                         | crate::network::protocol::MessageType::TransferComplete {
                             transfer_id,
                             ..
@@ -705,23 +702,6 @@ impl FileshareDaemon {
                             drop(ft);
 
                             if is_outgoing {
-                                // FIXED: Handle FileChunkBatch specially to prevent reflection
-                                if matches!(
-                                    message.message_type,
-                                    crate::network::protocol::MessageType::FileChunkBatch { .. }
-                                ) {
-                                    error!("🚀 ENHANCED_FIXED: Sending outgoing FileChunkBatch for transfer {} directly to peer {} - NO MORE REFLECTION!", transfer_id, peer_id);
-                                    if let Err(e) =
-                                        pm.send_direct_to_connection(peer_id, message.clone()).await
-                                    {
-                                        error!(
-                                            "❌ Failed to send FileChunkBatch to peer {}: {}",
-                                            peer_id, e
-                                        );
-                                    }
-                                    continue; // Don't process locally - THIS PREVENTS REFLECTION!
-                                }
-
                                 // FIXED: Handle TransferComplete specially to mark local completion
                                 if matches!(
                                     message.message_type,
@@ -893,33 +873,6 @@ impl FileshareDaemon {
                                     );
                                 }
                                 continue; // Don't process locally
-                            }
-                        }
-
-                        crate::network::protocol::MessageType::FileChunkBatch {
-                            transfer_id, ..
-                        } => {
-                            let is_our_outgoing = {
-                                let ft = pm.file_transfer.read().await;
-                                ft.has_transfer(*transfer_id)
-                                    && matches!(
-                                        ft.get_transfer_direction(*transfer_id),
-                                        Some(TransferDirection::Outgoing)
-                                    )
-                            };
-
-                            if is_our_outgoing {
-                                error!("🚀 FIXED: Sending outgoing FileChunkBatch for transfer {} directly to peer {} - NO MORE REFLECTION!", transfer_id, peer_id);
-                                // FIXED: Clone message before sending
-                                if let Err(e) =
-                                    pm.send_direct_to_connection(peer_id, message.clone()).await
-                                {
-                                    error!(
-                                        "❌ Failed to send FileChunkBatch to peer {}: {}",
-                                        peer_id, e
-                                    );
-                                }
-                                continue; // Don't process locally - THIS PREVENTS REFLECTION!
                             }
                         }
 
