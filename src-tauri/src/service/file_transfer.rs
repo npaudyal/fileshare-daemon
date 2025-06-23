@@ -8,9 +8,9 @@ use tokio::time::sleep;
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
-use crate::service::parallel_transfer::{ChunkBatcher, ParallelChunkSender, TransferTracker};
+use crate::service::parallel_transfer::{ParallelChunkSender, TransferTracker};
 use crate::service::streaming::{
-    calculate_adaptive_chunk_size, StreamingFileReader, StreamingFileWriter, TransferProgress,
+    calculate_adaptive_chunk_size, StreamingFileReader, StreamingFileWriter,
 };
 
 // Transfer constants
@@ -959,7 +959,7 @@ impl FileTransferManager {
 
         // Spawn background progress reporting to avoid blocking main transfer
         let progress_sender = message_sender.clone();
-        let total_bytes = reader.progress().1;
+        let _total_bytes = reader.progress().1;
         tokio::spawn(async move {
             let mut last_report = Instant::now();
             while last_report.elapsed() < Duration::from_secs(1) {
@@ -1377,7 +1377,7 @@ impl FileTransferManager {
 
                 // Only log progress every 50 chunks or on completion
                 if transfer.chunks_completed % 50 == 0 || chunk.is_last {
-                    let progress_pct = (bytes_written as f64 / total_bytes as f64 * 100.0);
+                    let progress_pct = bytes_written as f64 / total_bytes as f64 * 100.0;
                     info!(
                         "📊 TRANSFER_PROGRESS: {:.1}% complete - {}/{} chunks ({:.1}MB/{:.1}MB)",
                         progress_pct,
@@ -1714,7 +1714,7 @@ impl FileTransferManager {
 
         // CRITICAL: Remove completed transfer after a short delay to prevent immediate cleanup issues
         tokio::spawn({
-            let transfer_id = transfer_id;
+            let _transfer_id = transfer_id;
             async move {
                 tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
                 // Note: We can't access self here, so we'll handle this in the cleanup method
@@ -1885,7 +1885,7 @@ impl FileTransferManager {
         info!("📋 TRANSFER_STATUS: {} active transfers", self.active_transfers.len());
         for (id, transfer) in &self.active_transfers {
             let progress_pct = if transfer.metadata.size > 0 {
-                (transfer.bytes_transferred as f64 / transfer.metadata.size as f64 * 100.0)
+                transfer.bytes_transferred as f64 / transfer.metadata.size as f64 * 100.0
             } else {
                 0.0
             };
@@ -1903,7 +1903,7 @@ impl FileTransferManager {
                     TransferStatus::Pending => "🟡 PENDING", 
                     TransferStatus::Paused => "⏸️ PAUSED",
                     TransferStatus::Completed => "✅ DONE",
-                    TransferStatus::Error(e) => "❌ ERROR",
+                    TransferStatus::Error(_) => "❌ ERROR",
                     TransferStatus::Cancelled => "🚫 CANCELLED",
                 },
                 transfer.bytes_transferred as f64 / (1024.0 * 1024.0),

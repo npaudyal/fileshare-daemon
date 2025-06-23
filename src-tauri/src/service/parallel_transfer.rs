@@ -1,9 +1,9 @@
-use crate::{network::protocol::*, Result};
 use crate::service::file_transfer::MessageSender;
+use crate::{network::protocol::*, Result};
 use std::sync::Arc;
 use tokio::sync::{Mutex, Semaphore};
 use tokio::task::JoinSet;
-use tracing::{debug, error, warn, info};
+use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
 pub struct ParallelChunkSender {
@@ -35,8 +35,11 @@ impl ParallelChunkSender {
         chunks: Vec<(u64, TransferChunk)>,
     ) -> Result<Vec<u64>> {
         let total_chunks = chunks.len();
-        debug!("📤 PARALLEL_SEND: Sending {} chunks in parallel", total_chunks);
-        
+        debug!(
+            "📤 PARALLEL_SEND: Sending {} chunks in parallel",
+            total_chunks
+        );
+
         let mut join_set = JoinSet::new();
         let failed_chunks = Arc::new(Mutex::new(Vec::new()));
 
@@ -50,15 +53,12 @@ impl ParallelChunkSender {
             join_set.spawn(async move {
                 // Acquire permit for concurrency control
                 let _permit = semaphore.acquire().await.unwrap();
-                
+
                 if index < 5 || index % 10 == 0 {
                     debug!("📤 Sending chunk {} in parallel", index);
                 }
-                
-                let message = Message::new(MessageType::FileChunk { 
-                    transfer_id, 
-                    chunk 
-                });
+
+                let message = Message::new(MessageType::FileChunk { transfer_id, chunk });
 
                 if let Err(e) = sender.send((peer_id, message)) {
                     error!("❌ Failed to send chunk {}: {}", index, e);
@@ -79,9 +79,15 @@ impl ParallelChunkSender {
         let failed_chunks_guard = failed_chunks.lock().await;
         let failed_count = failed_chunks_guard.len();
         if failed_count > 0 {
-            warn!("⚠️ PARALLEL_SEND: {} out of {} chunks failed", failed_count, total_chunks);
+            warn!(
+                "⚠️ PARALLEL_SEND: {} out of {} chunks failed",
+                failed_count, total_chunks
+            );
         } else {
-            debug!("✅ PARALLEL_SEND: All {} chunks sent successfully", total_chunks);
+            debug!(
+                "✅ PARALLEL_SEND: All {} chunks sent successfully",
+                total_chunks
+            );
         }
         Ok(failed_chunks_guard.clone())
     }
@@ -93,63 +99,69 @@ impl ParallelChunkSender {
         batch_size: usize,
     ) -> Result<Vec<u64>> {
         let total_chunks = chunks.len();
-        
+
         // PERFORMANCE: Use larger batches for better TCP efficiency
         let effective_batch_size = std::cmp::max(batch_size, 8); // Minimum 8 chunks per batch
-        
+
         let failed_chunks = Arc::new(Mutex::new(Vec::new()));
-        
+
         // OPTIMIZATION: Process all batches in parallel for maximum speed
         let mut batch_tasks = Vec::new();
-        
+
         for batch_start in (0..chunks.len()).step_by(effective_batch_size) {
             let batch_end = (batch_start + effective_batch_size).min(chunks.len());
             let batch_chunks: Vec<TransferChunk> = chunks[batch_start..batch_end]
                 .iter()
                 .map(|(_, chunk)| chunk.clone())
                 .collect();
-            
+
             let batch_indices: Vec<u64> = chunks[batch_start..batch_end]
                 .iter()
                 .map(|(index, _)| *index)
                 .collect();
-            
+
             let message_sender = self.message_sender.clone();
             let peer_id = self.peer_id;
             let transfer_id = self.transfer_id;
             let failed_chunks = failed_chunks.clone();
-            
+
             // CRITICAL: Send batches in parallel to maximize throughput
             let batch_task = tokio::spawn(async move {
-                let message = Message::new(MessageType::FileChunkBatch { 
-                    transfer_id, 
-                    chunks: batch_chunks 
+                let message = Message::new(MessageType::FileChunkBatch {
+                    transfer_id,
+                    chunks: batch_chunks,
                 });
-                
+
                 if let Err(e) = message_sender.send((peer_id, message)) {
                     error!("❌ BATCH_SEND: Failed to send batch: {}", e);
                     failed_chunks.lock().await.extend(batch_indices);
                 }
             });
-            
+
             batch_tasks.push(batch_task);
         }
-        
+
         // Wait for all batch sends to complete
         for task in batch_tasks {
             let _ = task.await;
         }
-        
+
         let failed_chunks_guard = failed_chunks.lock().await;
         let failed_count = failed_chunks_guard.len();
-        
+
         if failed_count > 0 {
-            warn!("⚠️ HIGH_SPEED_BATCH: {} out of {} chunks failed", failed_count, total_chunks);
+            warn!(
+                "⚠️ HIGH_SPEED_BATCH: {} out of {} chunks failed",
+                failed_count, total_chunks
+            );
         } else {
-            info!("🚀 HIGH_SPEED_BATCH: All {} chunks sent in {} batches", total_chunks, 
-                  (total_chunks + effective_batch_size - 1) / effective_batch_size);
+            info!(
+                "🚀 HIGH_SPEED_BATCH: All {} chunks sent in {} batches",
+                total_chunks,
+                (total_chunks + effective_batch_size - 1) / effective_batch_size
+            );
         }
-        
+
         Ok(failed_chunks_guard.clone())
     }
 }
@@ -174,7 +186,7 @@ impl ChunkBatcher {
 
         let batch_end = self.batch_size.min(self.chunk_indices.len());
         let batch: Vec<u64> = self.chunk_indices.drain(0..batch_end).collect();
-        
+
         Some(batch)
     }
 }
@@ -216,13 +228,13 @@ impl TransferTracker {
 
     pub fn get_pending_chunks(&self) -> Vec<u64> {
         let mut pending = Vec::new();
-        
+
         for i in 0..self.total_chunks {
             if !self.completed_chunks.contains(&i) && !self.in_progress_chunks.contains(&i) {
                 pending.push(i);
             }
         }
-        
+
         // Also retry failed chunks
         pending.extend(&self.failed_chunks);
         pending

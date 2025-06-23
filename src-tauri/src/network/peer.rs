@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::{mpsc, RwLock};
-use tokio::time::{interval, timeout};
+use tokio::time::timeout;
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
@@ -563,7 +563,7 @@ impl PeerManager {
 
         // Clean up when connection ends
         let cleanup_peer_id = peer_id;
-        let connections_cleanup = self.connections.clone();
+        let _connections_cleanup = self.connections.clone();
         tokio::spawn(async move {
             tokio::select! {
                 _ = read_task => {
@@ -1412,7 +1412,6 @@ impl PeerConnectionWriteHalf {
 
     // OPTIMIZATION: Vectored I/O for batch writing multiple messages
     pub async fn write_messages_vectored(&mut self, messages: &[Message]) -> Result<()> {
-        use std::io::IoSlice;
         use tokio::io::AsyncWriteExt;
 
         if messages.is_empty() {

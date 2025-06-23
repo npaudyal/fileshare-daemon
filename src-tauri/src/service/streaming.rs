@@ -1,12 +1,10 @@
-use crate::{network::protocol::*, FileshareError, Result};
+use crate::{FileshareError, Result};
 use crate::network::protocol::CompressionType;
 use sha2::{Digest, Sha256};
 use std::path::Path;
-use std::sync::Arc;
 use std::collections::HashMap;
 use tokio::fs::File;
 use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader, BufWriter};
-use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
@@ -129,25 +127,16 @@ impl StreamingFileReader {
         let chunk_size_to_read = std::cmp::min(self.chunk_size as u64, remaining_bytes) as usize;
         
         // PERFORMANCE: Pre-allocate buffer with exact size to avoid reallocations
-        let mut buffer = Vec::with_capacity(chunk_size_to_read);
-        buffer.resize(chunk_size_to_read, 0);
+        let mut buffer = vec![0u8; chunk_size_to_read];
+        let mut total_bytes_read = 0;
         
-        // OPTIMIZATION: Read entire chunk in single call when possible
-        let total_bytes_read = match self.file.read_exact(&mut buffer).await {
-            Ok(()) => chunk_size_to_read,
-            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
-                // Handle partial read at end of file
-                let mut partial_bytes_read = 0;
-                while partial_bytes_read < chunk_size_to_read {
-                    match self.file.read(&mut buffer[partial_bytes_read..]).await? {
-                        0 => break, // EOF
-                        n => partial_bytes_read += n,
-                    }
-                }
-                partial_bytes_read
+        // OPTIMIZATION: Read entire chunk efficiently with loop for partial reads
+        while total_bytes_read < chunk_size_to_read {
+            match self.file.read(&mut buffer[total_bytes_read..]).await? {
+                0 => break, // EOF reached
+                n => total_bytes_read += n,
             }
-            Err(e) => return Err(e.into()),
-        };
+        }
         
         if total_bytes_read == 0 {
             return Ok(None);
