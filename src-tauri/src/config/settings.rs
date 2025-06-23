@@ -65,7 +65,7 @@ impl Default for Settings {
                 service_name: "_fileshare._tcp.local.".to_string(),
                 timeout_seconds: 30,
                 quic_enabled: true,
-                quic_port_offset: 1, // QUIC will use port + 1
+                quic_port_offset: 2, // QUIC will use port + 2 (9878)
                 prefer_quic: true,
             },
             transfer: TransferSettings {
