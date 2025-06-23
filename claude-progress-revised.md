@@ -75,12 +75,38 @@ let buffer_size = parallel_chunks * buffer_batches;
 4. **Network Tests**: Verify parallel sending efficiency
 5. **Integrity Tests**: Confirm checksums still work correctly
 
+## Latest Performance Fix (TCP Layer Optimization)
+
+### Critical Issue Found: Flush After Every Chunk
+The code was calling `flush()` after every single message, including file chunks. This forced immediate sending and prevented TCP from efficiently batching data.
+
+### Fixes Applied:
+
+1. **Selective Flushing**:
+   - Removed flush for FileChunk messages
+   - Keep flush for control messages only
+   - Added periodic flush every 50ms to prevent buffering delays
+
+2. **Increased TCP Buffers**:
+   - Changed from 2MB to 8MB send/receive buffers
+   - Allows more efficient data transfer
+
+3. **Code Changes**:
+   ```rust
+   // Before: self.stream.flush().await?; // After every message!
+   // After: Only flush non-chunk messages
+   ```
+
+### Expected Performance Improvement:
+- **Before**: 1-2 MB/s (forced flush bottleneck)
+- **After**: 20-40 MB/s (efficient TCP batching)
+- 587MB file should transfer in 15-30 seconds instead of 5+ minutes
+
 ## Conclusion
 
-The revised approach addresses the performance regression by:
-- Using a sliding window buffer instead of full streaming or full pre-loading
-- Keeping optimized checksum calculation for integrity
-- Using balanced chunk sizes for efficiency
-- Maintaining the benefits of parallel transfers without the memory costs
+The performance issues were caused by:
+1. TCP layer forcing flush after every chunk
+2. Small TCP buffers (2MB)
+3. Sliding window buffer complexity
 
-This should achieve the target 40+ MBPS speeds while keeping memory usage reasonable and maintaining file integrity verification.
+With these TCP optimizations, the app should now achieve much better speeds even without the complex parallel connection implementation.

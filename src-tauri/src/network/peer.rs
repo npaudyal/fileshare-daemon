@@ -478,6 +478,9 @@ impl PeerManager {
         // Spawn task to handle writing messages TO the peer
         let write_peer_id = peer_id;
         let write_task = tokio::spawn(async move {
+            let mut last_flush = tokio::time::Instant::now();
+            let flush_interval = Duration::from_millis(50); // Flush every 50ms
+            
             while let Some(message) = conn_rx.recv().await {
                 // Only log important messages, not chunks or frequent messages
                 match &message.message_type {
@@ -501,6 +504,14 @@ impl PeerManager {
                 if let Err(e) = write_half.write_message(&message).await {
                     error!("Failed to write message to peer {}: {}", write_peer_id, e);
                     break;
+                }
+                
+                // Periodic flush to ensure chunks are sent timely
+                if last_flush.elapsed() > flush_interval {
+                    if let Err(e) = write_half.stream.flush().await {
+                        error!("Failed to flush stream: {}", e);
+                    }
+                    last_flush = tokio::time::Instant::now();
                 }
             }
             info!("Write task ended for peer {}", write_peer_id);
@@ -1140,8 +1151,8 @@ impl PeerConnection {
             let socket = unsafe { Socket::from_raw_fd(stream.as_raw_fd()) };
             
             // Increase TCP buffer sizes for better throughput
-            let _ = socket.set_recv_buffer_size(2 * 1024 * 1024); // 2MB receive buffer
-            let _ = socket.set_send_buffer_size(2 * 1024 * 1024); // 2MB send buffer
+            let _ = socket.set_recv_buffer_size(8 * 1024 * 1024); // 8MB receive buffer
+            let _ = socket.set_send_buffer_size(8 * 1024 * 1024); // 8MB send buffer
             
             // Disable Nagle algorithm for lower latency
             let _ = socket.set_nodelay(true);
@@ -1160,8 +1171,8 @@ impl PeerConnection {
             let socket = unsafe { Socket::from_raw_socket(stream.as_raw_socket()) };
             
             // Increase TCP buffer sizes for better throughput
-            let _ = socket.set_recv_buffer_size(2 * 1024 * 1024); // 2MB receive buffer
-            let _ = socket.set_send_buffer_size(2 * 1024 * 1024); // 2MB send buffer
+            let _ = socket.set_recv_buffer_size(8 * 1024 * 1024); // 8MB receive buffer
+            let _ = socket.set_send_buffer_size(8 * 1024 * 1024); // 8MB send buffer
             
             // Disable Nagle algorithm for lower latency
             let _ = socket.set_nodelay(true);
@@ -1173,7 +1184,7 @@ impl PeerConnection {
             std::mem::forget(socket);
         }
         
-        info!("✅ TCP optimizations applied: 2MB buffers, nodelay enabled");
+        info!("✅ TCP optimizations applied: 8MB buffers, nodelay enabled");
         Ok(())
     }
 
@@ -1193,7 +1204,17 @@ impl PeerConnection {
         // Write length first, then data
         self.stream.write_all(&message_len.to_be_bytes()).await?;
         self.stream.write_all(&message_data).await?;
-        self.stream.flush().await?;
+        
+        // OPTIMIZATION: Only flush for critical messages, not chunks
+        match &message.message_type {
+            MessageType::FileChunk { .. } => {
+                // Don't flush chunks - let TCP buffer them
+            }
+            _ => {
+                // Flush other messages for responsiveness
+                self.stream.flush().await?;
+            }
+        }
 
         Ok(())
     }
@@ -1254,7 +1275,17 @@ impl PeerConnectionWriteHalf {
         // Write length first, then data
         self.stream.write_all(&message_len.to_be_bytes()).await?;
         self.stream.write_all(&message_data).await?;
-        self.stream.flush().await?;
+        
+        // OPTIMIZATION: Only flush for critical messages, not chunks
+        match &message.message_type {
+            MessageType::FileChunk { .. } => {
+                // Don't flush chunks - let TCP buffer them
+            }
+            _ => {
+                // Flush other messages for responsiveness
+                self.stream.flush().await?;
+            }
+        }
 
         Ok(())
     }
