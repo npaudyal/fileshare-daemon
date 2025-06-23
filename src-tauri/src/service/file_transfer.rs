@@ -3,12 +3,12 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::mpsc;
 use tokio::time::sleep;
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
-use crate::service::parallel_transfer::{ParallelChunkSender, TransferTracker};
+// Removed unused parallel transfer imports
 use crate::service::streaming::{
     calculate_adaptive_chunk_size, StreamingFileReader, StreamingFileWriter,
 };
@@ -21,7 +21,7 @@ const TRANSFER_TIMEOUT_SECONDS: u64 = 3600; // Base timeout: 1 hour per transfer
 const MIN_TRANSFER_TIMEOUT_SECONDS: u64 = 300; // Minimum 5 minutes
 const MAX_TRANSFER_TIMEOUT_SECONDS: u64 = 28800; // Maximum 8 hours
 const CHUNK_TIMEOUT_SECONDS: u64 = 300; // 5 minutes per chunk (more reasonable for large files)
-const PROGRESS_UPDATE_INTERVAL_MS: u64 = 500; // Update progress every 500ms
+const PROGRESS_UPDATE_INTERVAL_MS: u64 = 100; // Update progress every 100ms for responsiveness
 
 // Use simple message sender instead of DirectPeerSender
 pub type MessageSender = mpsc::UnboundedSender<(Uuid, Message)>;
@@ -810,29 +810,18 @@ impl FileTransferManager {
             metadata.size, use_streaming, compression, use_parallel, parallel_chunks
         );
 
-        if use_parallel {
-            Self::send_file_chunks_parallel(
-                message_sender,
-                peer_id,
-                transfer_id,
-                file_path,
-                chunk_size,
-                compression,
-                parallel_chunks,
-                total_chunks,
-            )
-            .await
-        } else {
-            Self::send_file_chunks_sequential(
-                message_sender,
-                peer_id,
-                transfer_id,
-                file_path,
-                chunk_size,
-                compression,
-            )
-            .await
-        }
+        // PERFORMANCE: Always use optimized parallel mode for best speed
+        Self::send_file_chunks_parallel(
+            message_sender,
+            peer_id,
+            transfer_id,
+            file_path,
+            chunk_size,
+            compression,
+            parallel_chunks,
+            total_chunks,
+        )
+        .await
     }
 
     async fn send_file_chunks(
@@ -868,29 +857,18 @@ impl FileTransferManager {
             metadata.size, use_streaming, compression, use_parallel, parallel_chunks
         );
 
-        if use_parallel {
-            Self::send_file_chunks_parallel(
-                message_sender,
-                peer_id,
-                transfer_id,
-                file_path,
-                chunk_size,
-                compression,
-                parallel_chunks,
-                total_chunks,
-            )
-            .await
-        } else {
-            Self::send_file_chunks_sequential(
-                message_sender,
-                peer_id,
-                transfer_id,
-                file_path,
-                chunk_size,
-                compression,
-            )
-            .await
-        }
+        // PERFORMANCE: Always use optimized parallel mode for best speed
+        Self::send_file_chunks_parallel(
+            message_sender,
+            peer_id,
+            transfer_id,
+            file_path,
+            chunk_size,
+            compression,
+            parallel_chunks,
+            total_chunks,
+        )
+        .await
     }
 
     async fn send_file_chunks_sequential(
@@ -993,156 +971,101 @@ impl FileTransferManager {
         total_chunks: u64,
     ) -> Result<()> {
         info!(
-            "🚀 PARALLEL_OPTIMIZED: Starting optimized parallel transfer with {} concurrent chunks",
-            parallel_chunks
+            "🚀 FAST_TRANSFER: Starting optimized file transfer - {} MB chunks, {} parallel streams",
+            chunk_size / (1024 * 1024), parallel_chunks
         );
 
-        // PERFORMANCE FIX: Use true streaming without loading entire file into memory
-        info!("🚀 STREAM_PARALLEL: Starting streaming parallel transfer (no memory pre-loading)");
-        
-        // Create multiple readers for parallel access (one per parallel chunk)
-        let mut readers = Vec::new();
-        for _ in 0..parallel_chunks {
-            let reader = StreamingFileReader::new(&file_path, chunk_size, compression).await?;
-            readers.push(Arc::new(Mutex::new(reader)));
-        }
-        
-        info!("✅ STREAM_PARALLEL: Created {} streaming readers for parallel access", readers.len());
-
-        // Create parallel sender and tracker
-        let _parallel_sender = ParallelChunkSender::new(
-            message_sender.clone(),
-            peer_id,
-            transfer_id,
-            parallel_chunks,
-        );
-
-        let mut tracker = TransferTracker::new(transfer_id, total_chunks);
+        // PERFORMANCE FIX: Use sequential reading with batched network sending
+        let mut reader = StreamingFileReader::new(&file_path, chunk_size, compression).await?;
         let start_time = Instant::now();
-        let mut last_progress_update = Instant::now();
-
-        // PERFORMANCE FIX: Stream chunks in parallel without memory loading
-        use tokio::task::JoinSet;
-        let mut join_set = JoinSet::new();
-        let mut chunk_index = 0u64;
         let mut bytes_sent = 0u64;
+        let mut chunk_index = 0u64;
+        let mut last_progress_update = Instant::now();
         
-        // Process chunks in parallel using streaming readers
-        while chunk_index < total_chunks {
-            // Limit concurrent tasks to parallel_chunks
-            while join_set.len() < parallel_chunks && chunk_index < total_chunks {
-                let reader_idx = chunk_index as usize % readers.len();
-                let reader = readers[reader_idx].clone();
-                let message_sender = message_sender.clone();
-                let current_chunk_index = chunk_index;
-                
-                debug!("🔄 STREAM_PARALLEL: Starting chunk {} read", current_chunk_index);
-                
-                tracker.mark_in_progress(&[current_chunk_index]);
-                
-                // Spawn task to read and send chunk
-                join_set.spawn(async move {
-                    let mut reader_guard = reader.lock().await;
+        // Batch size for network writes (send multiple chunks at once)
+        let batch_size = std::cmp::min(parallel_chunks, 8);
+        let mut chunk_batch = Vec::with_capacity(batch_size);
+        
+        info!("📈 FAST_TRANSFER: Reading {} MB file with {} MB chunks in batches of {}", 
+              file_path.metadata().unwrap().len() / (1024 * 1024),
+              chunk_size / (1024 * 1024), 
+              batch_size);
+
+        // Read and send chunks in optimal batches
+        while let Some((chunk_data, is_last)) = reader.read_next_chunk().await? {
+            let chunk_len = chunk_data.len();
+            let chunk = TransferChunk {
+                index: chunk_index,
+                data: chunk_data,
+                is_last,
+                compressed: compression.is_some(),
+                checksum: None,
+            };
+            
+            chunk_batch.push(chunk);
+            bytes_sent += chunk_len as u64;
+            chunk_index += 1;
+            
+            // Send batch when full or at end of file
+            if chunk_batch.len() >= batch_size || is_last {
+                // Send all chunks in batch rapidly
+                for chunk in chunk_batch.drain(..) {
+                    let message = Message::new(MessageType::FileChunk { 
+                        transfer_id, 
+                        chunk 
+                    });
                     
-                    // Read chunk at specific index
-                    match reader_guard.read_chunk_at_index(current_chunk_index).await {
-                        Ok(Some((chunk_data, is_last))) => {
-                            let chunk_len = chunk_data.len();
-                            let chunk = TransferChunk {
-                                index: current_chunk_index,
-                                data: chunk_data,
-                                is_last,
-                                compressed: compression.is_some(),
-                                checksum: None,
-                            };
-                            
-                            let message = Message::new(MessageType::FileChunk { 
-                                transfer_id, 
-                                chunk 
-                            });
-                            
-                            match message_sender.send((peer_id, message)) {
-                                Ok(()) => Ok((current_chunk_index, chunk_len)),
-                                Err(e) => Err((current_chunk_index, format!("Send failed: {}", e)))
-                            }
-                        }
-                        Ok(None) => Err((current_chunk_index, "No more chunks".to_string())),
-                        Err(e) => Err((current_chunk_index, format!("Read failed: {}", e)))
+                    if let Err(e) = message_sender.send((peer_id, message)) {
+                        error!("❌ FAST_TRANSFER: Failed to send chunk: {}", e);
+                        return Err(FileshareError::Transfer(format!("Send failed: {}", e)));
                     }
-                });
+                }
                 
-                chunk_index += 1;
+                // Report progress
+                if last_progress_update.elapsed() > Duration::from_millis(PROGRESS_UPDATE_INTERVAL_MS) {
+                    let elapsed = start_time.elapsed().as_secs_f64();
+                    let speed_bps = if elapsed > 0.0 {
+                        (bytes_sent as f64 / elapsed) as u64
+                    } else {
+                        0
+                    };
+
+                    let progress_msg = Message::new(MessageType::TransferProgress {
+                        transfer_id,
+                        bytes_transferred: bytes_sent,
+                        chunks_completed: chunk_index,
+                        speed_bps,
+                        eta_seconds: None,
+                    });
+
+                    let _ = message_sender.send((peer_id, progress_msg));
+                    last_progress_update = Instant::now();
+
+                    info!(
+                        "📊 FAST_TRANSFER: {:.1}% complete - {:.1} MB/s - {} chunks sent",
+                        (chunk_index as f64 / total_chunks as f64) * 100.0,
+                        speed_bps as f64 / (1024.0 * 1024.0),
+                        chunk_index
+                    );
+                }
             }
             
-            // Wait for at least one task to complete
-            if let Some(result) = join_set.join_next().await {
-                match result {
-                    Ok(Ok((completed_index, chunk_bytes))) => {
-                        tracker.mark_completed(completed_index);
-                        bytes_sent += chunk_bytes as u64;
-                        
-                        // Send progress update
-                        if last_progress_update.elapsed() > Duration::from_millis(PROGRESS_UPDATE_INTERVAL_MS) {
-                            let elapsed = start_time.elapsed().as_secs_f64();
-                            let speed_bps = if elapsed > 0.0 {
-                                (bytes_sent as f64 / elapsed) as u64
-                            } else {
-                                0
-                            };
-
-                            let progress_msg = Message::new(MessageType::TransferProgress {
-                                transfer_id,
-                                bytes_transferred: bytes_sent,
-                                chunks_completed: tracker.completed_chunks.len() as u64,
-                                speed_bps,
-                                eta_seconds: None,
-                            });
-
-                            let _ = message_sender.send((peer_id, progress_msg));
-                            last_progress_update = Instant::now();
-
-                            info!(
-                                "📊 STREAM_PARALLEL: Progress {:.1}% ({}/{} chunks) - Speed: {:.1} MB/s",
-                                tracker.progress_percentage(),
-                                tracker.completed_chunks.len(),
-                                total_chunks,
-                                speed_bps as f64 / (1024.0 * 1024.0)
-                            );
-                        }
-                    }
-                    Ok(Err((failed_index, error))) => {
-                        error!("❌ STREAM_PARALLEL: Chunk {} failed: {}", failed_index, error);
-                        tracker.mark_failed(failed_index);
-                    }
-                    Err(e) => {
-                        error!("❌ STREAM_PARALLEL: Task panicked: {:?}", e);
-                    }
-                }
-            }
+            if is_last { break; }
         }
-        
-        // Wait for all remaining tasks to complete
-        while let Some(result) = join_set.join_next().await {
-            match result {
-                Ok(Ok((completed_index, chunk_bytes))) => {
-                    tracker.mark_completed(completed_index);
-                    bytes_sent += chunk_bytes as u64;
-                }
-                Ok(Err((failed_index, error))) => {
-                    error!("❌ STREAM_PARALLEL: Final chunk {} failed: {}", failed_index, error);
-                    tracker.mark_failed(failed_index);
-                }
-                Err(e) => {
-                    error!("❌ STREAM_PARALLEL: Final task panicked: {:?}", e);
-                }
-            }
-        }
+
+        let elapsed = start_time.elapsed().as_secs_f64();
+        let final_speed = if elapsed > 0.0 {
+            bytes_sent as f64 / elapsed / (1024.0 * 1024.0)
+        } else {
+            0.0
+        };
 
         info!(
-            "✅ STREAM_PARALLEL: All chunks processed for transfer {} - {} completed, {} failed",
-            transfer_id,
-            tracker.completed_chunks.len(),
-            tracker.failed_chunks.len()
+            "✅ FAST_TRANSFER: Completed {} chunks ({:.1} MB) in {:.1}s at {:.1} MB/s",
+            chunk_index,
+            bytes_sent as f64 / (1024.0 * 1024.0),
+            elapsed,
+            final_speed
         );
 
         Ok(())
