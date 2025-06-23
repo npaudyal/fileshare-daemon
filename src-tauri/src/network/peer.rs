@@ -1292,8 +1292,12 @@ impl PeerConnection {
             Message {
                 message_type: MessageType::FileChunk { .. },
                 ..
+            }
+            | Message {
+                message_type: MessageType::FileChunkBatch { .. },
+                ..
             } => {
-                // Don't flush for file chunks - let TCP batch them
+                // Don't flush for file chunks or batches - let TCP batch them
             }
             _ => {
                 // Flush for control messages
@@ -1371,8 +1375,12 @@ impl PeerConnectionWriteHalf {
             Message {
                 message_type: MessageType::FileChunk { .. },
                 ..
+            }
+            | Message {
+                message_type: MessageType::FileChunkBatch { .. },
+                ..
             } => {
-                // Don't flush for file chunks - let TCP batch them
+                // Don't flush for file chunks or batches - let TCP batch them
             }
             _ => {
                 // Flush for control messages

@@ -10,8 +10,9 @@ use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
-const BUFFER_SIZE: usize = 2 * 1024 * 1024; // 2MB buffer for streaming (OPTIMIZED)
+const BUFFER_SIZE: usize = 32 * 1024 * 1024; // 32MB buffer for better performance with 16MB chunks
 const MAX_MEMORY_PER_TRANSFER: usize = 50 * 1024 * 1024; // 50MB max memory per transfer (REDUCED)
+const WRITE_BUFFER_CHUNKS: usize = 2; // Number of chunks to buffer before flushing (32MB with 16MB chunks)
 
 pub struct StreamingFileReader {
     file: BufReader<File>,
@@ -200,6 +201,7 @@ pub struct StreamingFileWriter {
     decompression: Option<CompressionType>,
     chunks_buffer: HashMap<u64, Vec<u8>>,
     next_write_index: u64,
+    chunks_written_since_flush: usize,
 }
 
 impl StreamingFileWriter {
@@ -216,6 +218,12 @@ impl StreamingFileWriter {
         }
         
         let file = File::create(path).await?;
+        
+        // Pre-allocate file space for better performance
+        file.set_len(total_size).await
+            .map_err(|e| FileshareError::FileOperation(format!("Failed to pre-allocate file: {}", e)))?;
+        info!("📝 Pre-allocated file with {} bytes", total_size);
+        
         let buffered = BufWriter::with_capacity(BUFFER_SIZE, file);
         
         // Use HashMap for better chunk management - no size limits needed
@@ -230,6 +238,7 @@ impl StreamingFileWriter {
             decompression,
             chunks_buffer: HashMap::new(),
             next_write_index: 0,
+            chunks_written_since_flush: 0,
         })
     }
     
@@ -330,6 +339,14 @@ impl StreamingFileWriter {
         self.file.write_all(data).await?;
         self.hasher.update(data);
         self.bytes_written += data.len() as u64;
+        self.chunks_written_since_flush += 1;
+        
+        // Only flush after writing multiple chunks for better performance
+        if self.chunks_written_since_flush >= WRITE_BUFFER_CHUNKS {
+            self.file.flush().await?;
+            self.chunks_written_since_flush = 0;
+        }
+        
         Ok(())
     }
     
@@ -446,9 +463,9 @@ pub struct TransferProgress {
 
 pub fn calculate_adaptive_chunk_size(file_size: u64) -> usize {
     match file_size {
-        0..=10_485_760 => 256 * 1024,                   // <= 10MB: 256KB chunks (OPTIMIZED)
-        10_485_761..=104_857_600 => 1 * 1024 * 1024,    // 10MB-100MB: 1MB chunks (OPTIMIZED)
-        104_857_601..=1_073_741_824 => 4 * 1024 * 1024, // 100MB-1GB: 4MB chunks (OPTIMIZED)
-        _ => 8 * 1024 * 1024,                           // > 1GB: 8MB chunks (OPTIMIZED)
+        0..=10_485_760 => 1 * 1024 * 1024,               // <= 10MB: 1MB chunks
+        10_485_761..=104_857_600 => 4 * 1024 * 1024,     // 10MB-100MB: 4MB chunks
+        104_857_601..=1_073_741_824 => 8 * 1024 * 1024,  // 100MB-1GB: 8MB chunks
+        _ => 16 * 1024 * 1024,                           // > 1GB: 16MB chunks for maximum throughput
     }
 }
