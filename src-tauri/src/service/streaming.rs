@@ -445,13 +445,11 @@ pub struct TransferProgress {
 }
 
 pub fn calculate_adaptive_chunk_size(file_size: u64) -> usize {
-    // OPTIMIZED: Better chunk size distribution for improved performance
+    // Balanced chunk sizes for good performance across all file sizes
     match file_size {
-        0..=1_048_576 => 32 * 1024,                      // <= 1MB: 32KB chunks (faster for small files)
-        1_048_577..=10_485_760 => 128 * 1024,            // 1MB-10MB: 128KB chunks (reduced overhead)
-        10_485_761..=52_428_800 => 256 * 1024,           // 10MB-50MB: 256KB chunks
-        52_428_801..=524_288_000 => 512 * 1024,          // 50MB-500MB: 512KB chunks (optimal for parallel)
-        524_288_001..=2_147_483_648 => 1 * 1024 * 1024,  // 500MB-2GB: 1MB chunks
-        _ => 1536 * 1024,                                 // > 2GB: 1.5MB chunks (optimal for very large files)
+        0..=10_485_760 => 256 * 1024,                    // <= 10MB: 256KB chunks
+        10_485_761..=104_857_600 => 512 * 1024,          // 10MB-100MB: 512KB chunks  
+        104_857_601..=1_073_741_824 => 1 * 1024 * 1024,  // 100MB-1GB: 1MB chunks
+        _ => 2 * 1024 * 1024,                             // > 1GB: 2MB chunks
     }
 }
