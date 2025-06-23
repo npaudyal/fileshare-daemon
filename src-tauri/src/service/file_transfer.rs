@@ -1364,7 +1364,7 @@ impl FileTransferManager {
             // Handle streaming vs non-streaming transfers
             if let Some(ref mut writer) = transfer.streaming_writer {
                 // Streaming mode - write chunk directly to file
-                writer
+                let chunk_was_written = writer
                     .write_chunk(chunk.index, chunk.data.clone(), chunk.compressed)
                     .await?;
 
@@ -1372,8 +1372,13 @@ impl FileTransferManager {
                 transfer.bytes_transferred = bytes_written;
                 transfer.chunks_completed += 1;
                 
-                // CRITICAL FIX: Mark chunk as received in chunks_received array for streaming mode
-                transfer.chunks_received[chunk.index as usize] = true;
+                // CRITICAL FIX: Only mark chunk as received if it was actually written to disk
+                if chunk_was_written {
+                    transfer.chunks_received[chunk.index as usize] = true;
+                } else {
+                    // Chunk is buffered but not written yet, don't mark as received
+                    debug!("📦 BUFFERED: Chunk {} buffered but not written yet", chunk.index);
+                }
 
                 // Only log progress every 50 chunks or on completion
                 if transfer.chunks_completed % 50 == 0 || chunk.is_last {
@@ -1518,7 +1523,23 @@ impl FileTransferManager {
             // Check if transfer is complete - ALL chunks must be received
             let chunks_received_count = transfer.chunks_received.iter().filter(|&&b| b).count();
             let total_chunks = transfer.metadata.total_chunks as usize;
+            
+            // For streaming mode, also check actual written chunks vs buffered chunks
+            let (actual_written_chunks, buffered_chunks_count) = if let Some(ref writer) = transfer.streaming_writer {
+                (writer.get_written_chunks(), writer.get_buffered_chunks_count())
+            } else {
+                (chunks_received_count as u64, 0)
+            };
+            
             let is_complete = chunks_received_count == total_chunks;
+            
+            // Enhanced debugging for streaming mode
+            if transfer.streaming_writer.is_some() && (chunk.index % 20 == 0 || chunk.is_last || is_complete) {
+                info!(
+                    "📊 STREAMING_STATUS: Transfer {} - Received chunks: {}/{}, Written to disk: {}, Buffered: {}",
+                    transfer_id, chunks_received_count, total_chunks, actual_written_chunks, buffered_chunks_count
+                );
+            }
             
             // Enhanced debugging to track which chunks are missing
             if chunk.index % 10 == 0 || chunk.is_last || is_complete {

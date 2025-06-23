@@ -235,7 +235,7 @@ impl StreamingFileWriter {
         })
     }
     
-    pub async fn write_chunk(&mut self, index: u64, data: Vec<u8>, compressed: bool) -> Result<()> {
+    pub async fn write_chunk(&mut self, index: u64, data: Vec<u8>, compressed: bool) -> Result<bool> {
         if index % 10 == 0 || index < 5 {  // Only log every 10th chunk or first 5 chunks
             debug!("🔧 WRITE_CHUNK: Attempting to write chunk {} (expecting {})", index, self.next_write_index);
         }
@@ -243,7 +243,7 @@ impl StreamingFileWriter {
         // Skip chunks that are already written (duplicate handling)
         if index < self.next_write_index {
             info!("⚠️ Skipping duplicate chunk {} (already processed up to {})", index, self.next_write_index - 1);
-            return Ok(());
+            return Ok(true); // Return true since it's already written
         }
         
         // Decompress if needed
@@ -272,7 +272,10 @@ impl StreamingFileWriter {
             }
             
             // Check if we have buffered chunks that can now be written
-            self.flush_buffered_chunks().await?;
+            let _flushed_count = self.flush_buffered_chunks().await?;
+            
+            // Return true since this chunk was successfully written
+            return Ok(true);
         } else if index > self.next_write_index {
             // Store chunk directly in HashMap by chunk index - much simpler!
             if index % 10 == 0 || index < 5 {  // Log significant gaps and first 5
@@ -292,12 +295,15 @@ impl StreamingFileWriter {
                 let stored_chunks: Vec<u64> = self.chunks_buffer.keys().cloned().collect();
                 debug!("📦 BUFFER_STATE: After storing chunk {}, stored chunks: {:?}", index, stored_chunks);
             }
+            
+            // Return false since this chunk is buffered, not written yet
+            return Ok(false);
         }
         
-        Ok(())
+        Ok(true)
     }
     
-    async fn flush_buffered_chunks(&mut self) -> Result<()> {
+    async fn flush_buffered_chunks(&mut self) -> Result<u64> {
         let mut consecutive_flushes = 0;
         let start_write_index = self.next_write_index;
         
@@ -337,7 +343,7 @@ impl StreamingFileWriter {
                   self.next_write_index);
         }
         
-        Ok(())
+        Ok(consecutive_flushes as u64)
     }
     
     async fn write_data(&mut self, data: &[u8]) -> Result<()> {
@@ -382,7 +388,7 @@ impl StreamingFileWriter {
                   self.next_write_index, expected_chunks);
             
             // Try to flush any remaining buffered chunks
-            self.flush_buffered_chunks().await?;
+            let _flushed_count = self.flush_buffered_chunks().await?;
             
             // Check again after flush
             if self.next_write_index < expected_chunks {
@@ -466,6 +472,16 @@ impl StreamingFileWriter {
     
     pub fn progress(&self) -> (u64, u64) {
         (self.bytes_written, self.total_size)
+    }
+    
+    pub fn get_written_chunks(&self) -> u64 {
+        // Return the number of chunks that have been actually written to disk
+        self.next_write_index
+    }
+    
+    pub fn get_buffered_chunks_count(&self) -> usize {
+        // Return the number of chunks currently buffered (not yet written)
+        self.chunks_buffer.len()
     }
 }
 
