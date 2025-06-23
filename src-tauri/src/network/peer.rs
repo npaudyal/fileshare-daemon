@@ -4,6 +4,7 @@ use crate::{
     service::file_transfer::{
         FileTransferManager, MessageSender, TransferDirection, TransferStatus,
     },
+    quic::QuicIntegration,
     FileshareError, Result,
 };
 use std::collections::HashMap;
@@ -65,6 +66,7 @@ pub struct PeerManager {
     pub message_rx: mpsc::UnboundedReceiver<(Uuid, Message)>,
     // Store active connections to send messages
     connections: HashMap<Uuid, mpsc::UnboundedSender<Message>>,
+    quic_integration: Option<Arc<QuicIntegration>>,
 }
 
 impl PeerManager {
@@ -98,6 +100,33 @@ impl PeerManager {
             message_tx: message_tx.clone(),
             message_rx,
             connections: HashMap::new(),
+            quic_integration: None,
+        };
+
+        // Set up the message sender for file transfers
+        peer_manager.set_file_transfer_message_sender().await;
+
+        Ok(peer_manager)
+    }
+
+    /// Create a new PeerManager with QUIC integration
+    pub async fn new_with_quic(
+        settings: Arc<Settings>, 
+        quic_integration: Option<Arc<QuicIntegration>>
+    ) -> Result<Self> {
+        let (message_tx, message_rx) = mpsc::unbounded_channel();
+        let file_transfer = Arc::new(RwLock::new(
+            FileTransferManager::new(settings.clone()).await?,
+        ));
+
+        let peer_manager = Self {
+            settings,
+            peers: HashMap::new(),
+            file_transfer,
+            message_tx: message_tx.clone(),
+            message_rx,
+            connections: HashMap::new(),
+            quic_integration,
         };
 
         // Set up the message sender for file transfers
@@ -552,7 +581,30 @@ impl PeerManager {
             ));
         }
 
-        // Start file transfer with validation
+        // Try QUIC first for better performance
+        if let Some(ref quic_integration) = self.quic_integration {
+            // Check if QUIC connection exists for this peer
+            let quic_stats = quic_integration.get_connection_stats().await;
+            if quic_stats.contains_key(&peer_id) {
+                info!("🚀 Using QUIC for high-speed file transfer to {}", peer_id);
+                
+                match quic_integration.send_file(peer_id, file_path.clone(), None).await {
+                    Ok(transfer_id) => {
+                        info!("✅ QUIC transfer started: {}", transfer_id);
+                        return Ok(());
+                    }
+                    Err(e) => {
+                        warn!("⚠️ QUIC transfer failed, falling back to TCP: {}", e);
+                        // Continue to TCP fallback below
+                    }
+                }
+            } else {
+                info!("📡 No QUIC connection for peer {}, using TCP", peer_id);
+            }
+        }
+
+        // Fallback to TCP-based file transfer
+        info!("📡 Using TCP file transfer to {}", peer_id);
         let mut ft = self.file_transfer.write().await;
         ft.send_file_with_validation(peer_id, file_path).await
     }

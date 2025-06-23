@@ -27,6 +27,9 @@ pub struct NetworkSettings {
     pub discovery_port: u16,
     pub service_name: String,
     pub timeout_seconds: u64,
+    pub quic_enabled: bool,
+    pub quic_port_offset: u16,
+    pub prefer_quic: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -61,6 +64,9 @@ impl Default for Settings {
                 discovery_port: 9877,
                 service_name: "_fileshare._tcp.local.".to_string(),
                 timeout_seconds: 30,
+                quic_enabled: true,
+                quic_port_offset: 1, // QUIC will use port + 1
+                prefer_quic: true,
             },
             transfer: TransferSettings {
                 chunk_size: 1024 * 1024, // 1MB default chunk size
