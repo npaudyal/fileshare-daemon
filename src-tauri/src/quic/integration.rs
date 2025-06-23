@@ -211,7 +211,7 @@ impl QuicMessageProcessor {
     
     async fn handle_handshake(
         &self,
-        peer_id: Uuid,
+        temp_peer_id: Uuid,
         device_id: Uuid,
         device_name: String,
         version: String,
@@ -219,20 +219,29 @@ impl QuicMessageProcessor {
     ) -> Result<()> {
         info!("🤝 Handshake from {} ({}): {}", device_name, device_id, version);
         
-        // Register peer with stream manager
-        // Note: We need the actual Connection object here, which we don't have access to
-        // This would need to be refactored to pass the connection through
+        // CRITICAL: Update the connection mapping to use real device ID
+        // This fixes the connection ID mismatch issue
+        if let Err(e) = self.connection_manager.update_peer_id(temp_peer_id, device_id).await {
+            warn!("⚠️ Failed to update peer ID mapping: {}", e);
+        } else {
+            info!("✅ Updated QUIC connection mapping: {} -> {}", temp_peer_id, device_id);
+        }
         
-        // Send handshake response
+        // Send handshake response using the real device ID
         let response = QuicMessage::HandshakeResponse {
             accepted: true,
             capabilities: TransferCapabilities::default(),
             reason: None,
         };
         
-        self.connection_manager.send_message(peer_id, response).await?;
+        // Try to send with real device ID first, fall back to temp ID if needed
+        let send_result = self.connection_manager.send_message(device_id, response.clone()).await;
+        if send_result.is_err() {
+            warn!("⚠️ Sending with real device ID failed, using temp ID");
+            self.connection_manager.send_message(temp_peer_id, response).await?;
+        }
         
-        info!("✅ Handshake completed with {}", device_name);
+        info!("✅ Handshake completed with {} (device_id: {})", device_name, device_id);
         Ok(())
     }
     

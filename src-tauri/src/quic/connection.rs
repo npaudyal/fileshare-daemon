@@ -371,6 +371,27 @@ impl QuicConnectionManager {
         }
     }
 
+    /// Update peer ID mapping from temporary ID to real device ID
+    pub async fn update_peer_id(&self, temp_id: Uuid, real_id: Uuid) -> Result<()> {
+        let mut connections = self.connections.write().await;
+        
+        if let Some(mut peer_conn) = connections.remove(&temp_id) {
+            // Update the peer_id in the connection
+            peer_conn.peer_id = real_id;
+            
+            // Store with the real device ID
+            connections.insert(real_id, peer_conn);
+            
+            info!("✅ Updated QUIC peer connection: {} -> {}", temp_id, real_id);
+            Ok(())
+        } else {
+            Err(crate::FileshareError::Transfer(format!(
+                "Temporary peer {} not found for ID update",
+                temp_id
+            )))
+        }
+    }
+
     /// Get message receiver for processing
     pub fn get_message_receiver(&self) -> Arc<Mutex<mpsc::UnboundedReceiver<(Uuid, QuicMessage)>>> {
         self.message_rx.clone()

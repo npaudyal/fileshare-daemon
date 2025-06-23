@@ -469,6 +469,10 @@ impl FileshareDaemon {
                     ).await {
                         Ok(()) => {
                             info!("✅ QUIC connection established for high-speed transfer to {}", quic_addr);
+                            
+                            // Wait a moment for handshake to complete
+                            tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+                            
                             use_quic = true;
                         }
                         Err(e) => {
@@ -481,6 +485,8 @@ impl FileshareDaemon {
                 }
             }
 
+            info!("🔍 Debug: use_quic = {}, quic_integration available = {}", use_quic, quic_integration.is_some());
+            
             let send_result = if use_quic {
                 // Use QUIC for high-speed file transfer
                 info!("🚀 Initiating QUIC file transfer for high-speed delivery");
