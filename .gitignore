@@ -14,4 +14,3 @@ node_modules/
 /src-tauri/gen/
 /claude.md
 /Claude-progress.md
-dist/
