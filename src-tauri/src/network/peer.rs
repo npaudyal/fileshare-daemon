@@ -838,8 +838,9 @@ impl PeerManager {
             }
             _ => {
                 info!(
-                    "📥 Processing message from {}: {:?}",
-                    peer_id, message.message_type
+                    "📥 Processing message from {}: {}",
+                    peer_id,
+                    message_type_name(&message.message_type)
                 );
             }
         }
