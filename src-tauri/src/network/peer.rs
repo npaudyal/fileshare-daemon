@@ -478,29 +478,62 @@ impl PeerManager {
         // Spawn task to handle writing messages TO the peer
         let write_peer_id = peer_id;
         let write_task = tokio::spawn(async move {
+            let mut chunk_count = 0u64;
+            let mut total_write_time = std::time::Duration::ZERO;
+            let mut total_bytes_written = 0u64;
+            
             while let Some(message) = conn_rx.recv().await {
-                // Only log important messages, not chunks or frequent messages
+                let write_start = std::time::Instant::now();
+                
+                // PERFORMANCE: Track message types and timing
                 match &message.message_type {
                     MessageType::Ping | MessageType::Pong => {
-                        debug!("📤 WRITE {} to {}", 
+                        debug!("📤 PERF_WRITE: {} to {} starting", 
                                if matches!(message.message_type, MessageType::Ping) { "ping" } else { "pong" },
                                write_peer_id);
                     }
                     MessageType::FileChunk { transfer_id, chunk } => {
-                        // Only log every 10th chunk to reduce noise
-                        if chunk.index % 10 == 0 || chunk.is_last {
-                            info!("📤 WRITE chunk {} for transfer {} ({}B, last: {})",
+                        chunk_count += 1;
+                        total_bytes_written += chunk.data.len() as u64;
+                        
+                        // Log performance for first chunks and every 10th chunk
+                        if chunk.index < 5 || chunk.index % 10 == 0 || chunk.is_last {
+                            info!("📤 PERF_WRITE: Starting chunk {} for transfer {} ({}B, last: {})",
                                   chunk.index, transfer_id, chunk.data.len(), chunk.is_last);
                         }
                     }
                     _ => {
-                        info!("📤 WRITE to peer {}: {:?}", write_peer_id, message.message_type);
+                        debug!("📤 PERF_WRITE: {} to {} starting", 
+                               format!("{:?}", message.message_type), write_peer_id);
                     }
                 }
 
                 if let Err(e) = write_half.write_message(&message).await {
-                    error!("Failed to write message to peer {}: {}", write_peer_id, e);
+                    error!("❌ PERF_WRITE_ERROR: Failed to write to peer {}: {}", write_peer_id, e);
                     break;
+                }
+                
+                let write_time = write_start.elapsed();
+                total_write_time += write_time;
+                
+                // PERFORMANCE: Log timing for file chunks
+                match &message.message_type {
+                    MessageType::FileChunk { transfer_id, chunk } => {
+                        if chunk.index < 5 || chunk.index % 10 == 0 || chunk.is_last || write_time.as_millis() > 10 {
+                            let avg_write_time = if chunk_count > 0 { total_write_time.as_millis() / chunk_count as u128 } else { 0 };
+                            let throughput_mbps = if total_write_time.as_secs_f64() > 0.0 {
+                                total_bytes_written as f64 / total_write_time.as_secs_f64() / (1024.0 * 1024.0)
+                            } else { 0.0 };
+                            
+                            info!("📤 PERF_WRITE: Chunk {} wrote in {:.2}ms | avg: {:.2}ms | throughput: {:.1} MB/s | total: {} chunks",
+                                  chunk.index, write_time.as_millis(), avg_write_time, throughput_mbps, chunk_count);
+                        }
+                    }
+                    _ => {
+                        if write_time.as_millis() > 1 { // Log slow non-chunk writes
+                            debug!("📤 PERF_WRITE: Non-chunk message wrote in {:.2}ms", write_time.as_millis());
+                        }
+                    }
                 }
             }
             info!("Write task ended for peer {}", write_peer_id);
@@ -1186,14 +1219,41 @@ impl PeerConnection {
     }
 
     async fn write_message(&mut self, message: &Message) -> Result<()> {
-        // Serialize the message
+        let write_start = std::time::Instant::now();
+        
+        // PERFORMANCE: Serialize timing
+        let serialize_start = std::time::Instant::now();
         let message_data = bincode::serialize(message)?;
+        let serialize_time = serialize_start.elapsed();
         let message_len = message_data.len() as u32;
 
-        // Write length first, then data
+        // PERFORMANCE: TCP write timing
+        let tcp_start = std::time::Instant::now();
         self.stream.write_all(&message_len.to_be_bytes()).await?;
         self.stream.write_all(&message_data).await?;
+        let write_time = tcp_start.elapsed();
+        
+        let flush_start = std::time::Instant::now();
         self.stream.flush().await?;
+        let flush_time = flush_start.elapsed();
+        
+        let total_time = write_start.elapsed();
+        
+        // Log performance for file chunks
+        match &message.message_type {
+            MessageType::FileChunk { chunk, .. } => {
+                if chunk.index < 5 || chunk.index % 20 == 0 || chunk.is_last || total_time.as_millis() > 20 {
+                    info!("🌐 PERF_TCP: Chunk {} - SERIALIZE: {:.2}ms | WRITE: {:.2}ms | FLUSH: {:.2}ms | TOTAL: {:.2}ms | SIZE: {}B",
+                          chunk.index, serialize_time.as_millis(), write_time.as_millis(), 
+                          flush_time.as_millis(), total_time.as_millis(), message_data.len());
+                }
+            }
+            _ => {
+                if total_time.as_millis() > 5 {
+                    debug!("🌐 PERF_TCP: Non-chunk message took {:.2}ms", total_time.as_millis());
+                }
+            }
+        }
 
         Ok(())
     }
@@ -1247,14 +1307,41 @@ impl PeerConnectionReadHalf {
 
 impl PeerConnectionWriteHalf {
     async fn write_message(&mut self, message: &Message) -> Result<()> {
-        // Serialize the message
+        let write_start = std::time::Instant::now();
+        
+        // PERFORMANCE: Serialize timing
+        let serialize_start = std::time::Instant::now();
         let message_data = bincode::serialize(message)?;
+        let serialize_time = serialize_start.elapsed();
         let message_len = message_data.len() as u32;
 
-        // Write length first, then data
+        // PERFORMANCE: TCP write timing
+        let tcp_start = std::time::Instant::now();
         self.stream.write_all(&message_len.to_be_bytes()).await?;
         self.stream.write_all(&message_data).await?;
+        let write_time = tcp_start.elapsed();
+        
+        let flush_start = std::time::Instant::now();
         self.stream.flush().await?;
+        let flush_time = flush_start.elapsed();
+        
+        let total_time = write_start.elapsed();
+        
+        // Log performance for file chunks
+        match &message.message_type {
+            MessageType::FileChunk { chunk, .. } => {
+                if chunk.index < 5 || chunk.index % 20 == 0 || chunk.is_last || total_time.as_millis() > 20 {
+                    info!("🌐 PERF_TCP: Chunk {} - SERIALIZE: {:.2}ms | WRITE: {:.2}ms | FLUSH: {:.2}ms | TOTAL: {:.2}ms | SIZE: {}B",
+                          chunk.index, serialize_time.as_millis(), write_time.as_millis(), 
+                          flush_time.as_millis(), total_time.as_millis(), message_data.len());
+                }
+            }
+            _ => {
+                if total_time.as_millis() > 5 {
+                    debug!("🌐 PERF_TCP: Non-chunk message took {:.2}ms", total_time.as_millis());
+                }
+            }
+        }
 
         Ok(())
     }

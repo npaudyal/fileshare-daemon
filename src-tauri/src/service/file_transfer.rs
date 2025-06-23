@@ -970,17 +970,30 @@ impl FileTransferManager {
         parallel_chunks: usize,
         total_chunks: u64,
     ) -> Result<()> {
+        let overall_start = Instant::now();
         info!(
-            "🚀 FAST_TRANSFER: Starting optimized file transfer - {} MB chunks, {} parallel streams",
-            chunk_size / (1024 * 1024), parallel_chunks
+            "🚀 PERF_START: Transfer {} - File: {} MB, Chunk: {} MB, Expected chunks: {}",
+            transfer_id,
+            file_path.metadata().unwrap().len() / (1024 * 1024),
+            chunk_size / (1024 * 1024), 
+            total_chunks
         );
 
-        // PERFORMANCE FIX: Use sequential reading with batched network sending
+        // PERFORMANCE TIMING: Reader creation
+        let reader_start = Instant::now();
         let mut reader = StreamingFileReader::new(&file_path, chunk_size, compression).await?;
+        let reader_creation_time = reader_start.elapsed();
+        info!("📊 PERF_READER: Created in {:.2}ms", reader_creation_time.as_millis());
+
         let start_time = Instant::now();
         let mut bytes_sent = 0u64;
         let mut chunk_index = 0u64;
         let mut last_progress_update = Instant::now();
+        
+        // PERFORMANCE COUNTERS
+        let mut total_read_time = Duration::ZERO;
+        let mut total_send_time = Duration::ZERO;
+        let mut total_progress_time = Duration::ZERO;
         
         // Batch size for network writes (send multiple chunks at once)
         let batch_size = std::cmp::min(parallel_chunks, 8);
@@ -992,7 +1005,21 @@ impl FileTransferManager {
               batch_size);
 
         // Read and send chunks in optimal batches
-        while let Some((chunk_data, is_last)) = reader.read_next_chunk().await? {
+        info!("📊 PERF_LOOP: Starting main transfer loop");
+        while let Some((chunk_data, is_last)) = {
+            // PERFORMANCE TIMING: Chunk reading
+            let read_start = Instant::now();
+            let result = reader.read_next_chunk().await?;
+            let read_time = read_start.elapsed();
+            total_read_time += read_time;
+            
+            if chunk_index < 5 || chunk_index % 10 == 0 {
+                info!("📊 PERF_READ: Chunk {} read in {:.2}ms ({} bytes)", 
+                      chunk_index, read_time.as_millis(), 
+                      result.as_ref().map(|(data, _)| data.len()).unwrap_or(0));
+            }
+            result
+        } {
             let chunk_len = chunk_data.len();
             let chunk = TransferChunk {
                 index: chunk_index,
@@ -1008,21 +1035,41 @@ impl FileTransferManager {
             
             // Send batch when full or at end of file
             if chunk_batch.len() >= batch_size || is_last {
+                // PERFORMANCE TIMING: Batch sending
+                let send_start = Instant::now();
+                let batch_len = chunk_batch.len();
+                
                 // Send all chunks in batch rapidly
-                for chunk in chunk_batch.drain(..) {
+                for (i, chunk) in chunk_batch.drain(..).enumerate() {
+                    let message_start = Instant::now();
                     let message = Message::new(MessageType::FileChunk { 
                         transfer_id, 
                         chunk 
                     });
+                    let message_creation_time = message_start.elapsed();
                     
+                    let send_msg_start = Instant::now();
                     if let Err(e) = message_sender.send((peer_id, message)) {
-                        error!("❌ FAST_TRANSFER: Failed to send chunk: {}", e);
+                        error!("❌ PERF_SEND_ERROR: Failed to send chunk: {}", e);
                         return Err(FileshareError::Transfer(format!("Send failed: {}", e)));
+                    }
+                    let send_msg_time = send_msg_start.elapsed();
+                    
+                    if i == 0 || batch_len <= 2 { // Log timing for first chunk in batch or small batches
+                        info!("📊 PERF_MSG: Chunk msg created in {:.2}ms, sent in {:.2}ms", 
+                              message_creation_time.as_millis(), send_msg_time.as_millis());
                     }
                 }
                 
-                // Report progress
+                let batch_send_time = send_start.elapsed();
+                total_send_time += batch_send_time;
+                info!("📊 PERF_BATCH: Sent {} chunks in {:.2}ms (avg: {:.2}ms/chunk)", 
+                      batch_len, batch_send_time.as_millis(), 
+                      batch_send_time.as_millis() as f64 / batch_len as f64);
+                
+                // Report progress with timing
                 if last_progress_update.elapsed() > Duration::from_millis(PROGRESS_UPDATE_INTERVAL_MS) {
+                    let progress_start = Instant::now();
                     let elapsed = start_time.elapsed().as_secs_f64();
                     let speed_bps = if elapsed > 0.0 {
                         (bytes_sent as f64 / elapsed) as u64
@@ -1039,13 +1086,22 @@ impl FileTransferManager {
                     });
 
                     let _ = message_sender.send((peer_id, progress_msg));
+                    let progress_time = progress_start.elapsed();
+                    total_progress_time += progress_time;
                     last_progress_update = Instant::now();
 
+                    // PERFORMANCE ANALYSIS
+                    let avg_read_time = if chunk_index > 0 { total_read_time.as_millis() / chunk_index as u128 } else { 0 };
+                    let avg_send_time = if chunk_index > 0 { total_send_time.as_millis() / chunk_index as u128 } else { 0 };
+                    
                     info!(
-                        "📊 FAST_TRANSFER: {:.1}% complete - {:.1} MB/s - {} chunks sent",
+                        "📊 PERF_PROGRESS: {:.1}% - {:.1} MB/s - {} chunks | READ avg: {}ms | SEND avg: {}ms | PROGRESS: {}ms",
                         (chunk_index as f64 / total_chunks as f64) * 100.0,
                         speed_bps as f64 / (1024.0 * 1024.0),
-                        chunk_index
+                        chunk_index,
+                        avg_read_time,
+                        avg_send_time,
+                        progress_time.as_millis()
                     );
                 }
             }
@@ -1053,20 +1109,29 @@ impl FileTransferManager {
             if is_last { break; }
         }
 
-        let elapsed = start_time.elapsed().as_secs_f64();
-        let final_speed = if elapsed > 0.0 {
-            bytes_sent as f64 / elapsed / (1024.0 * 1024.0)
+        let total_elapsed = overall_start.elapsed();
+        let transfer_elapsed = start_time.elapsed().as_secs_f64();
+        let final_speed = if transfer_elapsed > 0.0 {
+            bytes_sent as f64 / transfer_elapsed / (1024.0 * 1024.0)
         } else {
             0.0
         };
 
-        info!(
-            "✅ FAST_TRANSFER: Completed {} chunks ({:.1} MB) in {:.1}s at {:.1} MB/s",
-            chunk_index,
-            bytes_sent as f64 / (1024.0 * 1024.0),
-            elapsed,
-            final_speed
-        );
+        // COMPREHENSIVE PERFORMANCE SUMMARY
+        info!("✅ PERF_SUMMARY: Transfer {} completed", transfer_id);
+        info!("📊 PERF_TIMING: Total: {:.2}s | Transfer: {:.2}s | Setup: {:.2}ms", 
+              total_elapsed.as_secs_f64(), transfer_elapsed, reader_creation_time.as_millis());
+        info!("📊 PERF_DATA: {} chunks, {:.1} MB at {:.1} MB/s", 
+              chunk_index, bytes_sent as f64 / (1024.0 * 1024.0), final_speed);
+        info!("📊 PERF_BREAKDOWN: READ total: {:.2}s | SEND total: {:.2}s | PROGRESS total: {:.2}s", 
+              total_read_time.as_secs_f64(), total_send_time.as_secs_f64(), total_progress_time.as_secs_f64());
+        
+        if chunk_index > 0 {
+            let avg_read = total_read_time.as_millis() / chunk_index as u128;
+            let avg_send = total_send_time.as_millis() / chunk_index as u128;
+            info!("📊 PERF_AVERAGES: READ {:.2}ms/chunk | SEND {:.2}ms/chunk | THROUGHPUT {:.1} chunks/s", 
+                  avg_read, avg_send, chunk_index as f64 / transfer_elapsed);
+        }
 
         Ok(())
     }
@@ -1201,10 +1266,12 @@ impl FileTransferManager {
         transfer_id: Uuid,
         chunk: TransferChunk,
     ) -> Result<()> {
-        // Only log every 10th chunk to reduce noise, or important chunks
+        let chunk_start = std::time::Instant::now();
+        
+        // PERFORMANCE: Log chunk reception timing
         if chunk.index % 10 == 0 || chunk.is_last || chunk.index < 5 {
             info!(
-                "📥 RECEIVER: Chunk {} for transfer {} ({} bytes, compressed: {}, is_last: {})",
+                "📥 PERF_RECV: Chunk {} for transfer {} ({} bytes, compressed: {}, is_last: {})",
                 chunk.index,
                 transfer_id,
                 chunk.data.len(),
@@ -1233,6 +1300,7 @@ impl FileTransferManager {
         }
 
         let (is_complete, debug_info) = {
+            let validation_start = std::time::Instant::now();
             let transfer = self.active_transfers.get_mut(&transfer_id).unwrap();
 
             if transfer.peer_id != peer_id {
@@ -1263,10 +1331,12 @@ impl FileTransferManager {
 
             // Handle streaming vs non-streaming transfers
             if let Some(ref mut writer) = transfer.streaming_writer {
-                // Streaming mode - write chunk directly to file
+                // PERFORMANCE: Streaming mode write timing
+                let write_start = std::time::Instant::now();
                 writer
                     .write_chunk(chunk.index, chunk.data.clone(), chunk.compressed)
                     .await?;
+                let write_time = write_start.elapsed();
 
                 let (bytes_written, total_bytes) = writer.progress();
                 transfer.bytes_transferred = bytes_written;
@@ -1275,14 +1345,14 @@ impl FileTransferManager {
                 // CRITICAL FIX: Mark chunk as received in chunks_received array for streaming mode
                 transfer.chunks_received[chunk.index as usize] = true;
 
-                // Only log progress every 50 chunks or on completion
-                if transfer.chunks_completed % 50 == 0 || chunk.is_last {
+                // PERFORMANCE: Log write timing for first chunks and periodically
+                if chunk.index < 5 || chunk.index % 10 == 0 || chunk.is_last || write_time.as_millis() > 100 {
                     let progress_pct = bytes_written as f64 / total_bytes as f64 * 100.0;
                     info!(
-                        "📊 TRANSFER_PROGRESS: {:.1}% complete - {}/{} chunks ({:.1}MB/{:.1}MB)",
+                        "📊 PERF_RECV_WRITE: Chunk {} wrote in {:.2}ms - {:.1}% complete ({:.1}MB/{:.1}MB)",
+                        chunk.index,
+                        write_time.as_millis(),
                         progress_pct,
-                        transfer.chunks_completed,
-                        transfer.metadata.total_chunks,
                         bytes_written as f64 / (1024.0 * 1024.0),
                         total_bytes as f64 / (1024.0 * 1024.0)
                     );
@@ -1444,6 +1514,12 @@ impl FileTransferManager {
                 None
             };
             
+            let validation_time = validation_start.elapsed();
+            if chunk.index < 5 || validation_time.as_millis() > 50 { // Log slow validations
+                debug!("📊 PERF_RECV_VALIDATION: Chunk {} validation took {:.2}ms", 
+                       chunk.index, validation_time.as_millis());
+            }
+            
             (is_complete, debug_info)
         };
 
@@ -1465,6 +1541,13 @@ impl FileTransferManager {
                 });
                 let _ = sender.send((peer_id, ack));
             }
+        }
+
+        let total_chunk_time = chunk_start.elapsed();
+        // PERFORMANCE: Log total chunk processing time
+        if chunk.index < 5 || chunk.index % 10 == 0 || chunk.is_last || total_chunk_time.as_millis() > 100 {
+            info!("📊 PERF_RECV_TOTAL: Chunk {} processed in {:.2}ms (receive->validate->write->complete)", 
+                  chunk.index, total_chunk_time.as_millis());
         }
 
         Ok(())

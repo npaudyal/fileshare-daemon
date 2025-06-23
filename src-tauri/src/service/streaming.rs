@@ -117,6 +117,8 @@ impl StreamingFileReader {
     }
 
     pub async fn read_next_chunk(&mut self) -> Result<Option<(Vec<u8>, bool)>> {
+        let chunk_start = std::time::Instant::now();
+        
         if self.bytes_read >= self.total_size {
             return Ok(None);
         }
@@ -125,29 +127,43 @@ impl StreamingFileReader {
         let remaining_bytes = self.total_size - self.bytes_read;
         let chunk_size_to_read = std::cmp::min(self.chunk_size as u64, remaining_bytes) as usize;
         
-        debug!("🔧 READER: Reading chunk with target size {} bytes (remaining: {} bytes)", 
-               chunk_size_to_read, remaining_bytes);
-        
+        // PERFORMANCE: Allocation timing
+        let alloc_start = std::time::Instant::now();
         let mut buffer = vec![0u8; chunk_size_to_read];
+        let alloc_time = alloc_start.elapsed();
+        
+        // PERFORMANCE: File I/O timing
+        let io_start = std::time::Instant::now();
         let mut total_bytes_read = 0;
+        let mut read_operations = 0;
         
         // Keep reading until we fill the entire chunk or reach EOF
         while total_bytes_read < chunk_size_to_read {
+            let read_op_start = std::time::Instant::now();
             let bytes_read = self.file.read(&mut buffer[total_bytes_read..]).await?;
+            let read_op_time = read_op_start.elapsed();
+            read_operations += 1;
+            
             if bytes_read == 0 {
                 // EOF reached
                 break;
             }
             total_bytes_read += bytes_read;
+            
+            if read_operations <= 3 || read_op_time.as_millis() > 10 { // Log slow reads
+                debug!("🔧 PERF_IO: Read op {} took {:.2}ms, got {} bytes", 
+                       read_operations, read_op_time.as_millis(), bytes_read);
+            }
         }
         
-        debug!("🔧 READER: Successfully read {} bytes for chunk (target: {})", 
-               total_bytes_read, chunk_size_to_read);
+        let total_io_time = io_start.elapsed();
         
         if total_bytes_read == 0 {
             return Ok(None);
         }
         
+        // PERFORMANCE: Buffer processing timing
+        let process_start = std::time::Instant::now();
         buffer.truncate(total_bytes_read);
         self.bytes_read += total_bytes_read as u64;
         self.hasher.update(&buffer);
@@ -155,11 +171,32 @@ impl StreamingFileReader {
         let is_last = self.bytes_read >= self.total_size;
         
         // Apply compression if needed
+        let compress_start = std::time::Instant::now();
         let compressed_data = if let Some(compression) = self.compression {
             self.compress_chunk(&buffer, compression)?
         } else {
             buffer
         };
+        let compress_time = compress_start.elapsed();
+        let process_time = process_start.elapsed();
+        
+        let total_chunk_time = chunk_start.elapsed();
+        
+        // Log detailed timing for performance analysis
+        let chunk_num = self.bytes_read / self.chunk_size as u64;
+        if chunk_num < 5 || total_chunk_time.as_millis() > 50 { // Log first 5 chunks or slow chunks
+            info!("🔧 PERF_CHUNK: Chunk {} - TOTAL: {:.2}ms | ALLOC: {:.2}ms | IO: {:.2}ms ({} ops) | PROCESS: {:.2}ms | COMPRESS: {:.2}ms | SIZE: {}->{}",
+                  chunk_num,
+                  total_chunk_time.as_millis(),
+                  alloc_time.as_millis(),
+                  total_io_time.as_millis(),
+                  read_operations,
+                  process_time.as_millis(),
+                  compress_time.as_millis(),
+                  total_bytes_read,
+                  compressed_data.len()
+            );
+        }
         
         Ok(Some((compressed_data, is_last)))
     }
