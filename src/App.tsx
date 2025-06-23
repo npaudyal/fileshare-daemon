@@ -310,14 +310,26 @@ function App() {
         loadInitialData();
     }, [loadDevices, loadSettings, checkConnectionStatus]);
 
-    // Auto-refresh
+    // Auto-refresh and transfer monitoring
     useEffect(() => {
         const interval = setInterval(async () => {
             await loadDevices();
             await checkConnectionStatus();
+            
+            // Auto-show transfer progress if there are active transfers
+            if (!showTransferProgress) {
+                try {
+                    const activeTransfers = await invoke('get_active_transfers');
+                    if (Array.isArray(activeTransfers) && activeTransfers.length > 0) {
+                        setShowTransferProgress(true);
+                    }
+                } catch (error) {
+                    // Silently handle error - transfer service might not be ready
+                }
+            }
         }, 3000);
         return () => clearInterval(interval);
-    }, [loadDevices, checkConnectionStatus]);
+    }, [loadDevices, checkConnectionStatus, showTransferProgress]);
 
     // Load favorites
     useEffect(() => {

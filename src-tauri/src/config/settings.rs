@@ -63,13 +63,13 @@ impl Default for Settings {
                 timeout_seconds: 30,
             },
             transfer: TransferSettings {
-                chunk_size: 1024 * 1024, // 1MB default chunk size
+                chunk_size: 4 * 1024 * 1024, // 4MB default chunk size (OPTIMIZED)
                 max_concurrent_transfers: 5,
                 bandwidth_limit_mbps: None,
                 temp_dir: None,
                 adaptive_chunk_size: true,
                 compression_enabled: false,
-                parallel_chunks: 16, // OPTIMIZED: Increased from 4
+                parallel_chunks: 8, // OPTIMIZED: Increased from 4
                 resume_enabled: true,
             },
             security: SecuritySettings {
@@ -104,10 +104,10 @@ impl Settings {
             ));
         }
 
-        // Validate parallel chunks (1-24)
-        if transfer.parallel_chunks == 0 || transfer.parallel_chunks > 24 {
+        // Validate parallel chunks (1-16)
+        if transfer.parallel_chunks == 0 || transfer.parallel_chunks > 16 {
             return Err(FileshareError::Config(
-                "Parallel chunks must be between 1 and 24".to_string(),
+                "Parallel chunks must be between 1 and 16".to_string(),
             ));
         }
 
