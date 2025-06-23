@@ -141,6 +141,11 @@ impl PeerManager {
         ft.set_message_sender(self.message_tx.clone());
     }
 
+    /// Get peer information by device ID
+    pub fn get_peer(&self, device_id: &uuid::Uuid) -> Option<&Peer> {
+        self.peers.get(device_id)
+    }
+
     pub fn debug_connection_status(&self) {
         info!("=== CONNECTION STATUS DEBUG ===");
         info!("Total discovered peers: {}", self.peers.len());
