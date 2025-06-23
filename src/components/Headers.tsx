@@ -59,17 +59,20 @@ const Header: React.FC<HeaderProps> = ({
                 <div className="flex items-center space-x-3">
                     {onToggleTransferProgress && (
                         <motion.button
-                            whileHover={{ scale: 1.1 }}
-                            whileTap={{ scale: 0.9 }}
+                            whileHover={{ scale: 1.05 }}
+                            whileTap={{ scale: 0.95 }}
                             onClick={onToggleTransferProgress}
-                            className={`p-1 rounded transition-colors ${
+                            className={`px-3 py-1 rounded-md transition-all duration-200 ${
                                 showTransferProgress 
-                                    ? 'text-blue-400 bg-blue-500/20' 
-                                    : 'text-gray-400 hover:text-white hover:bg-white/10'
+                                    ? 'text-blue-300 bg-blue-500/30 border border-blue-400/50' 
+                                    : 'text-gray-400 hover:text-white hover:bg-white/10 border border-white/10'
                             }`}
                             title="Toggle Transfer Progress"
                         >
-                            <Download className="w-4 h-4" />
+                            <div className="flex items-center space-x-1">
+                                <Download className="w-4 h-4" />
+                                <span className="text-xs font-medium">Transfers</span>
+                            </div>
                         </motion.button>
                     )}
                     <motion.button

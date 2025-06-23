@@ -63,13 +63,13 @@ impl Default for Settings {
                 timeout_seconds: 30,
             },
             transfer: TransferSettings {
-                chunk_size: 1024 * 1024, // 1MB default chunk size
+                chunk_size: 8 * 1024 * 1024, // 8MB default chunk size (OPTIMIZED for local networks)
                 max_concurrent_transfers: 5,
                 bandwidth_limit_mbps: None,
                 temp_dir: None,
-                adaptive_chunk_size: true,
-                compression_enabled: false,
-                parallel_chunks: 16, // PERFORMANCE: Increased to 16 for maximum throughput
+                adaptive_chunk_size: false, // Use fixed large chunks for local networks
+                compression_enabled: false, // Disabled for local networks (CPU overhead not worth it)
+                parallel_chunks: 4, // Reduced to prevent overwhelming (OPTIMIZED)
                 resume_enabled: true,
             },
             security: SecuritySettings {
@@ -91,9 +91,9 @@ impl Settings {
                 "Chunk size must be at least 64KB".to_string(),
             ));
         }
-        if transfer.chunk_size > 32 * 1024 * 1024 {
+        if transfer.chunk_size > 16 * 1024 * 1024 {
             return Err(FileshareError::Config(
-                "Chunk size must not exceed 32MB".to_string(),
+                "Chunk size must not exceed 16MB".to_string(),
             ));
         }
 
@@ -104,10 +104,10 @@ impl Settings {
             ));
         }
 
-        // Validate parallel chunks (1-32)
-        if transfer.parallel_chunks == 0 || transfer.parallel_chunks > 32 {
+        // Validate parallel chunks (1-16)
+        if transfer.parallel_chunks == 0 || transfer.parallel_chunks > 16 {
             return Err(FileshareError::Config(
-                "Parallel chunks must be between 1 and 32".to_string(),
+                "Parallel chunks must be between 1 and 16".to_string(),
             ));
         }
 

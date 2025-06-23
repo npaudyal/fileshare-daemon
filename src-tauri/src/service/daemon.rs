@@ -62,7 +62,7 @@ impl FileshareDaemon {
     }
 
     // Enhanced daemon startup with health monitoring
-    pub async fn start_background_services(self: Arc<Self>) -> Result<()> {
+    pub async fn start_background_services(mut self: Arc<Self>) -> Result<()> {
         info!("🚀 Starting Enhanced Fileshare Daemon with health monitoring...");
         info!("📱 Device ID: {}", self.settings.device.id);
         info!("🏷️ Device Name: {}", self.settings.device.name);
@@ -664,7 +664,7 @@ impl FileshareDaemon {
         let message_pm = peer_manager.clone();
         let message_clipboard = clipboard.clone();
         let message_handle = tokio::spawn(async move {
-            let mut interval = tokio::time::interval(Duration::from_millis(1)); // Ultra-fast processing for high throughput
+            let mut interval = tokio::time::interval(Duration::from_millis(50)); // Faster processing
             loop {
                 interval.tick().await;
 

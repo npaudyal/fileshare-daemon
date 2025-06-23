@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::{mpsc, RwLock};
-use tokio::time::timeout;
+use tokio::time::{interval, timeout};
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
@@ -426,6 +426,9 @@ impl PeerManager {
 
         let message_tx = self.message_tx.clone();
         let (conn_tx, mut conn_rx) = mpsc::unbounded_channel::<Message>();
+        
+        // PERFORMANCE: Create dedicated high-capacity channels for file data
+        let (file_data_tx, mut file_data_rx) = mpsc::channel::<Message>(1000); // Large buffer for file chunks
 
         // Store the connection sender so we can send messages to this peer
         self.connections.insert(peer_id, conn_tx);
@@ -433,37 +436,71 @@ impl PeerManager {
         // Split the connection into read and write halves
         let (mut read_half, mut write_half) = connection.split();
 
+        // Clone file_transfer reference for loopback checking
+        let file_transfer_ref = self.file_transfer.clone();
+
         // Spawn task to handle reading messages FROM the peer
         let read_message_tx = message_tx.clone();
         let read_peer_id = peer_id;
+        let file_data_tx_clone = file_data_tx.clone();
         let read_task = tokio::spawn(async move {
             loop {
                 match read_half.read_message().await {
                     Ok(message) => {
-                        // Only log important messages, not chunks or frequent messages
-                        match &message.message_type {
-                            MessageType::Ping | MessageType::Pong => {
-                                debug!("📥 READ {} from {}", 
-                                       if matches!(message.message_type, MessageType::Ping) { "ping" } else { "pong" },
-                                       read_peer_id);
-                            }
-                            MessageType::FileChunk { transfer_id, chunk } => {
-                                // Only log every 10th chunk to reduce noise
-                                if chunk.index % 10 == 0 || chunk.is_last {
-                                    info!("📥 READ chunk {} for transfer {} ({}B, last: {})",
-                                          chunk.index, transfer_id, chunk.data.len(), chunk.is_last);
+                        // CRITICAL FIX: Filter out loopback messages
+                        let should_process = match &message.message_type {
+                            MessageType::FileChunk { transfer_id, .. } |
+                            MessageType::FileChunkBatch { transfer_id, .. } => {
+                                // Check if this is an outgoing transfer from our perspective
+                                let ft = file_transfer_ref.read().await;
+                                if let Some(transfer) = ft.active_transfers.get(transfer_id) {
+                                    // Only process chunks for INCOMING transfers
+                                    matches!(transfer.direction, crate::service::file_transfer::TransferDirection::Incoming)
+                                } else {
+                                    // Transfer not found, process anyway (might be new)
+                                    true
                                 }
                             }
-                            _ => {
-                                info!("📥 READ from peer {}: {:?}", read_peer_id, message.message_type);
-                            }
+                            _ => true, // Process all other messages normally
+                        };
+
+                        if !should_process {
+                            debug!("🚫 LOOPBACK_FILTER: Ignoring outgoing transfer chunk from peer {}", read_peer_id);
+                            continue;
                         }
-                        if let Err(e) = read_message_tx.send((read_peer_id, message)) {
-                            error!(
-                                "Failed to forward message from peer {}: {}",
-                                read_peer_id, e
-                            );
-                            break;
+
+                        // PERFORMANCE: Route file data to dedicated high-speed channel
+                        let use_fast_channel = matches!(&message.message_type, 
+                            MessageType::FileChunk { .. } | MessageType::FileChunkBatch { .. }
+                        );
+
+                        if use_fast_channel {
+                            // Send file data through dedicated channel - bypasses main message loop
+                            if let Err(e) = file_data_tx_clone.send(message).await {
+                                error!("Failed to send file data to fast channel: {}", e);
+                                break;
+                            }
+                        } else {
+                            // Minimal logging for performance - only for control messages
+                            match &message.message_type {
+                                MessageType::Ping | MessageType::Pong => {
+                                    debug!("📥 READ {} from {}", 
+                                           if matches!(message.message_type, MessageType::Ping) { "ping" } else { "pong" },
+                                           read_peer_id);
+                                }
+                                _ => {
+                                    debug!("📥 READ from peer {}: {:?}", read_peer_id, message.message_type);
+                                }
+                            }
+                            
+                            // Send control messages through normal channel
+                            if let Err(e) = read_message_tx.send((read_peer_id, message)) {
+                                error!(
+                                    "Failed to forward control message from peer {}: {}",
+                                    read_peer_id, e
+                                );
+                                break;
+                            }
                         }
                     }
                     Err(e) => {
@@ -475,65 +512,66 @@ impl PeerManager {
             info!("Read task ended for peer {}", read_peer_id);
         });
 
+        // PERFORMANCE: Spawn dedicated task for high-speed file data processing
+        let file_transfer_ref_fast = self.file_transfer.clone();
+        let fast_data_peer_id = peer_id;
+        let fast_data_task = tokio::spawn(async move {
+            while let Some(message) = file_data_rx.recv().await {
+                // Process file data directly without going through main message loop
+                match message.message_type {
+                    MessageType::FileChunk { transfer_id, chunk } => {
+                        let mut ft = file_transfer_ref_fast.write().await;
+                        if let Err(e) = ft.handle_file_chunk(fast_data_peer_id, transfer_id, chunk).await {
+                            error!("Fast channel: Failed to handle file chunk: {}", e);
+                        }
+                    }
+                    MessageType::FileChunkBatch { transfer_id, chunks } => {
+                        let mut ft = file_transfer_ref_fast.write().await;
+                        for chunk in chunks {
+                            if let Err(e) = ft.handle_file_chunk(fast_data_peer_id, transfer_id, chunk).await {
+                                error!("Fast channel: Failed to handle batch chunk: {}", e);
+                                break;
+                            }
+                        }
+                    }
+                    _ => {
+                        // This shouldn't happen, but log if it does
+                        warn!("Unexpected message type in fast data channel: {:?}", message.message_type);
+                    }
+                }
+            }
+            debug!("Fast data task ended for peer {}", fast_data_peer_id);
+        });
+
         // Spawn task to handle writing messages TO the peer
         let write_peer_id = peer_id;
         let write_task = tokio::spawn(async move {
-            let mut chunk_count = 0u64;
-            let mut total_write_time = std::time::Duration::ZERO;
-            let mut total_bytes_written = 0u64;
-            
             while let Some(message) = conn_rx.recv().await {
-                let write_start = std::time::Instant::now();
-                
-                // PERFORMANCE: Track message types and timing
+                // Minimal logging for performance
                 match &message.message_type {
                     MessageType::Ping | MessageType::Pong => {
-                        debug!("📤 PERF_WRITE: {} to {} starting", 
+                        debug!("📤 WRITE {} to {}", 
                                if matches!(message.message_type, MessageType::Ping) { "ping" } else { "pong" },
                                write_peer_id);
                     }
                     MessageType::FileChunk { transfer_id, chunk } => {
-                        chunk_count += 1;
-                        total_bytes_written += chunk.data.len() as u64;
-                        
-                        // Log performance for first chunks and every 10th chunk
-                        if chunk.index < 5 || chunk.index % 10 == 0 || chunk.is_last {
-                            info!("📤 PERF_WRITE: Starting chunk {} for transfer {} ({}B, last: {})",
+                        // Drastically reduced logging - only first chunk and every 100th
+                        if chunk.index == 0 || chunk.index % 100 == 0 || chunk.is_last {
+                            debug!("📤 WRITE chunk {} for transfer {} ({}B, last: {})",
                                   chunk.index, transfer_id, chunk.data.len(), chunk.is_last);
                         }
                     }
+                    MessageType::FileChunkBatch { transfer_id, chunks } => {
+                        debug!("📤 WRITE batch of {} chunks for transfer {}", chunks.len(), transfer_id);
+                    }
                     _ => {
-                        debug!("📤 PERF_WRITE: {} to {} starting", 
-                               format!("{:?}", message.message_type), write_peer_id);
+                        info!("📤 WRITE to peer {}: {:?}", write_peer_id, message.message_type);
                     }
                 }
 
                 if let Err(e) = write_half.write_message(&message).await {
-                    error!("❌ PERF_WRITE_ERROR: Failed to write to peer {}: {}", write_peer_id, e);
+                    error!("Failed to write message to peer {}: {}", write_peer_id, e);
                     break;
-                }
-                
-                let write_time = write_start.elapsed();
-                total_write_time += write_time;
-                
-                // PERFORMANCE: Log timing for file chunks
-                match &message.message_type {
-                    MessageType::FileChunk { transfer_id, chunk } => {
-                        if chunk.index < 5 || chunk.index % 10 == 0 || chunk.is_last || write_time.as_millis() > 10 {
-                            let avg_write_time = if chunk_count > 0 { total_write_time.as_millis() / chunk_count as u128 } else { 0 };
-                            let throughput_mbps = if total_write_time.as_secs_f64() > 0.0 {
-                                total_bytes_written as f64 / total_write_time.as_secs_f64() / (1024.0 * 1024.0)
-                            } else { 0.0 };
-                            
-                            info!("📤 PERF_WRITE: Chunk {} wrote in {:.2}ms | avg: {:.2}ms | throughput: {:.1} MB/s | total: {} chunks",
-                                  chunk.index, write_time.as_millis(), avg_write_time, throughput_mbps, chunk_count);
-                        }
-                    }
-                    _ => {
-                        if write_time.as_millis() > 1 { // Log slow non-chunk writes
-                            debug!("📤 PERF_WRITE: Non-chunk message wrote in {:.2}ms", write_time.as_millis());
-                        }
-                    }
                 }
             }
             info!("Write task ended for peer {}", write_peer_id);
@@ -541,7 +579,7 @@ impl PeerManager {
 
         // Clean up when connection ends
         let cleanup_peer_id = peer_id;
-        let _connections_cleanup = self.connections.clone();
+        let connections_cleanup = self.connections.clone();
         tokio::spawn(async move {
             tokio::select! {
                 _ = read_task => {
@@ -549,6 +587,9 @@ impl PeerManager {
                 },
                 _ = write_task => {
                     info!("Write task completed for peer {}", cleanup_peer_id);
+                },
+                _ = fast_data_task => {
+                    info!("Fast data task completed for peer {}", cleanup_peer_id);
                 },
             }
             info!("Connection handler for peer {} ended", cleanup_peer_id);
@@ -946,9 +987,14 @@ impl PeerManager {
                     .await?;
             }
 
-            MessageType::FileChunk { transfer_id, chunk } => {
-                let mut ft = self.file_transfer.write().await;
-                ft.handle_file_chunk(peer_id, transfer_id, chunk).await?;
+            MessageType::FileChunk { .. } => {
+                // PERFORMANCE: File chunks are now handled by dedicated fast channel
+                debug!("File chunk received in main channel - should use fast channel");
+            }
+
+            MessageType::FileChunkBatch { .. } => {
+                // PERFORMANCE: File chunk batches are now handled by dedicated fast channel
+                debug!("File chunk batch received in main channel - should use fast channel");
             }
 
             MessageType::TransferComplete {
@@ -1041,14 +1087,7 @@ impl PeerManager {
                 // TODO: Implement pause functionality
             }
 
-            // OPTIMIZATION: Handle batched file chunks
-            MessageType::FileChunkBatch { transfer_id, chunks } => {
-                debug!("📦 Received batch of {} chunks for transfer {}", chunks.len(), transfer_id);
-                let mut ft = self.file_transfer.write().await;
-                for chunk in chunks {
-                    ft.handle_file_chunk(peer_id, transfer_id, chunk).await?;
-                }
-            }
+            // PERFORMANCE: Batched file chunks are now handled by dedicated fast channel above
 
             _ => {
                 debug!(
@@ -1162,7 +1201,7 @@ impl PeerConnection {
         Self { stream }
     }
     
-    // OPTIMIZATION: TCP performance tuning with smart flushing for file transfers
+    // OPTIMIZATION: TCP performance tuning for high-speed transfers
     fn optimize_tcp_connection(stream: &TcpStream) -> Result<()> {
         use socket2::Socket;
         
@@ -1172,12 +1211,21 @@ impl PeerConnection {
             // Get the raw socket
             let socket = unsafe { Socket::from_raw_fd(stream.as_raw_fd()) };
             
-            // Increase TCP buffer sizes for better throughput
-            let _ = socket.set_recv_buffer_size(16 * 1024 * 1024); // 16MB receive buffer for maximum throughput
-            let _ = socket.set_send_buffer_size(16 * 1024 * 1024); // 16MB send buffer for maximum throughput
+            // Significantly increase TCP buffer sizes for high-speed transfers
+            // 16MB buffers for optimal throughput on local networks
+            let recv_buffer_size = 16 * 1024 * 1024; // 16MB receive buffer
+            let send_buffer_size = 16 * 1024 * 1024; // 16MB send buffer
             
-            // Disable Nagle algorithm for lower latency
-            let _ = socket.set_nodelay(true);
+            if let Err(e) = socket.set_recv_buffer_size(recv_buffer_size) {
+                warn!("Failed to set recv buffer size: {}", e);
+            }
+            if let Err(e) = socket.set_send_buffer_size(send_buffer_size) {
+                warn!("Failed to set send buffer size: {}", e);
+            }
+            
+            // For bulk transfers, we want Nagle's algorithm enabled
+            // This allows TCP to batch small writes together
+            let _ = socket.set_nodelay(false);
             
             // Enable TCP keep-alive
             let _ = socket.set_keepalive(true);
@@ -1192,12 +1240,21 @@ impl PeerConnection {
             // Get the raw socket
             let socket = unsafe { Socket::from_raw_socket(stream.as_raw_socket()) };
             
-            // Increase TCP buffer sizes for better throughput
-            let _ = socket.set_recv_buffer_size(16 * 1024 * 1024); // 16MB receive buffer for maximum throughput
-            let _ = socket.set_send_buffer_size(16 * 1024 * 1024); // 16MB send buffer for maximum throughput
+            // Significantly increase TCP buffer sizes for high-speed transfers
+            // 16MB buffers for optimal throughput on local networks
+            let recv_buffer_size = 16 * 1024 * 1024; // 16MB receive buffer
+            let send_buffer_size = 16 * 1024 * 1024; // 16MB send buffer
             
-            // Disable Nagle algorithm for lower latency
-            let _ = socket.set_nodelay(true);
+            if let Err(e) = socket.set_recv_buffer_size(recv_buffer_size) {
+                warn!("Failed to set recv buffer size: {}", e);
+            }
+            if let Err(e) = socket.set_send_buffer_size(send_buffer_size) {
+                warn!("Failed to set send buffer size: {}", e);
+            }
+            
+            // For bulk transfers, we want Nagle's algorithm enabled
+            // This allows TCP to batch small writes together
+            let _ = socket.set_nodelay(false);
             
             // Enable TCP keep-alive
             let _ = socket.set_keepalive(true);
@@ -1206,7 +1263,7 @@ impl PeerConnection {
             std::mem::forget(socket);
         }
         
-        info!("✅ TCP optimizations applied: 16MB buffers, nodelay enabled");
+        info!("✅ TCP optimizations applied: 16MB buffers, Nagle enabled for batching");
         Ok(())
     }
 
@@ -1219,80 +1276,27 @@ impl PeerConnection {
     }
 
     async fn write_message(&mut self, message: &Message) -> Result<()> {
-        let write_start = std::time::Instant::now();
-        
-        // PERFORMANCE: Serialize timing
-        let serialize_start = std::time::Instant::now();
+        // Serialize the message
         let message_data = bincode::serialize(message)?;
-        let serialize_time = serialize_start.elapsed();
         let message_len = message_data.len() as u32;
 
-        // PERFORMANCE: TCP write timing
-        let tcp_start = std::time::Instant::now();
-        self.stream.write_all(&message_len.to_be_bytes()).await?;
-        self.stream.write_all(&message_data).await?;
-        let write_time = tcp_start.elapsed();
+        // For better performance, combine length and data into a single buffer
+        // This reduces the number of system calls and improves batching
+        let mut combined_buffer = Vec::with_capacity(4 + message_data.len());
+        combined_buffer.extend_from_slice(&message_len.to_be_bytes());
+        combined_buffer.extend_from_slice(&message_data);
+
+        // Write everything in one go
+        self.stream.write_all(&combined_buffer).await?;
         
-        // PERFORMANCE FIX: Only flush for non-chunk messages or last chunk to maximize throughput
-        let (should_flush, flush_time) = match &message.message_type {
-            MessageType::FileChunk { chunk, .. } => {
-                // Only flush the last chunk to maximize throughput
-                if chunk.is_last {
-                    let flush_start = std::time::Instant::now();
-                    self.stream.flush().await?;
-                    (true, flush_start.elapsed())
-                } else {
-                    // Let TCP buffer accumulate chunks for better performance
-                    (false, std::time::Duration::from_millis(0))
-                }
-            }
-            MessageType::FileChunkBatch { chunks, .. } => {
-                // Check if any chunk in the batch is the last chunk
-                let has_last_chunk = chunks.iter().any(|c| c.is_last);
-                if has_last_chunk {
-                    let flush_start = std::time::Instant::now();
-                    self.stream.flush().await?;
-                    (true, flush_start.elapsed())
-                } else {
-                    // Let TCP buffer accumulate chunk batches for better performance
-                    (false, std::time::Duration::from_millis(0))
-                }
+        // Only flush for important messages, not for bulk data chunks
+        match message {
+            Message { message_type: MessageType::FileChunk { .. }, .. } => {
+                // Don't flush for file chunks - let TCP batch them
             }
             _ => {
-                // Always flush non-chunk messages for responsiveness
-                let flush_start = std::time::Instant::now();
+                // Flush for control messages
                 self.stream.flush().await?;
-                (true, flush_start.elapsed())
-            }
-        };
-        
-        let total_time = write_start.elapsed();
-        
-        // Log performance for file chunks and batches
-        match &message.message_type {
-            MessageType::FileChunk { chunk, .. } => {
-                if chunk.index < 5 || chunk.index % 20 == 0 || chunk.is_last || total_time.as_millis() > 20 {
-                    info!("🌐 PERF_TCP: Chunk {} - SERIALIZE: {:.2}ms | WRITE: {:.2}ms | FLUSH: {:.2}ms ({}) | TOTAL: {:.2}ms | SIZE: {}B",
-                          chunk.index, serialize_time.as_millis(), write_time.as_millis(), 
-                          flush_time.as_millis(), if should_flush { "YES" } else { "NO" }, 
-                          total_time.as_millis(), message_data.len());
-                }
-            }
-            MessageType::FileChunkBatch { chunks, .. } => {
-                let first_chunk = chunks.first().unwrap().index;
-                let last_chunk = chunks.last().unwrap().index;
-                let has_last = chunks.iter().any(|c| c.is_last);
-                
-                info!("🌐 PERF_TCP: Batch {}-{} ({}x) - SERIALIZE: {:.2}ms | WRITE: {:.2}ms | FLUSH: {:.2}ms ({}) | TOTAL: {:.2}ms | SIZE: {}B",
-                      first_chunk, last_chunk, chunks.len(),
-                      serialize_time.as_millis(), write_time.as_millis(), 
-                      flush_time.as_millis(), if should_flush { "YES" } else { "NO" }, 
-                      total_time.as_millis(), message_data.len());
-            }
-            _ => {
-                if total_time.as_millis() > 5 {
-                    debug!("🌐 PERF_TCP: Non-chunk message took {:.2}ms", total_time.as_millis());
-                }
             }
         }
 
@@ -1348,83 +1352,78 @@ impl PeerConnectionReadHalf {
 
 impl PeerConnectionWriteHalf {
     async fn write_message(&mut self, message: &Message) -> Result<()> {
-        let write_start = std::time::Instant::now();
-        
-        // PERFORMANCE: Serialize timing
-        let serialize_start = std::time::Instant::now();
+        // Serialize the message
         let message_data = bincode::serialize(message)?;
-        let serialize_time = serialize_start.elapsed();
         let message_len = message_data.len() as u32;
 
-        // PERFORMANCE: TCP write timing
-        let tcp_start = std::time::Instant::now();
-        self.stream.write_all(&message_len.to_be_bytes()).await?;
-        self.stream.write_all(&message_data).await?;
-        let write_time = tcp_start.elapsed();
+        // For better performance, combine length and data into a single buffer
+        // This reduces the number of system calls and improves batching
+        let mut combined_buffer = Vec::with_capacity(4 + message_data.len());
+        combined_buffer.extend_from_slice(&message_len.to_be_bytes());
+        combined_buffer.extend_from_slice(&message_data);
+
+        // Write everything in one go
+        self.stream.write_all(&combined_buffer).await?;
         
-        // PERFORMANCE FIX: Only flush for non-chunk messages or last chunk to maximize throughput
-        let (should_flush, flush_time) = match &message.message_type {
-            MessageType::FileChunk { chunk, .. } => {
-                // Only flush the last chunk to maximize throughput
-                if chunk.is_last {
-                    let flush_start = std::time::Instant::now();
-                    self.stream.flush().await?;
-                    (true, flush_start.elapsed())
-                } else {
-                    // Let TCP buffer accumulate chunks for better performance
-                    (false, std::time::Duration::from_millis(0))
-                }
-            }
-            MessageType::FileChunkBatch { chunks, .. } => {
-                // Check if any chunk in the batch is the last chunk
-                let has_last_chunk = chunks.iter().any(|c| c.is_last);
-                if has_last_chunk {
-                    let flush_start = std::time::Instant::now();
-                    self.stream.flush().await?;
-                    (true, flush_start.elapsed())
-                } else {
-                    // Let TCP buffer accumulate chunk batches for better performance
-                    (false, std::time::Duration::from_millis(0))
-                }
+        // Only flush for important messages, not for bulk data chunks
+        match message {
+            Message { message_type: MessageType::FileChunk { .. }, .. } => {
+                // Don't flush for file chunks - let TCP batch them
             }
             _ => {
-                // Always flush non-chunk messages for responsiveness
-                let flush_start = std::time::Instant::now();
+                // Flush for control messages
                 self.stream.flush().await?;
-                (true, flush_start.elapsed())
-            }
-        };
-        
-        let total_time = write_start.elapsed();
-        
-        // Log performance for file chunks and batches
-        match &message.message_type {
-            MessageType::FileChunk { chunk, .. } => {
-                if chunk.index < 5 || chunk.index % 20 == 0 || chunk.is_last || total_time.as_millis() > 20 {
-                    info!("🌐 PERF_TCP: Chunk {} - SERIALIZE: {:.2}ms | WRITE: {:.2}ms | FLUSH: {:.2}ms ({}) | TOTAL: {:.2}ms | SIZE: {}B",
-                          chunk.index, serialize_time.as_millis(), write_time.as_millis(), 
-                          flush_time.as_millis(), if should_flush { "YES" } else { "NO" }, 
-                          total_time.as_millis(), message_data.len());
-                }
-            }
-            MessageType::FileChunkBatch { chunks, .. } => {
-                let first_chunk = chunks.first().unwrap().index;
-                let last_chunk = chunks.last().unwrap().index;
-                let has_last = chunks.iter().any(|c| c.is_last);
-                
-                info!("🌐 PERF_TCP: Batch {}-{} ({}x) - SERIALIZE: {:.2}ms | WRITE: {:.2}ms | FLUSH: {:.2}ms ({}) | TOTAL: {:.2}ms | SIZE: {}B",
-                      first_chunk, last_chunk, chunks.len(),
-                      serialize_time.as_millis(), write_time.as_millis(), 
-                      flush_time.as_millis(), if should_flush { "YES" } else { "NO" }, 
-                      total_time.as_millis(), message_data.len());
-            }
-            _ => {
-                if total_time.as_millis() > 5 {
-                    debug!("🌐 PERF_TCP: Non-chunk message took {:.2}ms", total_time.as_millis());
-                }
             }
         }
 
+        Ok(())
+    }
+    
+    // OPTIMIZATION: Vectored I/O for batch writing multiple messages
+    pub async fn write_messages_vectored(&mut self, messages: &[Message]) -> Result<()> {
+        use tokio::io::AsyncWriteExt;
+        
+        if messages.is_empty() {
+            return Ok(());
+        }
+        
+        // PERFORMANCE: Use larger buffer size to better utilize 16MB TCP buffers
+        let target_buffer_size = 1024 * 1024; // 1MB buffer for better TCP utilization
+        let mut combined_buffer = Vec::with_capacity(target_buffer_size);
+        let mut message_count = 0;
+        
+        for message in messages {
+            let message_data = bincode::serialize(message)?;
+            let message_len = message_data.len() as u32;
+            
+            // Check if adding this message would exceed our target buffer
+            if combined_buffer.len() + 4 + message_data.len() > target_buffer_size && !combined_buffer.is_empty() {
+                // Write current buffer and start new one
+                self.stream.write_all(&combined_buffer).await?;
+                combined_buffer.clear();
+                message_count = 0;
+            }
+            
+            // Add message to buffer
+            combined_buffer.extend_from_slice(&message_len.to_be_bytes());
+            combined_buffer.extend_from_slice(&message_data);
+            message_count += 1;
+        }
+        
+        // Write any remaining data
+        if !combined_buffer.is_empty() {
+            self.stream.write_all(&combined_buffer).await?;
+        }
+        
+        // Only flush for control messages, not file chunks
+        let has_control_messages = messages.iter().any(|msg| {
+            !matches!(msg.message_type, MessageType::FileChunk { .. } | MessageType::FileChunkBatch { .. })
+        });
+        
+        if has_control_messages {
+            self.stream.flush().await?;
+        }
+        
         Ok(())
     }
 }
