@@ -261,6 +261,12 @@ impl StreamingFileWriter {
             self.write_data(&decompressed_data).await?;
             self.next_write_index += 1;
             
+            // CRITICAL FIX: Flush critical early chunks to disk immediately
+            if index < 10 {
+                debug!("💾 EARLY_FLUSH: Flushing early chunk {} to disk", index);
+                self.file.flush().await?;
+            }
+            
             if index < 5 {
                 debug!("🔄 DIRECT_WRITE: After writing chunk {}, next_write_index is now {}", index, self.next_write_index);
             }
@@ -309,6 +315,12 @@ impl StreamingFileWriter {
             self.next_write_index += 1;
             consecutive_flushes += 1;
             
+            // CRITICAL FIX: Flush every 5 consecutive chunks to ensure data persistence
+            if consecutive_flushes % 5 == 0 {
+                debug!("💾 BATCH_FLUSH: Flushing after {} consecutive chunks", consecutive_flushes);
+                self.file.flush().await?;
+            }
+            
             // Debug: Show remaining chunks in HashMap for critical chunks
             if chunk_index < 5 || chunk_index >= 25 {
                 let remaining_chunks: Vec<u64> = self.chunks_buffer.keys().cloned().collect();
@@ -332,6 +344,14 @@ impl StreamingFileWriter {
         self.file.write_all(data).await?;
         self.hasher.update(data);
         self.bytes_written += data.len() as u64;
+        
+        // CRITICAL FIX: Flush data to disk periodically to prevent data loss
+        // Flush every 8MB of written data for optimal performance vs safety balance
+        if self.bytes_written % (8 * 1024 * 1024) == 0 {
+            debug!("💾 FLUSH: Periodic flush at {} bytes written", self.bytes_written);
+            self.file.flush().await?;
+        }
+        
         Ok(())
     }
     
@@ -374,15 +394,24 @@ impl StreamingFileWriter {
                 let stored_chunks: Vec<u64> = self.chunks_buffer.keys().cloned().collect();
                 warn!("🔧 FINALIZE: Chunks still in HashMap: {:?}", stored_chunks);
                 
+                // CRITICAL FIX: Flush buffer before seeking to ensure proper file state
+                self.file.flush().await?;
+                
                 // Check if any missing chunks are in the HashMap and write them directly
                 for missing_idx in &missing_chunks {
                     if let Some(data) = self.chunks_buffer.remove(missing_idx) {
                         warn!("🔧 FINALIZE: Found missing chunk {} in HashMap, writing directly", missing_idx);
-                        // Write it directly at the correct file position
+                        // CRITICAL FIX: Get inner file handle and seek on it directly
                         use tokio::io::AsyncSeekExt;
                         let file_position = *missing_idx * self.chunk_size as u64;
-                        self.file.seek(std::io::SeekFrom::Start(file_position)).await?;
-                        self.file.write_all(&data).await?;
+                        
+                        // Flush buffer first, then get inner file for seeking
+                        self.file.flush().await?;
+                        let inner_file = self.file.get_mut();
+                        inner_file.seek(std::io::SeekFrom::Start(file_position)).await?;
+                        inner_file.write_all(&data).await?;
+                        inner_file.flush().await?;
+                        
                         self.hasher.update(&data);
                         self.bytes_written += data.len() as u64;
                         info!("✅ FINALIZE: Successfully wrote missing chunk {} at file position {}", 
@@ -406,8 +435,14 @@ impl StreamingFileWriter {
                 warn!("🔧 FINALIZE: Writing orphaned chunk {} directly", chunk_index);
                 use tokio::io::AsyncSeekExt;
                 let file_position = chunk_index * self.chunk_size as u64;
-                self.file.seek(std::io::SeekFrom::Start(file_position)).await?;
-                self.file.write_all(&data).await?;
+                
+                // CRITICAL FIX: Flush buffer first, then get inner file for seeking
+                self.file.flush().await?;
+                let inner_file = self.file.get_mut();
+                inner_file.seek(std::io::SeekFrom::Start(file_position)).await?;
+                inner_file.write_all(&data).await?;
+                inner_file.flush().await?;
+                
                 self.hasher.update(&data);
                 self.bytes_written += data.len() as u64;
             }
