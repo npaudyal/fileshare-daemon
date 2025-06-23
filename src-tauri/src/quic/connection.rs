@@ -162,16 +162,28 @@ impl QuicConnectionManager {
         message_tx: mpsc::UnboundedSender<(Uuid, QuicMessage)>,
         is_incoming: bool,
     ) -> Result<()> {
-        // Open control stream
+        // Open control stream with timeout
         let (control_send, control_recv) = if is_incoming {
-            // Wait for incoming control stream
-            let (send, recv) = connection.accept_bi().await
+            // Wait for incoming control stream with timeout
+            info!("📥 Waiting for incoming control stream from peer...");
+            let (send, recv) = tokio::time::timeout(
+                Duration::from_secs(30), // 30 second timeout
+                connection.accept_bi()
+            ).await
+                .map_err(|_| crate::FileshareError::Transfer("Accept bi stream timeout".to_string()))?
                 .map_err(|e| crate::FileshareError::Transfer(format!("Accept bi stream error: {}", e)))?;
+            info!("✅ Incoming control stream established");
             (Some(send), Some(recv))
         } else {
-            // Open outgoing control stream
-            let (send, recv) = connection.open_bi().await
+            // Open outgoing control stream with timeout
+            info!("📤 Opening outgoing control stream to peer...");
+            let (send, recv) = tokio::time::timeout(
+                Duration::from_secs(30), // 30 second timeout
+                connection.open_bi()
+            ).await
+                .map_err(|_| crate::FileshareError::Transfer("Open bi stream timeout".to_string()))?
                 .map_err(|e| crate::FileshareError::Transfer(format!("Open bi stream error: {}", e)))?;
+            info!("✅ Outgoing control stream established");
             (Some(send), Some(recv))
         };
 
@@ -389,7 +401,7 @@ fn configure_server((cert, key): (Certificate, PrivateKey)) -> Result<ServerConf
     let mut server_config = ServerConfig::with_single_cert(cert_chain, key)
         .map_err(|e| crate::FileshareError::Transfer(format!("TLS config error: {}", e)))?;
 
-    // Configure transport for high throughput
+    // Configure transport for high throughput with generous timeouts
     server_config.transport_config(Arc::new({
         let mut transport = quinn::TransportConfig::default();
         transport.max_concurrent_uni_streams(256_u32.into());
@@ -398,6 +410,11 @@ fn configure_server((cert, key): (Certificate, PrivateKey)) -> Result<ServerConf
         transport.receive_window(VarInt::from_u32(8 * 1024 * 1024)); // 8MB receive window
         transport.stream_receive_window(VarInt::from_u32(2 * 1024 * 1024)); // 2MB per stream
         transport.datagram_receive_buffer_size(Some(16 * 1024 * 1024)); // 16MB datagram buffer
+        
+        // Set generous timeouts for file transfers
+        transport.max_idle_timeout(Some(Duration::from_secs(300).try_into().unwrap())); // 5 minutes
+        transport.keep_alive_interval(Some(Duration::from_secs(30))); // Keep alive every 30s
+        
         transport
     }));
 
@@ -412,7 +429,7 @@ fn configure_client() -> Result<ClientConfig> {
 
     let mut client_config = ClientConfig::new(Arc::new(crypto));
 
-    // Configure transport for high throughput
+    // Configure transport for high throughput with generous timeouts
     client_config.transport_config(Arc::new({
         let mut transport = quinn::TransportConfig::default();
         transport.max_concurrent_uni_streams(256_u32.into());
@@ -421,6 +438,11 @@ fn configure_client() -> Result<ClientConfig> {
         transport.receive_window(VarInt::from_u32(8 * 1024 * 1024)); // 8MB receive window
         transport.stream_receive_window(VarInt::from_u32(2 * 1024 * 1024)); // 2MB per stream
         transport.datagram_receive_buffer_size(Some(16 * 1024 * 1024)); // 16MB datagram buffer
+        
+        // Set generous timeouts for file transfers
+        transport.max_idle_timeout(Some(Duration::from_secs(300).try_into().unwrap())); // 5 minutes
+        transport.keep_alive_interval(Some(Duration::from_secs(30))); // Keep alive every 30s
+        
         transport
     }));
 

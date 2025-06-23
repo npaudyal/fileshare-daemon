@@ -76,6 +76,11 @@ pub enum QuicMessage {
     },
 
     // File transfer initiation
+    FileRequest {
+        request_id: Uuid,
+        file_path: String,
+        target_path: String,
+    },
     FileOffer {
         transfer_id: Uuid,
         metadata: QuicFileMetadata,

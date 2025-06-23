@@ -482,19 +482,38 @@ impl FileshareDaemon {
             }
 
             let send_result = if use_quic {
-                // For QUIC transfers, we still need to send the request via TCP control channel
-                // but the actual file transfer will use QUIC
-                let request_id = uuid::Uuid::new_v4();
-                let message = crate::network::protocol::Message::new(
-                    crate::network::protocol::MessageType::FileRequest {
-                        request_id,
-                        file_path: source_file_path,
-                        target_path: target_path.to_string_lossy().to_string(),
-                    },
-                );
+                // Use QUIC for high-speed file transfer
+                info!("🚀 Initiating QUIC file transfer for high-speed delivery");
                 
-                let mut pm = peer_manager.write().await;
-                pm.send_message_to_peer(source_device, message).await
+                if let Some(ref quic) = quic_integration {
+                    match quic.request_file(
+                        source_device,
+                        source_file_path.clone(),
+                        target_path.to_string_lossy().to_string(),
+                    ).await {
+                        Ok(request_id) => {
+                            info!("✅ QUIC file request sent with ID: {}", request_id);
+                            Ok(())
+                        }
+                        Err(e) => {
+                            warn!("⚠️ QUIC file transfer failed: {}, falling back to TCP", e);
+                            // Fall back to TCP
+                            let request_id = uuid::Uuid::new_v4();
+                            let message = crate::network::protocol::Message::new(
+                                crate::network::protocol::MessageType::FileRequest {
+                                    request_id,
+                                    file_path: source_file_path,
+                                    target_path: target_path.to_string_lossy().to_string(),
+                                },
+                            );
+                            
+                            let mut pm = peer_manager.write().await;
+                            pm.send_message_to_peer(source_device, message).await
+                        }
+                    }
+                } else {
+                    return Err(crate::FileshareError::Config("QUIC integration not available".to_string()));
+                }
             } else {
                 // Standard TCP file transfer
                 let request_id = uuid::Uuid::new_v4();

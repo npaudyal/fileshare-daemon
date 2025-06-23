@@ -80,6 +80,26 @@ impl QuicIntegration {
     }
     
     /// Send a file to a peer
+    /// Request a file from a peer via QUIC
+    pub async fn request_file(
+        &self,
+        peer_id: Uuid,
+        file_path: String,
+        target_path: String,
+    ) -> Result<Uuid> {
+        let request_id = Uuid::new_v4();
+        let message = QuicMessage::FileRequest {
+            request_id,
+            file_path,
+            target_path,
+        };
+        
+        self.connection_manager.send_message(peer_id, message).await?;
+        info!("📤 Sent QUIC file request {} to peer {}", request_id, peer_id);
+        Ok(request_id)
+    }
+
+    /// Send a file to a peer via QUIC (for senders)
     pub async fn send_file(
         &self,
         peer_id: Uuid,
@@ -154,6 +174,10 @@ impl QuicMessageProcessor {
                 self.handle_handshake(peer_id, device_id, device_name, version, capabilities).await
             }
             
+            QuicMessage::FileRequest { request_id, file_path, target_path } => {
+                self.handle_file_request(peer_id, request_id, file_path, target_path).await
+            }
+            
             QuicMessage::FileOffer { transfer_id, metadata, stream_count } => {
                 self.handle_file_offer(peer_id, transfer_id, metadata, stream_count).await
             }
@@ -206,6 +230,36 @@ impl QuicMessageProcessor {
         
         info!("✅ Handshake completed with {}", device_name);
         Ok(())
+    }
+    
+    async fn handle_file_request(
+        &self,
+        peer_id: Uuid,
+        request_id: Uuid,
+        file_path: String,
+        target_path: String,
+    ) -> Result<()> {
+        info!("📥 Received file request {} from peer {}: {} -> {}", 
+              request_id, peer_id, file_path, target_path);
+        
+        // Validate file exists and is accessible
+        let source_path = std::path::PathBuf::from(&file_path);
+        if !source_path.exists() {
+            warn!("❌ Requested file does not exist: {}", file_path);
+            return Err(crate::FileshareError::FileOperation(format!("File not found: {}", file_path)));
+        }
+        
+        // Start file transfer
+        match self.transfer_manager.send_file(peer_id, source_path, None, 8).await {
+            Ok(transfer_id) => {
+                info!("✅ Started QUIC file transfer {} for request {}", transfer_id, request_id);
+                Ok(())
+            }
+            Err(e) => {
+                error!("❌ Failed to start file transfer for request {}: {}", request_id, e);
+                Err(e)
+            }
+        }
     }
     
     async fn handle_file_offer(
