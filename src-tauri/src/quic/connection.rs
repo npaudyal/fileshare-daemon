@@ -110,6 +110,7 @@ impl QuicConnectionManager {
                                 capabilities,
                                 message_tx,
                                 true, // is_incoming
+                                None, // unknown peer_id for incoming connections
                             )
                             .await
                             {
@@ -147,6 +148,7 @@ impl QuicConnectionManager {
             self.capabilities.clone(),
             self.message_tx.clone(),
             false, // is_incoming
+            Some(peer_id), // known peer_id for outgoing connections
         )
         .await?;
 
@@ -161,6 +163,7 @@ impl QuicConnectionManager {
         capabilities: TransferCapabilities,
         message_tx: mpsc::UnboundedSender<(Uuid, QuicMessage)>,
         is_incoming: bool,
+        known_peer_id: Option<Uuid>, // For outgoing connections where we know the peer
     ) -> Result<()> {
         // Open control stream with timeout
         let (control_send, control_recv) = if is_incoming {
@@ -188,8 +191,9 @@ impl QuicConnectionManager {
         };
 
         // Create peer connection
+        let connection_peer_id = known_peer_id.unwrap_or_else(|| Uuid::new_v4());
         let peer_connection = QuicPeerConnection {
-            peer_id: Uuid::new_v4(), // Will be updated after handshake
+            peer_id: connection_peer_id,
             connection: connection.clone(),
             control_send,
             control_recv,
@@ -201,11 +205,16 @@ impl QuicConnectionManager {
             status: ConnectionStatus::Connected,
         };
 
-        // Store connection temporarily (will update with real peer_id after handshake)
-        let temp_id = Uuid::new_v4();
+        // Store connection with known peer ID if available, otherwise temporary ID
         {
             let mut conns = connections.write().await;
-            conns.insert(temp_id, peer_connection);
+            conns.insert(connection_peer_id, peer_connection);
+        }
+        
+        if known_peer_id.is_some() {
+            info!("✅ Stored QUIC connection for known peer: {}", connection_peer_id);
+        } else {
+            info!("📋 Stored QUIC connection with temporary ID: {} (will update after handshake)", connection_peer_id);
         }
 
         // Start handshake
@@ -222,7 +231,7 @@ impl QuicConnectionManager {
         }
 
         // Start message processing for this connection
-        Self::process_connection_messages(connection, connections, message_tx, temp_id).await;
+        Self::process_connection_messages(connection, connections, message_tx, connection_peer_id).await;
 
         Ok(())
     }
