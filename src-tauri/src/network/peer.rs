@@ -1162,7 +1162,7 @@ impl PeerConnection {
         Self { stream }
     }
     
-    // OPTIMIZATION: TCP performance tuning
+    // OPTIMIZATION: TCP performance tuning with smart flushing for file transfers
     fn optimize_tcp_connection(stream: &TcpStream) -> Result<()> {
         use socket2::Socket;
         
@@ -1206,7 +1206,7 @@ impl PeerConnection {
             std::mem::forget(socket);
         }
         
-        info!("✅ TCP optimizations applied: 2MB buffers, nodelay enabled");
+        info!("✅ TCP optimizations applied: 16MB buffers, nodelay enabled");
         Ok(())
     }
 
@@ -1233,9 +1233,26 @@ impl PeerConnection {
         self.stream.write_all(&message_data).await?;
         let write_time = tcp_start.elapsed();
         
-        let flush_start = std::time::Instant::now();
-        self.stream.flush().await?;
-        let flush_time = flush_start.elapsed();
+        // PERFORMANCE FIX: Only flush for non-chunk messages or last chunk to maximize throughput
+        let (should_flush, flush_time) = match &message.message_type {
+            MessageType::FileChunk { chunk, .. } => {
+                // Only flush the last chunk to maximize throughput
+                if chunk.is_last {
+                    let flush_start = std::time::Instant::now();
+                    self.stream.flush().await?;
+                    (true, flush_start.elapsed())
+                } else {
+                    // Let TCP buffer accumulate chunks for better performance
+                    (false, std::time::Duration::from_millis(0))
+                }
+            }
+            _ => {
+                // Always flush non-chunk messages for responsiveness
+                let flush_start = std::time::Instant::now();
+                self.stream.flush().await?;
+                (true, flush_start.elapsed())
+            }
+        };
         
         let total_time = write_start.elapsed();
         
@@ -1243,9 +1260,10 @@ impl PeerConnection {
         match &message.message_type {
             MessageType::FileChunk { chunk, .. } => {
                 if chunk.index < 5 || chunk.index % 20 == 0 || chunk.is_last || total_time.as_millis() > 20 {
-                    info!("🌐 PERF_TCP: Chunk {} - SERIALIZE: {:.2}ms | WRITE: {:.2}ms | FLUSH: {:.2}ms | TOTAL: {:.2}ms | SIZE: {}B",
+                    info!("🌐 PERF_TCP: Chunk {} - SERIALIZE: {:.2}ms | WRITE: {:.2}ms | FLUSH: {:.2}ms ({}) | TOTAL: {:.2}ms | SIZE: {}B",
                           chunk.index, serialize_time.as_millis(), write_time.as_millis(), 
-                          flush_time.as_millis(), total_time.as_millis(), message_data.len());
+                          flush_time.as_millis(), if should_flush { "YES" } else { "NO" }, 
+                          total_time.as_millis(), message_data.len());
                 }
             }
             _ => {
@@ -1321,9 +1339,26 @@ impl PeerConnectionWriteHalf {
         self.stream.write_all(&message_data).await?;
         let write_time = tcp_start.elapsed();
         
-        let flush_start = std::time::Instant::now();
-        self.stream.flush().await?;
-        let flush_time = flush_start.elapsed();
+        // PERFORMANCE FIX: Only flush for non-chunk messages or last chunk to maximize throughput
+        let (should_flush, flush_time) = match &message.message_type {
+            MessageType::FileChunk { chunk, .. } => {
+                // Only flush the last chunk to maximize throughput
+                if chunk.is_last {
+                    let flush_start = std::time::Instant::now();
+                    self.stream.flush().await?;
+                    (true, flush_start.elapsed())
+                } else {
+                    // Let TCP buffer accumulate chunks for better performance
+                    (false, std::time::Duration::from_millis(0))
+                }
+            }
+            _ => {
+                // Always flush non-chunk messages for responsiveness
+                let flush_start = std::time::Instant::now();
+                self.stream.flush().await?;
+                (true, flush_start.elapsed())
+            }
+        };
         
         let total_time = write_start.elapsed();
         
@@ -1331,9 +1366,10 @@ impl PeerConnectionWriteHalf {
         match &message.message_type {
             MessageType::FileChunk { chunk, .. } => {
                 if chunk.index < 5 || chunk.index % 20 == 0 || chunk.is_last || total_time.as_millis() > 20 {
-                    info!("🌐 PERF_TCP: Chunk {} - SERIALIZE: {:.2}ms | WRITE: {:.2}ms | FLUSH: {:.2}ms | TOTAL: {:.2}ms | SIZE: {}B",
+                    info!("🌐 PERF_TCP: Chunk {} - SERIALIZE: {:.2}ms | WRITE: {:.2}ms | FLUSH: {:.2}ms ({}) | TOTAL: {:.2}ms | SIZE: {}B",
                           chunk.index, serialize_time.as_millis(), write_time.as_millis(), 
-                          flush_time.as_millis(), total_time.as_millis(), message_data.len());
+                          flush_time.as_millis(), if should_flush { "YES" } else { "NO" }, 
+                          total_time.as_millis(), message_data.len());
                 }
             }
             _ => {
