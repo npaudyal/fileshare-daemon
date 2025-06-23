@@ -887,7 +887,11 @@ impl FileTransferManager {
         let start_time = Instant::now();
         let mut bytes_sent = 0u64;
 
-        // Stream file chunks sequentially
+        // PERFORMANCE OPTIMIZATION: Batch chunks for massive serialization speedup
+        let mut chunk_batch = Vec::new();
+        const BATCH_SIZE: usize = 5; // Send 5 chunks per batch for optimal performance
+        
+        // Stream file chunks sequentially and batch them
         while let Some((chunk_data, is_last)) = reader.read_next_chunk().await? {
             let compressed = compression.is_some();
 
@@ -899,20 +903,47 @@ impl FileTransferManager {
                 checksum: None,
             };
 
-            let message = Message::new(MessageType::FileChunk { transfer_id, chunk });
-
-            // Send chunk
-            if let Err(e) = message_sender.send((peer_id, message)) {
-                error!("❌ Failed to send chunk {}: {}", chunk_index, e);
-                let error_msg = Message::new(MessageType::TransferError {
-                    transfer_id,
-                    error: format!("Failed to send chunk: {}", e),
+            chunk_batch.push(chunk);
+            
+            // Send batch when full or this is the last chunk
+            let should_send_batch = chunk_batch.len() >= BATCH_SIZE || is_last;
+            
+            if should_send_batch {
+                let batch_start = std::time::Instant::now();
+                
+                // Use FileChunkBatch for better performance
+                let message = Message::new(MessageType::FileChunkBatch { 
+                    transfer_id, 
+                    chunks: chunk_batch.clone() 
                 });
-                let _ = message_sender.send((peer_id, error_msg));
-                return Err(FileshareError::Transfer(format!(
-                    "Failed to send chunk: {}",
-                    e
-                )));
+                let batch_serialize_time = batch_start.elapsed();
+                
+                // Send batch
+                let send_start = std::time::Instant::now();
+                if let Err(e) = message_sender.send((peer_id, message)) {
+                    error!("❌ Failed to send chunk batch (chunks {}-{}): {}", 
+                           chunk_batch[0].index, chunk_batch.last().unwrap().index, e);
+                    let error_msg = Message::new(MessageType::TransferError {
+                        transfer_id,
+                        error: format!("Failed to send chunk batch: {}", e),
+                    });
+                    let _ = message_sender.send((peer_id, error_msg));
+                    return Err(FileshareError::Transfer(format!(
+                        "Failed to send chunk batch: {}",
+                        e
+                    )));
+                }
+                let send_time = send_start.elapsed();
+                let total_batch_time = batch_start.elapsed();
+                
+                info!("📊 PERF_MSG: Chunk batch ({}x chunks) created in {:.2}ms, sent in {:.2}ms", 
+                      chunk_batch.len(), batch_serialize_time.as_millis(), send_time.as_millis());
+                info!("📊 PERF_BATCH: Sent {} chunks in {:.2}ms (avg: {:.2}ms/chunk)",
+                      chunk_batch.len(), total_batch_time.as_millis(),
+                      total_batch_time.as_millis() as f64 / chunk_batch.len() as f64);
+                
+                // Clear batch for next round
+                chunk_batch.clear();
             }
 
             let (current_bytes, total_bytes) = reader.progress();

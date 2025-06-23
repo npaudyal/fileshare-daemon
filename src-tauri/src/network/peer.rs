@@ -1246,6 +1246,18 @@ impl PeerConnection {
                     (false, std::time::Duration::from_millis(0))
                 }
             }
+            MessageType::FileChunkBatch { chunks, .. } => {
+                // Check if any chunk in the batch is the last chunk
+                let has_last_chunk = chunks.iter().any(|c| c.is_last);
+                if has_last_chunk {
+                    let flush_start = std::time::Instant::now();
+                    self.stream.flush().await?;
+                    (true, flush_start.elapsed())
+                } else {
+                    // Let TCP buffer accumulate chunk batches for better performance
+                    (false, std::time::Duration::from_millis(0))
+                }
+            }
             _ => {
                 // Always flush non-chunk messages for responsiveness
                 let flush_start = std::time::Instant::now();
@@ -1256,7 +1268,7 @@ impl PeerConnection {
         
         let total_time = write_start.elapsed();
         
-        // Log performance for file chunks
+        // Log performance for file chunks and batches
         match &message.message_type {
             MessageType::FileChunk { chunk, .. } => {
                 if chunk.index < 5 || chunk.index % 20 == 0 || chunk.is_last || total_time.as_millis() > 20 {
@@ -1265,6 +1277,17 @@ impl PeerConnection {
                           flush_time.as_millis(), if should_flush { "YES" } else { "NO" }, 
                           total_time.as_millis(), message_data.len());
                 }
+            }
+            MessageType::FileChunkBatch { chunks, .. } => {
+                let first_chunk = chunks.first().unwrap().index;
+                let last_chunk = chunks.last().unwrap().index;
+                let has_last = chunks.iter().any(|c| c.is_last);
+                
+                info!("🌐 PERF_TCP: Batch {}-{} ({}x) - SERIALIZE: {:.2}ms | WRITE: {:.2}ms | FLUSH: {:.2}ms ({}) | TOTAL: {:.2}ms | SIZE: {}B",
+                      first_chunk, last_chunk, chunks.len(),
+                      serialize_time.as_millis(), write_time.as_millis(), 
+                      flush_time.as_millis(), if should_flush { "YES" } else { "NO" }, 
+                      total_time.as_millis(), message_data.len());
             }
             _ => {
                 if total_time.as_millis() > 5 {
@@ -1352,6 +1375,18 @@ impl PeerConnectionWriteHalf {
                     (false, std::time::Duration::from_millis(0))
                 }
             }
+            MessageType::FileChunkBatch { chunks, .. } => {
+                // Check if any chunk in the batch is the last chunk
+                let has_last_chunk = chunks.iter().any(|c| c.is_last);
+                if has_last_chunk {
+                    let flush_start = std::time::Instant::now();
+                    self.stream.flush().await?;
+                    (true, flush_start.elapsed())
+                } else {
+                    // Let TCP buffer accumulate chunk batches for better performance
+                    (false, std::time::Duration::from_millis(0))
+                }
+            }
             _ => {
                 // Always flush non-chunk messages for responsiveness
                 let flush_start = std::time::Instant::now();
@@ -1362,7 +1397,7 @@ impl PeerConnectionWriteHalf {
         
         let total_time = write_start.elapsed();
         
-        // Log performance for file chunks
+        // Log performance for file chunks and batches
         match &message.message_type {
             MessageType::FileChunk { chunk, .. } => {
                 if chunk.index < 5 || chunk.index % 20 == 0 || chunk.is_last || total_time.as_millis() > 20 {
@@ -1371,6 +1406,17 @@ impl PeerConnectionWriteHalf {
                           flush_time.as_millis(), if should_flush { "YES" } else { "NO" }, 
                           total_time.as_millis(), message_data.len());
                 }
+            }
+            MessageType::FileChunkBatch { chunks, .. } => {
+                let first_chunk = chunks.first().unwrap().index;
+                let last_chunk = chunks.last().unwrap().index;
+                let has_last = chunks.iter().any(|c| c.is_last);
+                
+                info!("🌐 PERF_TCP: Batch {}-{} ({}x) - SERIALIZE: {:.2}ms | WRITE: {:.2}ms | FLUSH: {:.2}ms ({}) | TOTAL: {:.2}ms | SIZE: {}B",
+                      first_chunk, last_chunk, chunks.len(),
+                      serialize_time.as_millis(), write_time.as_millis(), 
+                      flush_time.as_millis(), if should_flush { "YES" } else { "NO" }, 
+                      total_time.as_millis(), message_data.len());
             }
             _ => {
                 if total_time.as_millis() > 5 {
