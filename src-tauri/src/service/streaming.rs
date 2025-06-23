@@ -1,16 +1,17 @@
-use crate::{FileshareError, Result};
+use crate::{network::protocol::*, FileshareError, Result};
 use crate::network::protocol::CompressionType;
 use sha2::{Digest, Sha256};
 use std::path::Path;
+use std::sync::Arc;
 use std::collections::HashMap;
 use tokio::fs::File;
 use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader, BufWriter};
+use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
-const BUFFER_SIZE: usize = 8 * 1024 * 1024; // 8MB buffer for high-speed streaming (AGGRESSIVE)
-const MAX_MEMORY_PER_TRANSFER: usize = 200 * 1024 * 1024; // 200MB max memory per transfer (INCREASED)
-const READ_AHEAD_CHUNKS: usize = 4; // Read-ahead 4 chunks for better I/O efficiency
+const BUFFER_SIZE: usize = 2 * 1024 * 1024; // 2MB buffer for streaming (OPTIMIZED)
+const MAX_MEMORY_PER_TRANSFER: usize = 50 * 1024 * 1024; // 50MB max memory per transfer (REDUCED)
 
 pub struct StreamingFileReader {
     file: BufReader<File>,
@@ -126,41 +127,38 @@ impl StreamingFileReader {
         let remaining_bytes = self.total_size - self.bytes_read;
         let chunk_size_to_read = std::cmp::min(self.chunk_size as u64, remaining_bytes) as usize;
         
-        // PERFORMANCE: Pre-allocate buffer with exact size to avoid reallocations
+        debug!("🔧 READER: Reading chunk with target size {} bytes (remaining: {} bytes)", 
+               chunk_size_to_read, remaining_bytes);
+        
         let mut buffer = vec![0u8; chunk_size_to_read];
         let mut total_bytes_read = 0;
         
-        // OPTIMIZATION: Read entire chunk efficiently with loop for partial reads
+        // Keep reading until we fill the entire chunk or reach EOF
         while total_bytes_read < chunk_size_to_read {
-            match self.file.read(&mut buffer[total_bytes_read..]).await? {
-                0 => break, // EOF reached
-                n => total_bytes_read += n,
+            let bytes_read = self.file.read(&mut buffer[total_bytes_read..]).await?;
+            if bytes_read == 0 {
+                // EOF reached
+                break;
             }
+            total_bytes_read += bytes_read;
         }
+        
+        debug!("🔧 READER: Successfully read {} bytes for chunk (target: {})", 
+               total_bytes_read, chunk_size_to_read);
         
         if total_bytes_read == 0 {
             return Ok(None);
         }
         
-        // PERFORMANCE: Only truncate if necessary
-        if total_bytes_read < chunk_size_to_read {
-            buffer.truncate(total_bytes_read);
-        }
-        
+        buffer.truncate(total_bytes_read);
         self.bytes_read += total_bytes_read as u64;
         self.hasher.update(&buffer);
         
         let is_last = self.bytes_read >= self.total_size;
         
-        // OPTIMIZATION: Apply compression only if it will actually reduce size
+        // Apply compression if needed
         let compressed_data = if let Some(compression) = self.compression {
-            let compressed = self.compress_chunk(&buffer, compression)?;
-            // Only use compression if it actually saves space
-            if compressed.len() < buffer.len() {
-                compressed
-            } else {
-                buffer
-            }
+            self.compress_chunk(&buffer, compression)?
         } else {
             buffer
         };
@@ -235,7 +233,7 @@ impl StreamingFileWriter {
         })
     }
     
-    pub async fn write_chunk(&mut self, index: u64, data: Vec<u8>, compressed: bool) -> Result<bool> {
+    pub async fn write_chunk(&mut self, index: u64, data: Vec<u8>, compressed: bool) -> Result<()> {
         if index % 10 == 0 || index < 5 {  // Only log every 10th chunk or first 5 chunks
             debug!("🔧 WRITE_CHUNK: Attempting to write chunk {} (expecting {})", index, self.next_write_index);
         }
@@ -243,7 +241,7 @@ impl StreamingFileWriter {
         // Skip chunks that are already written (duplicate handling)
         if index < self.next_write_index {
             info!("⚠️ Skipping duplicate chunk {} (already processed up to {})", index, self.next_write_index - 1);
-            return Ok(true); // Return true since it's already written
+            return Ok(());
         }
         
         // Decompress if needed
@@ -261,21 +259,12 @@ impl StreamingFileWriter {
             self.write_data(&decompressed_data).await?;
             self.next_write_index += 1;
             
-            // CRITICAL FIX: Flush critical early chunks to disk immediately
-            if index < 10 {
-                debug!("💾 EARLY_FLUSH: Flushing early chunk {} to disk", index);
-                self.file.flush().await?;
-            }
-            
             if index < 5 {
                 debug!("🔄 DIRECT_WRITE: After writing chunk {}, next_write_index is now {}", index, self.next_write_index);
             }
             
             // Check if we have buffered chunks that can now be written
-            let _flushed_count = self.flush_buffered_chunks().await?;
-            
-            // Return true since this chunk was successfully written
-            return Ok(true);
+            self.flush_buffered_chunks().await?;
         } else if index > self.next_write_index {
             // Store chunk directly in HashMap by chunk index - much simpler!
             if index % 10 == 0 || index < 5 {  // Log significant gaps and first 5
@@ -295,15 +284,12 @@ impl StreamingFileWriter {
                 let stored_chunks: Vec<u64> = self.chunks_buffer.keys().cloned().collect();
                 debug!("📦 BUFFER_STATE: After storing chunk {}, stored chunks: {:?}", index, stored_chunks);
             }
-            
-            // Return false since this chunk is buffered, not written yet
-            return Ok(false);
         }
         
-        Ok(true)
+        Ok(())
     }
     
-    async fn flush_buffered_chunks(&mut self) -> Result<u64> {
+    async fn flush_buffered_chunks(&mut self) -> Result<()> {
         let mut consecutive_flushes = 0;
         let start_write_index = self.next_write_index;
         
@@ -321,12 +307,6 @@ impl StreamingFileWriter {
             self.next_write_index += 1;
             consecutive_flushes += 1;
             
-            // CRITICAL FIX: Flush every 5 consecutive chunks to ensure data persistence
-            if consecutive_flushes % 5 == 0 {
-                debug!("💾 BATCH_FLUSH: Flushing after {} consecutive chunks", consecutive_flushes);
-                self.file.flush().await?;
-            }
-            
             // Debug: Show remaining chunks in HashMap for critical chunks
             if chunk_index < 5 || chunk_index >= 25 {
                 let remaining_chunks: Vec<u64> = self.chunks_buffer.keys().cloned().collect();
@@ -343,21 +323,13 @@ impl StreamingFileWriter {
                   self.next_write_index);
         }
         
-        Ok(consecutive_flushes as u64)
+        Ok(())
     }
     
     async fn write_data(&mut self, data: &[u8]) -> Result<()> {
         self.file.write_all(data).await?;
         self.hasher.update(data);
         self.bytes_written += data.len() as u64;
-        
-        // CRITICAL FIX: Flush data to disk periodically to prevent data loss
-        // Flush every 8MB of written data for optimal performance vs safety balance
-        if self.bytes_written % (8 * 1024 * 1024) == 0 {
-            debug!("💾 FLUSH: Periodic flush at {} bytes written", self.bytes_written);
-            self.file.flush().await?;
-        }
-        
         Ok(())
     }
     
@@ -388,7 +360,7 @@ impl StreamingFileWriter {
                   self.next_write_index, expected_chunks);
             
             // Try to flush any remaining buffered chunks
-            let _flushed_count = self.flush_buffered_chunks().await?;
+            self.flush_buffered_chunks().await?;
             
             // Check again after flush
             if self.next_write_index < expected_chunks {
@@ -400,24 +372,15 @@ impl StreamingFileWriter {
                 let stored_chunks: Vec<u64> = self.chunks_buffer.keys().cloned().collect();
                 warn!("🔧 FINALIZE: Chunks still in HashMap: {:?}", stored_chunks);
                 
-                // CRITICAL FIX: Flush buffer before seeking to ensure proper file state
-                self.file.flush().await?;
-                
                 // Check if any missing chunks are in the HashMap and write them directly
                 for missing_idx in &missing_chunks {
                     if let Some(data) = self.chunks_buffer.remove(missing_idx) {
                         warn!("🔧 FINALIZE: Found missing chunk {} in HashMap, writing directly", missing_idx);
-                        // CRITICAL FIX: Get inner file handle and seek on it directly
+                        // Write it directly at the correct file position
                         use tokio::io::AsyncSeekExt;
                         let file_position = *missing_idx * self.chunk_size as u64;
-                        
-                        // Flush buffer first, then get inner file for seeking
-                        self.file.flush().await?;
-                        let inner_file = self.file.get_mut();
-                        inner_file.seek(std::io::SeekFrom::Start(file_position)).await?;
-                        inner_file.write_all(&data).await?;
-                        inner_file.flush().await?;
-                        
+                        self.file.seek(std::io::SeekFrom::Start(file_position)).await?;
+                        self.file.write_all(&data).await?;
                         self.hasher.update(&data);
                         self.bytes_written += data.len() as u64;
                         info!("✅ FINALIZE: Successfully wrote missing chunk {} at file position {}", 
@@ -441,14 +404,8 @@ impl StreamingFileWriter {
                 warn!("🔧 FINALIZE: Writing orphaned chunk {} directly", chunk_index);
                 use tokio::io::AsyncSeekExt;
                 let file_position = chunk_index * self.chunk_size as u64;
-                
-                // CRITICAL FIX: Flush buffer first, then get inner file for seeking
-                self.file.flush().await?;
-                let inner_file = self.file.get_mut();
-                inner_file.seek(std::io::SeekFrom::Start(file_position)).await?;
-                inner_file.write_all(&data).await?;
-                inner_file.flush().await?;
-                
+                self.file.seek(std::io::SeekFrom::Start(file_position)).await?;
+                self.file.write_all(&data).await?;
                 self.hasher.update(&data);
                 self.bytes_written += data.len() as u64;
             }
@@ -473,16 +430,6 @@ impl StreamingFileWriter {
     pub fn progress(&self) -> (u64, u64) {
         (self.bytes_written, self.total_size)
     }
-    
-    pub fn get_written_chunks(&self) -> u64 {
-        // Return the number of chunks that have been actually written to disk
-        self.next_write_index
-    }
-    
-    pub fn get_buffered_chunks_count(&self) -> usize {
-        // Return the number of chunks currently buffered (not yet written)
-        self.chunks_buffer.len()
-    }
 }
 
 // Progress tracking for UI updates
@@ -498,12 +445,13 @@ pub struct TransferProgress {
 }
 
 pub fn calculate_adaptive_chunk_size(file_size: u64) -> usize {
-    // AGGRESSIVE: Larger chunks for maximum throughput (60-100 MBPS target)
+    // OPTIMIZED: Better chunk size distribution for improved performance
     match file_size {
-        0..=10_485_760 => 1 * 1024 * 1024,               // <= 10MB: 1MB chunks (4x increase)
-        10_485_761..=104_857_600 => 4 * 1024 * 1024,     // 10MB-100MB: 4MB chunks (4x increase)  
-        104_857_601..=1_073_741_824 => 8 * 1024 * 1024,  // 100MB-1GB: 8MB chunks (2x increase)
-        1_073_741_825..=10_737_418_240 => 16 * 1024 * 1024, // 1GB-10GB: 16MB chunks (2x increase)
-        _ => 32 * 1024 * 1024,                           // > 10GB: 32MB chunks (4x increase)
+        0..=1_048_576 => 32 * 1024,                      // <= 1MB: 32KB chunks (faster for small files)
+        1_048_577..=10_485_760 => 128 * 1024,            // 1MB-10MB: 128KB chunks (reduced overhead)
+        10_485_761..=52_428_800 => 256 * 1024,           // 10MB-50MB: 256KB chunks
+        52_428_801..=524_288_000 => 512 * 1024,          // 50MB-500MB: 512KB chunks (optimal for parallel)
+        524_288_001..=2_147_483_648 => 1 * 1024 * 1024,  // 500MB-2GB: 1MB chunks
+        _ => 1536 * 1024,                                 // > 2GB: 1.5MB chunks (optimal for very large files)
     }
 }

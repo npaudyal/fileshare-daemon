@@ -62,7 +62,7 @@ impl FileshareDaemon {
     }
 
     // Enhanced daemon startup with health monitoring
-    pub async fn start_background_services(self: Arc<Self>) -> Result<()> {
+    pub async fn start_background_services(mut self: Arc<Self>) -> Result<()> {
         info!("🚀 Starting Enhanced Fileshare Daemon with health monitoring...");
         info!("📱 Device ID: {}", self.settings.device.id);
         info!("🏷️ Device Name: {}", self.settings.device.name);
@@ -685,18 +685,11 @@ impl FileshareDaemon {
                         | crate::network::protocol::MessageType::FileChunk {
                             transfer_id, ..
                         }
-                        | crate::network::protocol::MessageType::FileChunkBatch {
-                            transfer_id, ..
-                        }
                         | crate::network::protocol::MessageType::TransferComplete {
                             transfer_id,
                             ..
                         }
                         | crate::network::protocol::MessageType::TransferError {
-                            transfer_id,
-                            ..
-                        }
-                        | crate::network::protocol::MessageType::TransferProgress {
                             transfer_id,
                             ..
                         } => {
@@ -858,9 +851,6 @@ impl FileshareDaemon {
 
                         crate::network::protocol::MessageType::FileChunk {
                             transfer_id, ..
-                        }
-                        | crate::network::protocol::MessageType::FileChunkBatch {
-                            transfer_id, ..
                         } => {
                             let is_our_outgoing = {
                                 let ft = pm.file_transfer.read().await;
@@ -872,19 +862,14 @@ impl FileshareDaemon {
                             };
 
                             if is_our_outgoing {
-                                let msg_type = if matches!(message.message_type, crate::network::protocol::MessageType::FileChunkBatch { .. }) {
-                                    "FileChunkBatch"
-                                } else {
-                                    "FileChunk"
-                                };
-                                info!("🚀 Sending outgoing {} for transfer {} directly to peer {}", msg_type, transfer_id, peer_id);
+                                info!("🚀 Sending outgoing FileChunk for transfer {} directly to peer {}", transfer_id, peer_id);
                                 // FIXED: Clone message before sending
                                 if let Err(e) =
                                     pm.send_direct_to_connection(peer_id, message.clone()).await
                                 {
                                     error!(
-                                        "❌ Failed to send {} to peer {}: {}",
-                                        msg_type, peer_id, e
+                                        "❌ Failed to send FileChunk to peer {}: {}",
+                                        peer_id, e
                                     );
                                 }
                                 continue; // Don't process locally
@@ -934,10 +919,6 @@ impl FileshareDaemon {
                         crate::network::protocol::MessageType::TransferError {
                             transfer_id,
                             ..
-                        }
-                        | crate::network::protocol::MessageType::TransferProgress {
-                            transfer_id,
-                            ..
                         } => {
                             let is_our_outgoing = {
                                 let ft = pm.file_transfer.read().await;
@@ -949,19 +930,14 @@ impl FileshareDaemon {
                             };
 
                             if is_our_outgoing {
-                                let msg_type = if matches!(message.message_type, crate::network::protocol::MessageType::TransferProgress { .. }) {
-                                    "TransferProgress"
-                                } else {
-                                    "TransferError"
-                                };
-                                info!("🚀 Sending outgoing {} for transfer {} directly to peer {}", msg_type, transfer_id, peer_id);
+                                info!("🚀 Sending outgoing TransferError for transfer {} directly to peer {}", transfer_id, peer_id);
                                 // FIXED: Clone message before sending
                                 if let Err(e) =
                                     pm.send_direct_to_connection(peer_id, message.clone()).await
                                 {
                                     error!(
-                                        "❌ Failed to send {} to peer {}: {}",
-                                        msg_type, peer_id, e
+                                        "❌ Failed to send TransferError to peer {}: {}",
+                                        peer_id, e
                                     );
                                 }
                                 continue; // Don't process locally

@@ -13,34 +13,9 @@ use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::{mpsc, RwLock};
-use tokio::time::timeout;
+use tokio::time::{interval, timeout};
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
-
-fn message_type_name(message_type: &MessageType) -> &'static str {
-    match message_type {
-        MessageType::Handshake { .. } => "Handshake",
-        MessageType::HandshakeResponse { .. } => "HandshakeResponse",
-        MessageType::ClipboardUpdate { .. } => "ClipboardUpdate",
-        MessageType::ClipboardClear => "ClipboardClear",
-        MessageType::FileRequest { .. } => "FileRequest",
-        MessageType::FileRequestResponse { .. } => "FileRequestResponse",
-        MessageType::FileOffer { .. } => "FileOffer",
-        MessageType::FileOfferResponse { .. } => "FileOfferResponse",
-        MessageType::FileChunk { .. } => "FileChunk",
-        MessageType::FileChunkAck { .. } => "FileChunkAck",
-        MessageType::FileChunkBatchAck { .. } => "FileChunkBatchAck",
-        MessageType::TransferComplete { .. } => "TransferComplete",
-        MessageType::TransferError { .. } => "TransferError",
-        MessageType::TransferProgress { .. } => "TransferProgress",
-        MessageType::TransferResume { .. } => "TransferResume",
-        MessageType::TransferPause { .. } => "TransferPause",
-        MessageType::FileChunkBatch { .. } => "FileChunkBatch",
-        MessageType::Ping => "Ping",
-        MessageType::Pong => "Pong",
-        MessageType::Disconnect => "Disconnect",
-    }
-}
 
 // Constants for connection health monitoring
 const PING_INTERVAL_SECONDS: u64 = 30; // Ping every 30 seconds
@@ -468,34 +443,19 @@ impl PeerManager {
                         // Only log important messages, not chunks or frequent messages
                         match &message.message_type {
                             MessageType::Ping | MessageType::Pong => {
-                                debug!(
-                                    "📥 READ {} from {}",
-                                    if matches!(message.message_type, MessageType::Ping) {
-                                        "ping"
-                                    } else {
-                                        "pong"
-                                    },
-                                    read_peer_id
-                                );
+                                debug!("📥 READ {} from {}", 
+                                       if matches!(message.message_type, MessageType::Ping) { "ping" } else { "pong" },
+                                       read_peer_id);
                             }
                             MessageType::FileChunk { transfer_id, chunk } => {
                                 // Only log every 10th chunk to reduce noise
                                 if chunk.index % 10 == 0 || chunk.is_last {
-                                    info!(
-                                        "📥 READ chunk {} for transfer {} ({}B, last: {})",
-                                        chunk.index,
-                                        transfer_id,
-                                        chunk.data.len(),
-                                        chunk.is_last
-                                    );
+                                    info!("📥 READ chunk {} for transfer {} ({}B, last: {})",
+                                          chunk.index, transfer_id, chunk.data.len(), chunk.is_last);
                                 }
                             }
                             _ => {
-                                info!(
-                                    "📥 READ from peer {}: {}",
-                                    read_peer_id,
-                                    message_type_name(&message.message_type)
-                                );
+                                info!("📥 READ from peer {}: {:?}", read_peer_id, message.message_type);
                             }
                         }
                         if let Err(e) = read_message_tx.send((read_peer_id, message)) {
@@ -522,34 +482,19 @@ impl PeerManager {
                 // Only log important messages, not chunks or frequent messages
                 match &message.message_type {
                     MessageType::Ping | MessageType::Pong => {
-                        debug!(
-                            "📤 WRITE {} to {}",
-                            if matches!(message.message_type, MessageType::Ping) {
-                                "ping"
-                            } else {
-                                "pong"
-                            },
-                            write_peer_id
-                        );
+                        debug!("📤 WRITE {} to {}", 
+                               if matches!(message.message_type, MessageType::Ping) { "ping" } else { "pong" },
+                               write_peer_id);
                     }
                     MessageType::FileChunk { transfer_id, chunk } => {
                         // Only log every 10th chunk to reduce noise
                         if chunk.index % 10 == 0 || chunk.is_last {
-                            info!(
-                                "📤 WRITE chunk {} for transfer {} ({}B, last: {})",
-                                chunk.index,
-                                transfer_id,
-                                chunk.data.len(),
-                                chunk.is_last
-                            );
+                            info!("📤 WRITE chunk {} for transfer {} ({}B, last: {})",
+                                  chunk.index, transfer_id, chunk.data.len(), chunk.is_last);
                         }
                     }
                     _ => {
-                        info!(
-                            "📤 WRITE to peer {}: {}",
-                            write_peer_id,
-                            message_type_name(&message.message_type)
-                        );
+                        info!("📤 WRITE to peer {}: {:?}", write_peer_id, message.message_type);
                     }
                 }
 
@@ -563,7 +508,7 @@ impl PeerManager {
 
         // Clean up when connection ends
         let cleanup_peer_id = peer_id;
-        let _connections_cleanup = self.connections.clone();
+        let connections_cleanup = self.connections.clone();
         tokio::spawn(async move {
             tokio::select! {
                 _ = read_task => {
@@ -823,25 +768,15 @@ impl PeerManager {
         // Only log important messages, not chunks or frequent messages
         match &message.message_type {
             MessageType::Ping | MessageType::Pong => {
-                debug!(
-                    "📥 Processing {} from {}",
-                    if matches!(message.message_type, MessageType::Ping) {
-                        "ping"
-                    } else {
-                        "pong"
-                    },
-                    peer_id
-                );
+                debug!("📥 Processing {} from {}", 
+                       if matches!(message.message_type, MessageType::Ping) { "ping" } else { "pong" },
+                       peer_id);
             }
             MessageType::FileChunk { .. } => {
                 // Don't log individual chunks - too noisy
             }
             _ => {
-                info!(
-                    "📥 Processing message from {}: {}",
-                    peer_id,
-                    message_type_name(&message.message_type)
-                );
+                info!("📥 Processing message from {}: {:?}", peer_id, message.message_type);
             }
         }
 
@@ -858,7 +793,7 @@ impl PeerManager {
                         }
                     }
                 }
-
+                
                 if let Some(conn) = self.connections.get(&peer_id) {
                     let _ = conn.send(Message::pong());
                     debug!("📤 WRITE to peer {}: Pong", peer_id);
@@ -983,22 +918,6 @@ impl PeerManager {
                 ft.handle_file_chunk(peer_id, transfer_id, chunk).await?;
             }
 
-            MessageType::FileChunkBatch {
-                transfer_id,
-                chunks,
-            } => {
-                debug!(
-                    "Received batch of {} chunks for transfer {}",
-                    chunks.len(),
-                    transfer_id
-                );
-                let mut ft = self.file_transfer.write().await;
-                // Process each chunk in the batch
-                for chunk in chunks {
-                    ft.handle_file_chunk(peer_id, transfer_id, chunk).await?;
-                }
-            }
-
             MessageType::TransferComplete {
                 transfer_id,
                 checksum,
@@ -1049,8 +968,7 @@ impl PeerManager {
             } => {
                 debug!(
                     "Received batch chunk ack for transfer {} - {} chunks",
-                    transfer_id,
-                    chunk_indices.len()
+                    transfer_id, chunk_indices.len()
                 );
             }
 
@@ -1075,17 +993,29 @@ impl PeerManager {
             } => {
                 info!(
                     "Received resume request for transfer {} with {} completed chunks",
-                    transfer_id,
-                    completed_chunks.len()
+                    transfer_id, completed_chunks.len()
                 );
                 // TODO: Implement resume functionality
             }
 
-            MessageType::TransferPause { transfer_id } => {
-                info!("Received pause request for transfer {}", transfer_id);
+            MessageType::TransferPause {
+                transfer_id,
+            } => {
+                info!(
+                    "Received pause request for transfer {}",
+                    transfer_id
+                );
                 // TODO: Implement pause functionality
             }
 
+            // OPTIMIZATION: Handle batched file chunks
+            MessageType::FileChunkBatch { transfer_id, chunks } => {
+                debug!("📦 Received batch of {} chunks for transfer {}", chunks.len(), transfer_id);
+                let mut ft = self.file_transfer.write().await;
+                for chunk in chunks {
+                    ft.handle_file_chunk(peer_id, transfer_id, chunk).await?;
+                }
+            }
 
             _ => {
                 debug!(
@@ -1198,90 +1128,52 @@ impl PeerConnection {
         }
         Self { stream }
     }
-
-    // OPTIMIZATION: Aggressive TCP performance tuning for 60-100 MBPS transfers
+    
+    // OPTIMIZATION: TCP performance tuning
     fn optimize_tcp_connection(stream: &TcpStream) -> Result<()> {
         use socket2::Socket;
-
+        
         #[cfg(unix)]
         {
             use std::os::fd::{AsRawFd, FromRawFd};
             // Get the raw socket
             let socket = unsafe { Socket::from_raw_fd(stream.as_raw_fd()) };
-
-            // AGGRESSIVE: Massive TCP buffer sizes for maximum throughput
-            // 64MB buffers for sustained high-speed transfers
-            let recv_buffer_size = 64 * 1024 * 1024; // 64MB receive buffer
-            let send_buffer_size = 64 * 1024 * 1024; // 64MB send buffer
-
-            if let Err(e) = socket.set_recv_buffer_size(recv_buffer_size) {
-                warn!("Failed to set recv buffer size: {}", e);
-            } else {
-                info!("✅ Set TCP recv buffer: 64MB");
-            }
             
-            if let Err(e) = socket.set_send_buffer_size(send_buffer_size) {
-                warn!("Failed to set send buffer size: {}", e);
-            } else {
-                info!("✅ Set TCP send buffer: 64MB");
-            }
-
-            // CRITICAL: Disable Nagle's algorithm for low latency
-            // For high-speed file transfers, we want immediate sending
+            // Increase TCP buffer sizes for better throughput
+            let _ = socket.set_recv_buffer_size(2 * 1024 * 1024); // 2MB receive buffer
+            let _ = socket.set_send_buffer_size(2 * 1024 * 1024); // 2MB send buffer
+            
+            // Disable Nagle algorithm for lower latency
             let _ = socket.set_nodelay(true);
-
-            // Enable TCP keep-alive for connection stability
+            
+            // Enable TCP keep-alive
             let _ = socket.set_keepalive(true);
-
-            // PERFORMANCE: Set TCP_USER_TIMEOUT for fast failure detection
-            #[cfg(target_os = "linux")]
-            {
-                use socket2::TcpKeepalive;
-                let keepalive = TcpKeepalive::new()
-                    .with_time(std::time::Duration::from_secs(7200))
-                    .with_interval(std::time::Duration::from_secs(75));
-                let _ = socket.set_tcp_keepalive(&keepalive);
-            }
-
+            
             // Don't take ownership of the socket
             std::mem::forget(socket);
         }
-
+        
         #[cfg(windows)]
         {
             use std::os::windows::io::{AsRawSocket, FromRawSocket};
             // Get the raw socket
             let socket = unsafe { Socket::from_raw_socket(stream.as_raw_socket()) };
-
-            // AGGRESSIVE: Massive TCP buffer sizes for maximum throughput
-            // 64MB buffers for sustained high-speed transfers  
-            let recv_buffer_size = 64 * 1024 * 1024; // 64MB receive buffer
-            let send_buffer_size = 64 * 1024 * 1024; // 64MB send buffer
-
-            if let Err(e) = socket.set_recv_buffer_size(recv_buffer_size) {
-                warn!("Failed to set recv buffer size: {}", e);
-            } else {
-                info!("✅ Set TCP recv buffer: 64MB");
-            }
             
-            if let Err(e) = socket.set_send_buffer_size(send_buffer_size) {
-                warn!("Failed to set send buffer size: {}", e);
-            } else {
-                info!("✅ Set TCP send buffer: 64MB");
-            }
-
-            // CRITICAL: Disable Nagle's algorithm for low latency
-            // For high-speed file transfers, we want immediate sending
+            // Increase TCP buffer sizes for better throughput
+            let _ = socket.set_recv_buffer_size(2 * 1024 * 1024); // 2MB receive buffer
+            let _ = socket.set_send_buffer_size(2 * 1024 * 1024); // 2MB send buffer
+            
+            // Disable Nagle algorithm for lower latency
             let _ = socket.set_nodelay(true);
-
-            // Enable TCP keep-alive for connection stability
+            
+            // Enable TCP keep-alive
             let _ = socket.set_keepalive(true);
-
+            
             // Don't take ownership of the socket
             std::mem::forget(socket);
         }
-
-        info!("🚀 AGGRESSIVE TCP optimizations applied: 64MB buffers, Nagle disabled, immediate sending");
+        
+        info!("✅ TCP optimizations applied: 2MB buffers, nodelay enabled");
         Ok(())
     }
 
@@ -1298,28 +1190,10 @@ impl PeerConnection {
         let message_data = bincode::serialize(message)?;
         let message_len = message_data.len() as u32;
 
-        // For better performance, combine length and data into a single buffer
-        // This reduces the number of system calls and improves batching
-        let mut combined_buffer = Vec::with_capacity(4 + message_data.len());
-        combined_buffer.extend_from_slice(&message_len.to_be_bytes());
-        combined_buffer.extend_from_slice(&message_data);
-
-        // Write everything in one go
-        self.stream.write_all(&combined_buffer).await?;
-
-        // Only flush for important messages, not for bulk data chunks
-        match message {
-            Message {
-                message_type: MessageType::FileChunk { .. },
-                ..
-            } => {
-                // Don't flush for file chunks - let TCP batch them
-            }
-            _ => {
-                // Flush for control messages
-                self.stream.flush().await?;
-            }
-        }
+        // Write length first, then data
+        self.stream.write_all(&message_len.to_be_bytes()).await?;
+        self.stream.write_all(&message_data).await?;
+        self.stream.flush().await?;
 
         Ok(())
     }
@@ -1331,9 +1205,8 @@ impl PeerConnection {
         let message_len = u32::from_be_bytes(len_bytes) as usize;
 
         // Validate message length to prevent memory attacks
-        // Increased to 150MB to support batched 8-16MB chunks with metadata overhead
-        // Maximum theoretical message: 8 chunks * 16MB + metadata ≈ 130MB
-        if message_len > 150_000_000 {
+        // Increased from 100MB to 50MB to support 8MB chunks with metadata overhead
+        if message_len > 50_000_000 {
             return Err(FileshareError::Transfer("Message too large".to_string()));
         }
 
@@ -1356,9 +1229,8 @@ impl PeerConnectionReadHalf {
         let message_len = u32::from_be_bytes(len_bytes) as usize;
 
         // Validate message length to prevent memory attacks
-        // Increased to 150MB to support batched 8-16MB chunks with metadata overhead
-        // Maximum theoretical message: 8 chunks * 16MB + metadata ≈ 130MB
-        if message_len > 150_000_000 {
+        // Increased from 100MB to 50MB to support 8MB chunks with metadata overhead
+        if message_len > 50_000_000 {
             return Err(FileshareError::Transfer("Message too large".to_string()));
         }
 
@@ -1375,81 +1247,14 @@ impl PeerConnectionReadHalf {
 
 impl PeerConnectionWriteHalf {
     async fn write_message(&mut self, message: &Message) -> Result<()> {
-        // PERFORMANCE: Pre-calculate buffer size to avoid reallocations
+        // Serialize the message
         let message_data = bincode::serialize(message)?;
         let message_len = message_data.len() as u32;
-        let total_size = 4 + message_data.len();
 
-        // OPTIMIZATION: Single allocation for entire message
-        let mut combined_buffer = Vec::with_capacity(total_size);
-        combined_buffer.extend_from_slice(&message_len.to_be_bytes());
-        combined_buffer.extend_from_slice(&message_data);
-
-        // CRITICAL: Write everything in one system call for maximum efficiency
-        self.stream.write_all(&combined_buffer).await?;
-
-        // PERFORMANCE: Minimize flushing for better TCP batching
-        match message {
-            Message {
-                message_type: MessageType::FileChunk { .. } | MessageType::FileChunkBatch { .. },
-                ..
-            } => {
-                // NEVER flush data messages - let TCP handle batching
-                // This is critical for achieving high throughput
-            }
-            Message {
-                message_type: MessageType::Handshake { .. } | MessageType::HandshakeResponse { .. },
-                ..
-            } => {
-                // Only flush critical handshake messages
-                self.stream.flush().await?;
-            }
-            _ => {
-                // No flushing for other control messages - batch them too
-            }
-        }
-
-        Ok(())
-    }
-
-    // OPTIMIZATION: Vectored I/O for batch writing multiple messages
-    pub async fn write_messages_vectored(&mut self, messages: &[Message]) -> Result<()> {
-        use tokio::io::AsyncWriteExt;
-
-        if messages.is_empty() {
-            return Ok(());
-        }
-
-        // Pre-serialize all messages and prepare IO vectors
-        let mut serialized_messages = Vec::with_capacity(messages.len());
-        let mut total_size = 0;
-
-        for message in messages {
-            let message_data = bincode::serialize(message)?;
-            let message_len = message_data.len() as u32;
-            total_size += 4 + message_data.len();
-            serialized_messages.push((message_len, message_data));
-        }
-
-        // Create a single buffer for all data to enable zero-copy
-        let mut combined_buffer = Vec::with_capacity(total_size);
-
-        for (len, data) in &serialized_messages {
-            combined_buffer.extend_from_slice(&len.to_be_bytes());
-            combined_buffer.extend_from_slice(data);
-        }
-
-        // Write all messages in a single system call
-        self.stream.write_all(&combined_buffer).await?;
-
-        // Check if we need to flush (only if any non-chunk messages)
-        let needs_flush = messages
-            .iter()
-            .any(|msg| !matches!(msg.message_type, MessageType::FileChunk { .. }));
-
-        if needs_flush {
-            self.stream.flush().await?;
-        }
+        // Write length first, then data
+        self.stream.write_all(&message_len.to_be_bytes()).await?;
+        self.stream.write_all(&message_data).await?;
+        self.stream.flush().await?;
 
         Ok(())
     }

@@ -859,12 +859,14 @@ async fn refresh_devices(_state: tauri::State<'_, AppState>) -> Result<(), Strin
 
 // Transfer progress and control commands
 #[tauri::command]
-async fn get_active_transfers(state: tauri::State<'_, AppState>) -> Result<Vec<serde_json::Value>, String> {
+async fn get_active_transfers(
+    state: tauri::State<'_, AppState>,
+) -> Result<Vec<serde_json::Value>, String> {
     if let Some(daemon_ref) = state.daemon_ref.lock().await.as_ref() {
         let pm = daemon_ref.peer_manager.read().await;
         let ft = pm.file_transfer.read().await;
         let active_transfers = ft.get_active_transfers();
-        
+
         let mut transfers = Vec::new();
         for transfer in active_transfers {
             let progress = ft.get_transfer_progress(transfer.id).unwrap_or(0.0);
@@ -881,7 +883,7 @@ async fn get_active_transfers(state: tauri::State<'_, AppState>) -> Result<Vec<s
                 fileshare_daemon::service::file_transfer::TransferStatus::Cancelled => "error",
                 _ => "pending",
             };
-            
+
             transfers.push(serde_json::json!({
                 "id": transfer.id.to_string(),
                 "fileName": transfer.file_path.file_name().unwrap_or_default().to_string_lossy(),
@@ -899,7 +901,7 @@ async fn get_active_transfers(state: tauri::State<'_, AppState>) -> Result<Vec<s
                 }
             }));
         }
-        
+
         Ok(transfers)
     } else {
         Err("Daemon not ready".to_string())
@@ -907,24 +909,29 @@ async fn get_active_transfers(state: tauri::State<'_, AppState>) -> Result<Vec<s
 }
 
 #[tauri::command]
-async fn toggle_transfer_pause(transfer_id: String, state: tauri::State<'_, AppState>) -> Result<(), String> {
-    let transfer_uuid = Uuid::parse_str(&transfer_id)
-        .map_err(|e| format!("Invalid transfer ID: {}", e))?;
-    
+async fn toggle_transfer_pause(
+    transfer_id: String,
+    state: tauri::State<'_, AppState>,
+) -> Result<(), String> {
+    let transfer_uuid =
+        Uuid::parse_str(&transfer_id).map_err(|e| format!("Invalid transfer ID: {}", e))?;
+
     if let Some(daemon_ref) = state.daemon_ref.lock().await.as_ref() {
         let pm = daemon_ref.peer_manager.read().await;
         let mut ft = pm.file_transfer.write().await;
-        
+
         if let Some(transfer) = ft.active_transfers.get_mut(&transfer_uuid) {
             match &transfer.status {
                 fileshare_daemon::service::file_transfer::TransferStatus::Active => {
-                    transfer.status = fileshare_daemon::service::file_transfer::TransferStatus::Paused;
+                    transfer.status =
+                        fileshare_daemon::service::file_transfer::TransferStatus::Paused;
                     info!("⏸️ Transfer {} paused", transfer_id);
-                },
+                }
                 fileshare_daemon::service::file_transfer::TransferStatus::Paused => {
-                    transfer.status = fileshare_daemon::service::file_transfer::TransferStatus::Active;
+                    transfer.status =
+                        fileshare_daemon::service::file_transfer::TransferStatus::Active;
                     info!("▶️ Transfer {} resumed", transfer_id);
-                },
+                }
                 _ => {
                     return Err("Transfer cannot be paused/resumed in current state".to_string());
                 }
@@ -939,14 +946,17 @@ async fn toggle_transfer_pause(transfer_id: String, state: tauri::State<'_, AppS
 }
 
 #[tauri::command]
-async fn cancel_transfer(transfer_id: String, state: tauri::State<'_, AppState>) -> Result<(), String> {
-    let transfer_uuid = Uuid::parse_str(&transfer_id)
-        .map_err(|e| format!("Invalid transfer ID: {}", e))?;
-    
+async fn cancel_transfer(
+    transfer_id: String,
+    state: tauri::State<'_, AppState>,
+) -> Result<(), String> {
+    let transfer_uuid =
+        Uuid::parse_str(&transfer_id).map_err(|e| format!("Invalid transfer ID: {}", e))?;
+
     if let Some(daemon_ref) = state.daemon_ref.lock().await.as_ref() {
         let pm = daemon_ref.peer_manager.read().await;
         let mut ft = pm.file_transfer.write().await;
-        
+
         if let Some(transfer) = ft.active_transfers.get_mut(&transfer_uuid) {
             transfer.status = fileshare_daemon::service::file_transfer::TransferStatus::Cancelled;
             info!("🚫 Transfer {} cancelled", transfer_id);

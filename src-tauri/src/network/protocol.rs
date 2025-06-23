@@ -172,9 +172,7 @@ impl FileMetadata {
         chunk_size: usize, 
         compression_enabled: bool
     ) -> crate::Result<Self> {
-        use sha2::{Digest, Sha256};
         use std::fs;
-        use std::io::Read;
 
         let metadata = fs::metadata(path)?;
         let name = path
@@ -188,20 +186,9 @@ impl FileMetadata {
         // Calculate total chunks based on file size and chunk size
         let total_chunks = (file_size + chunk_size as u64 - 1) / chunk_size as u64;
 
-        // Calculate checksum
-        let mut file = fs::File::open(path)?;
-        let mut hasher = Sha256::new();
-        let mut buffer = [0; 8192];
-
-        loop {
-            let bytes_read = file.read(&mut buffer)?;
-            if bytes_read == 0 {
-                break;
-            }
-            hasher.update(&buffer[..bytes_read]);
-        }
-
-        let checksum = format!("{:x}", hasher.finalize());
+        // FIXED: Don't calculate checksum upfront - will be calculated during streaming
+        // This eliminates the 2-5 second delay for large files
+        let checksum = String::new(); // Empty checksum - will be calculated during transfer
 
         // Get timestamps
         let created = metadata
