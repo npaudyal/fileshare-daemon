@@ -1,20 +1,18 @@
-use crate::{FileshareError, Result};
+use crate::{network::protocol::*, FileshareError, Result};
 use crate::network::protocol::CompressionType;
 use sha2::{Digest, Sha256};
 use std::path::Path;
+use std::sync::Arc;
 use std::collections::HashMap;
 use tokio::fs::File;
 use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader, BufWriter};
+use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
-// Memory-mapped file support for macOS
-#[cfg(target_os = "macos")]
-use memmap2::MmapMut;
-
-const BUFFER_SIZE: usize = 8 * 1024 * 1024; // 8MB buffer optimized for 1MB chunks
-const MAX_MEMORY_PER_TRANSFER: usize = 50 * 1024 * 1024; // 50MB max memory per transfer
-const WRITE_BUFFER_CHUNKS: usize = 8; // Buffer 8 chunks (8MB) before flushing for macOS optimization
+const BUFFER_SIZE: usize = 8 * 1024 * 1024; // 8MB buffer for high-speed streaming (AGGRESSIVE)
+const MAX_MEMORY_PER_TRANSFER: usize = 200 * 1024 * 1024; // 200MB max memory per transfer (INCREASED)
+const READ_AHEAD_CHUNKS: usize = 4; // Read-ahead 4 chunks for better I/O efficiency
 
 pub struct StreamingFileReader {
     file: BufReader<File>,
@@ -130,38 +128,50 @@ impl StreamingFileReader {
         let remaining_bytes = self.total_size - self.bytes_read;
         let chunk_size_to_read = std::cmp::min(self.chunk_size as u64, remaining_bytes) as usize;
         
-        debug!("🔧 READER: Reading chunk with target size {} bytes (remaining: {} bytes)", 
-               chunk_size_to_read, remaining_bytes);
+        // PERFORMANCE: Pre-allocate buffer with exact size to avoid reallocations
+        let mut buffer = Vec::with_capacity(chunk_size_to_read);
+        buffer.resize(chunk_size_to_read, 0);
         
-        let mut buffer = vec![0u8; chunk_size_to_read];
-        let mut total_bytes_read = 0;
-        
-        // Keep reading until we fill the entire chunk or reach EOF
-        while total_bytes_read < chunk_size_to_read {
-            let bytes_read = self.file.read(&mut buffer[total_bytes_read..]).await?;
-            if bytes_read == 0 {
-                // EOF reached
-                break;
+        // OPTIMIZATION: Read entire chunk in single call when possible
+        let total_bytes_read = match self.file.read_exact(&mut buffer).await {
+            Ok(()) => chunk_size_to_read,
+            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
+                // Handle partial read at end of file
+                let mut partial_bytes_read = 0;
+                while partial_bytes_read < chunk_size_to_read {
+                    match self.file.read(&mut buffer[partial_bytes_read..]).await? {
+                        0 => break, // EOF
+                        n => partial_bytes_read += n,
+                    }
+                }
+                partial_bytes_read
             }
-            total_bytes_read += bytes_read;
-        }
-        
-        debug!("🔧 READER: Successfully read {} bytes for chunk (target: {})", 
-               total_bytes_read, chunk_size_to_read);
+            Err(e) => return Err(e.into()),
+        };
         
         if total_bytes_read == 0 {
             return Ok(None);
         }
         
-        buffer.truncate(total_bytes_read);
+        // PERFORMANCE: Only truncate if necessary
+        if total_bytes_read < chunk_size_to_read {
+            buffer.truncate(total_bytes_read);
+        }
+        
         self.bytes_read += total_bytes_read as u64;
         self.hasher.update(&buffer);
         
         let is_last = self.bytes_read >= self.total_size;
         
-        // Apply compression if needed
+        // OPTIMIZATION: Apply compression only if it will actually reduce size
         let compressed_data = if let Some(compression) = self.compression {
-            self.compress_chunk(&buffer, compression)?
+            let compressed = self.compress_chunk(&buffer, compression)?;
+            // Only use compression if it actually saves space
+            if compressed.len() < buffer.len() {
+                compressed
+            } else {
+                buffer
+            }
         } else {
             buffer
         };
@@ -203,11 +213,6 @@ pub struct StreamingFileWriter {
     decompression: Option<CompressionType>,
     chunks_buffer: HashMap<u64, Vec<u8>>,
     next_write_index: u64,
-    chunks_written_since_flush: usize,
-    #[cfg(target_os = "macos")]
-    memory_map: Option<MmapMut>,
-    #[cfg(target_os = "macos")]
-    use_mmap: bool,
 }
 
 impl StreamingFileWriter {
@@ -224,37 +229,6 @@ impl StreamingFileWriter {
         }
         
         let file = File::create(path).await?;
-        
-        // Use memory mapping for large files on macOS
-        #[cfg(target_os = "macos")]
-        let (use_mmap, memory_map) = if total_size > 100 * 1024 * 1024 { // Use mmap for files > 100MB
-            match Self::create_memory_map(&file, total_size).await {
-                Ok(mmap) => {
-                    info!("📝 Using memory-mapped file for {} bytes on macOS", total_size);
-                    (true, Some(mmap))
-                },
-                Err(e) => {
-                    warn!("⚠️ Failed to create memory map, falling back to regular writes: {}", e);
-                    (false, None)
-                }
-            }
-        } else {
-            (false, None)
-        };
-        
-        // Regular file setup for non-macOS or smaller files
-        #[cfg(not(target_os = "macos"))]
-        {
-            file.set_len(total_size).await
-                .map_err(|e| FileshareError::FileOperation(format!("Failed to pre-allocate file: {}", e)))?;
-            info!("📝 Pre-allocated file with {} bytes", total_size);
-        }
-        
-        #[cfg(target_os = "macos")]
-        if !use_mmap {
-            info!("📝 Using regular buffered writes on macOS");
-        }
-        
         let buffered = BufWriter::with_capacity(BUFFER_SIZE, file);
         
         // Use HashMap for better chunk management - no size limits needed
@@ -269,25 +243,7 @@ impl StreamingFileWriter {
             decompression,
             chunks_buffer: HashMap::new(),
             next_write_index: 0,
-            chunks_written_since_flush: 0,
-            #[cfg(target_os = "macos")]
-            memory_map,
-            #[cfg(target_os = "macos")]
-            use_mmap,
         })
-    }
-    
-    #[cfg(target_os = "macos")]
-    async fn create_memory_map(file: &File, total_size: u64) -> Result<MmapMut> {
-        // Set file size first
-        file.set_len(total_size).await
-            .map_err(|e| FileshareError::FileOperation(format!("Failed to set file size for mmap: {}", e)))?;
-        
-        // Create memory map using the file directly
-        unsafe {
-            MmapMut::map_mut(file)
-                .map_err(|e| FileshareError::FileOperation(format!("Failed to create memory map: {}", e)))
-        }
     }
     
     pub async fn write_chunk(&mut self, index: u64, data: Vec<u8>, compressed: bool) -> Result<()> {
@@ -384,87 +340,10 @@ impl StreamingFileWriter {
     }
     
     async fn write_data(&mut self, data: &[u8]) -> Result<()> {
-        // Use memory mapping if available on macOS
-        #[cfg(target_os = "macos")]
-        if self.use_mmap && self.memory_map.is_some() {
-            return self.write_data_mmap(data).await;
-        }
-        
-        // Use optimized write strategy for macOS
-        #[cfg(target_os = "macos")]
-        {
-            // Write in smaller chunks to avoid macOS disk I/O bottlenecks
-            const WRITE_CHUNK_SIZE: usize = 256 * 1024; // 256KB chunks
-            let mut offset = 0;
-            
-            while offset < data.len() {
-                let end = std::cmp::min(offset + WRITE_CHUNK_SIZE, data.len());
-                self.file.write_all(&data[offset..end]).await?;
-                offset = end;
-                
-                // Yield to allow other tasks to run
-                if offset < data.len() {
-                    tokio::task::yield_now().await;
-                }
-            }
-        }
-        
-        #[cfg(not(target_os = "macos"))]
-        {
-            self.file.write_all(data).await?;
-        }
-        
+        self.file.write_all(data).await?;
         self.hasher.update(data);
         self.bytes_written += data.len() as u64;
-        self.chunks_written_since_flush += 1;
-        
-        // Optimized flush frequency for macOS
-        #[cfg(target_os = "macos")]
-        let flush_threshold = 4; // Flush every 4MB on macOS
-        
-        #[cfg(not(target_os = "macos"))]
-        let flush_threshold = WRITE_BUFFER_CHUNKS;
-        
-        if self.chunks_written_since_flush >= flush_threshold {
-            self.file.flush().await?;
-            self.chunks_written_since_flush = 0;
-        }
-        
         Ok(())
-    }
-    
-    #[cfg(target_os = "macos")]
-    async fn write_data_mmap(&mut self, data: &[u8]) -> Result<()> {
-        if let Some(ref mut mmap) = self.memory_map {
-            let start_offset = self.bytes_written as usize;
-            let end_offset = start_offset + data.len();
-            
-            // Ensure we don't write beyond the file size
-            if end_offset > mmap.len() {
-                return Err(FileshareError::FileOperation(
-                    "Memory map write would exceed file size".to_string()
-                ));
-            }
-            
-            // Copy data directly to memory map
-            mmap[start_offset..end_offset].copy_from_slice(data);
-            
-            // Update hash and counters
-            self.hasher.update(data);
-            self.bytes_written += data.len() as u64;
-            self.chunks_written_since_flush += 1;
-            
-            // Sync memory map every few chunks for safety
-            if self.chunks_written_since_flush >= 8 { // Sync every 8MB
-                mmap.flush_async()
-                    .map_err(|e| FileshareError::FileOperation(format!("Failed to sync memory map: {}", e)))?;
-                self.chunks_written_since_flush = 0;
-            }
-            
-            Ok(())
-        } else {
-            Err(FileshareError::FileOperation("Memory map not available".to_string()))
-        }
     }
     
     fn decompress_chunk(&self, data: &[u8], compression: CompressionType) -> Result<Vec<u8>> {
@@ -545,22 +424,8 @@ impl StreamingFileWriter {
             }
         }
         
-        // Final flush - handle memory map vs regular file
-        #[cfg(target_os = "macos")]
-        if self.use_mmap {
-            if let Some(ref mut mmap) = self.memory_map {
-                info!("📝 FINALIZE: Syncing memory map");
-                mmap.flush()
-                    .map_err(|e| FileshareError::FileOperation(format!("Failed to sync memory map: {}", e)))?;
-            }
-        } else {
-            self.file.flush().await?;
-        }
-        
-        #[cfg(not(target_os = "macos"))]
-        {
-            self.file.flush().await?;
-        }
+        // Final flush of file buffer
+        self.file.flush().await?;
         
         // Final validation
         if self.bytes_written != self.total_size {
@@ -593,25 +458,12 @@ pub struct TransferProgress {
 }
 
 pub fn calculate_adaptive_chunk_size(file_size: u64) -> usize {
-    #[cfg(target_os = "macos")]
-    {
-        // Use smaller chunks on macOS for better disk I/O performance
-        match file_size {
-            0..=10_485_760 => 512 * 1024,                // <= 10MB: 512KB chunks
-            10_485_761..=104_857_600 => 1 * 1024 * 1024, // 10MB-100MB: 1MB chunks
-            104_857_601..=1_073_741_824 => 2 * 1024 * 1024, // 100MB-1GB: 2MB chunks
-            _ => 4 * 1024 * 1024,                        // > 1GB: 4MB chunks max on macOS
-        }
-    }
-    
-    #[cfg(not(target_os = "macos"))]
-    {
-        // Use larger chunks on other platforms for maximum throughput
-        match file_size {
-            0..=10_485_760 => 1 * 1024 * 1024,               // <= 10MB: 1MB chunks
-            10_485_761..=104_857_600 => 4 * 1024 * 1024,     // 10MB-100MB: 4MB chunks
-            104_857_601..=1_073_741_824 => 8 * 1024 * 1024,  // 100MB-1GB: 8MB chunks
-            _ => 16 * 1024 * 1024,                           // > 1GB: 16MB chunks for maximum throughput
-        }
+    // AGGRESSIVE: Larger chunks for maximum throughput (60-100 MBPS target)
+    match file_size {
+        0..=10_485_760 => 1 * 1024 * 1024,               // <= 10MB: 1MB chunks (4x increase)
+        10_485_761..=104_857_600 => 4 * 1024 * 1024,     // 10MB-100MB: 4MB chunks (4x increase)  
+        104_857_601..=1_073_741_824 => 8 * 1024 * 1024,  // 100MB-1GB: 8MB chunks (2x increase)
+        1_073_741_825..=10_737_418_240 => 16 * 1024 * 1024, // 1GB-10GB: 16MB chunks (2x increase)
+        _ => 32 * 1024 * 1024,                           // > 10GB: 32MB chunks (4x increase)
     }
 }

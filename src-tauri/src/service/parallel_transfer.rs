@@ -86,20 +86,24 @@ impl ParallelChunkSender {
         Ok(failed_chunks_guard.clone())
     }
 
-    // OPTIMIZATION: Send chunks in batches to reduce message overhead
+    // OPTIMIZATION: High-speed batch sending for maximum throughput
     pub async fn send_chunks_batched(
         &self,
         chunks: Vec<(u64, TransferChunk)>,
         batch_size: usize,
     ) -> Result<Vec<u64>> {
         let total_chunks = chunks.len();
-        info!("📤 BATCH_SEND: Sending {} chunks in batches of {}", total_chunks, batch_size);
+        
+        // PERFORMANCE: Use larger batches for better TCP efficiency
+        let effective_batch_size = std::cmp::max(batch_size, 8); // Minimum 8 chunks per batch
         
         let failed_chunks = Arc::new(Mutex::new(Vec::new()));
         
-        // Process chunks in batches
-        for batch_start in (0..chunks.len()).step_by(batch_size) {
-            let batch_end = (batch_start + batch_size).min(chunks.len());
+        // OPTIMIZATION: Process all batches in parallel for maximum speed
+        let mut batch_tasks = Vec::new();
+        
+        for batch_start in (0..chunks.len()).step_by(effective_batch_size) {
+            let batch_end = (batch_start + effective_batch_size).min(chunks.len());
             let batch_chunks: Vec<TransferChunk> = chunks[batch_start..batch_end]
                 .iter()
                 .map(|(_, chunk)| chunk.clone())
@@ -110,29 +114,42 @@ impl ParallelChunkSender {
                 .map(|(index, _)| *index)
                 .collect();
             
-            debug!("📦 BATCH_SEND: Sending batch with {} chunks (indices: {:?})", 
-                   batch_chunks.len(), 
-                   if batch_indices.len() <= 5 { format!("{:?}", batch_indices) } else { format!("first 5: {:?}", &batch_indices[..5]) });
+            let message_sender = self.message_sender.clone();
+            let peer_id = self.peer_id;
+            let transfer_id = self.transfer_id;
+            let failed_chunks = failed_chunks.clone();
             
-            let message = Message::new(MessageType::FileChunkBatch { 
-                transfer_id: self.transfer_id, 
-                chunks: batch_chunks 
+            // CRITICAL: Send batches in parallel to maximize throughput
+            let batch_task = tokio::spawn(async move {
+                let message = Message::new(MessageType::FileChunkBatch { 
+                    transfer_id, 
+                    chunks: batch_chunks 
+                });
+                
+                if let Err(e) = message_sender.send((peer_id, message)) {
+                    error!("❌ BATCH_SEND: Failed to send batch: {}", e);
+                    failed_chunks.lock().await.extend(batch_indices);
+                }
             });
             
-            if let Err(e) = self.message_sender.send((self.peer_id, message)) {
-                error!("❌ BATCH_SEND: Failed to send batch: {}", e);
-                // Mark all chunks in this batch as failed
-                failed_chunks.lock().await.extend(batch_indices);
-            }
+            batch_tasks.push(batch_task);
+        }
+        
+        // Wait for all batch sends to complete
+        for task in batch_tasks {
+            let _ = task.await;
         }
         
         let failed_chunks_guard = failed_chunks.lock().await;
         let failed_count = failed_chunks_guard.len();
+        
         if failed_count > 0 {
-            warn!("⚠️ BATCH_SEND: {} out of {} chunks failed", failed_count, total_chunks);
+            warn!("⚠️ HIGH_SPEED_BATCH: {} out of {} chunks failed", failed_count, total_chunks);
         } else {
-            info!("✅ BATCH_SEND: All {} chunks sent successfully in batches", total_chunks);
+            info!("🚀 HIGH_SPEED_BATCH: All {} chunks sent in {} batches", total_chunks, 
+                  (total_chunks + effective_batch_size - 1) / effective_batch_size);
         }
+        
         Ok(failed_chunks_guard.clone())
     }
 }

@@ -63,13 +63,13 @@ impl Default for Settings {
                 timeout_seconds: 30,
             },
             transfer: TransferSettings {
-                chunk_size: 4 * 1024 * 1024, // 4MB default chunk size (OPTIMIZED)
-                max_concurrent_transfers: 5,
+                chunk_size: 8 * 1024 * 1024, // 8MB default chunk size (AGGRESSIVE)
+                max_concurrent_transfers: 10, // Increased for better parallelism
                 bandwidth_limit_mbps: None,
                 temp_dir: None,
                 adaptive_chunk_size: true,
                 compression_enabled: false,
-                parallel_chunks: 8, // OPTIMIZED: Increased from 4
+                parallel_chunks: 16, // AGGRESSIVE: Maximum parallelism
                 resume_enabled: true,
             },
             security: SecuritySettings {
