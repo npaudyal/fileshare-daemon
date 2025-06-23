@@ -452,10 +452,14 @@ impl FileshareDaemon {
 
             // Try QUIC first for high-speed transfer
             let mut use_quic = false;
+            info!("🔍 Starting QUIC connection attempt...");
             if let Some(ref quic) = quic_integration {
+                info!("✅ QUIC integration available");
                 // Get peer info from peer manager to get real IP address
                 let pm = peer_manager.read().await;
+                info!("✅ Got peer manager lock");
                 if let Some(peer) = pm.get_peer(&source_device) {
+                    info!("✅ Found peer in discovery: {}", source_device);
                     let peer_ip = peer.device_info.addr.ip();
                     let quic_port = settings.network.port + settings.network.quic_port_offset;
                     let quic_addr = format!("{}:{}", peer_ip, quic_port);
@@ -471,19 +475,24 @@ impl FileshareDaemon {
                             info!("✅ QUIC connection established for high-speed transfer to {}", quic_addr);
                             
                             // Wait a moment for handshake to complete
-                            tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+                            tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+                            info!("⏰ Waited for QUIC handshake completion");
                             
                             use_quic = true;
                         }
                         Err(e) => {
-                            warn!("⚠️ QUIC connection to {} failed, falling back to TCP: {}", quic_addr, e);
+                            error!("❌ QUIC connection to {} failed, falling back to TCP: {}", quic_addr, e);
                             use_quic = false;
                         }
                     }
                 } else {
                     info!("📡 Peer {} not found in discovery, using TCP", source_device);
                 }
+            } else {
+                info!("⚠️ QUIC integration not available");
             }
+            
+            info!("🔍 About to proceed with file transfer, use_quic = {}", use_quic);
 
             info!("🔍 Debug: use_quic = {}, quic_integration available = {}", use_quic, quic_integration.is_some());
             
@@ -535,8 +544,10 @@ impl FileshareDaemon {
                 pm.send_message_to_peer(source_device, message).await
             };
 
+            info!("🔍 File transfer request completed, checking result...");
             match send_result {
                 Ok(()) => {
+                    info!("✅ File transfer request sent successfully");
                     // Show enhanced notification with file details
                     let file_size_mb = file_size as f64 / (1024.0 * 1024.0);
 
@@ -578,8 +589,11 @@ impl FileshareDaemon {
                     return Err(e);
                 }
             }
+        } else {
+            info!("📋 No network clipboard content available for paste");
         }
 
+        info!("✅ Enhanced paste operation completed");
         Ok(())
     }
 
