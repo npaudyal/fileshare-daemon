@@ -1086,21 +1086,6 @@ impl PeerManager {
                 // TODO: Implement pause functionality
             }
 
-            // OPTIMIZATION: Handle batched file chunks
-            MessageType::FileChunkBatch {
-                transfer_id,
-                chunks,
-            } => {
-                debug!(
-                    "📦 Received batch of {} chunks for transfer {}",
-                    chunks.len(),
-                    transfer_id
-                );
-                let mut ft = self.file_transfer.write().await;
-                for chunk in chunks {
-                    ft.handle_file_chunk(peer_id, transfer_id, chunk).await?;
-                }
-            }
 
             _ => {
                 debug!(
