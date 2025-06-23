@@ -174,6 +174,10 @@ impl QuicMessageProcessor {
                 self.handle_handshake(peer_id, device_id, device_name, version, capabilities).await
             }
             
+            QuicMessage::HandshakeResponse { accepted, capabilities, reason } => {
+                self.handle_handshake_response(peer_id, accepted, capabilities, reason).await
+            }
+            
             QuicMessage::FileRequest { request_id, file_path, target_path } => {
                 self.handle_file_request(peer_id, request_id, file_path, target_path).await
             }
@@ -229,6 +233,22 @@ impl QuicMessageProcessor {
         self.connection_manager.send_message(peer_id, response).await?;
         
         info!("✅ Handshake completed with {}", device_name);
+        Ok(())
+    }
+    
+    async fn handle_handshake_response(
+        &self,
+        peer_id: Uuid,
+        accepted: bool,
+        capabilities: TransferCapabilities,
+        reason: Option<String>,
+    ) -> Result<()> {
+        if accepted {
+            info!("🤝 Handshake accepted by peer {}: {:?}", peer_id, capabilities);
+            info!("✅ QUIC peer {} is ready for file transfers", peer_id);
+        } else {
+            warn!("❌ Handshake rejected by peer {}: {:?}", peer_id, reason);
+        }
         Ok(())
     }
     
