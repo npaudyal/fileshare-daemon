@@ -47,6 +47,8 @@ lz4 = "1.24"
 sysinfo = "0.30"
 # Network optimization
 socket2 = "0.5"
+# Memory-mapped file I/O
+memmap2 = "0.9"
 
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.52", features = [
