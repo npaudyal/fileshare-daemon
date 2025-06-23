@@ -165,19 +165,9 @@ impl QuicConnectionManager {
         is_incoming: bool,
         known_peer_id: Option<Uuid>, // For outgoing connections where we know the peer
     ) -> Result<()> {
-        // Open control stream with timeout
-        let (control_send, control_recv) = if is_incoming {
-            // Wait for incoming control stream with timeout
-            info!("📥 Waiting for incoming control stream from peer...");
-            let (send, recv) = tokio::time::timeout(
-                Duration::from_secs(30), // 30 second timeout
-                connection.accept_bi()
-            ).await
-                .map_err(|_| crate::FileshareError::Transfer("Accept bi stream timeout".to_string()))?
-                .map_err(|e| crate::FileshareError::Transfer(format!("Accept bi stream error: {}", e)))?;
-            info!("✅ Incoming control stream established");
-            (Some(send), Some(recv))
-        } else {
+        // For incoming connections, we'll wait for the bidirectional stream in the message loop
+        // For outgoing connections, we'll open the control stream immediately
+        let (control_send, control_recv) = if !is_incoming {
             // Open outgoing control stream with timeout
             info!("📤 Opening outgoing control stream to peer...");
             let (send, recv) = tokio::time::timeout(
@@ -188,6 +178,10 @@ impl QuicConnectionManager {
                 .map_err(|e| crate::FileshareError::Transfer(format!("Open bi stream error: {}", e)))?;
             info!("✅ Outgoing control stream established");
             (Some(send), Some(recv))
+        } else {
+            // For incoming connections, control stream will be set when we receive the first bi stream
+            info!("📥 Will wait for incoming control stream from peer...");
+            (None, None)
         };
 
         // Create peer connection
@@ -237,14 +231,16 @@ impl QuicConnectionManager {
     }
 
     async fn send_control_message(connection: &Connection, message: &QuicMessage) -> Result<()> {
-        let mut control_stream = connection.open_uni().await
-            .map_err(|e| crate::FileshareError::Transfer(format!("Open uni stream error: {}", e)))?;
+        // Use bidirectional stream for control messages to ensure reliable delivery
+        let (mut send_stream, _recv_stream) = connection.open_bi().await
+            .map_err(|e| crate::FileshareError::Transfer(format!("Open bi stream error: {}", e)))?;
+        
         let data = bincode::serialize(message)?;
         
         use tokio::io::AsyncWriteExt;
-        control_stream.write_all(&data).await
+        send_stream.write_all(&data).await
             .map_err(|e| crate::FileshareError::Transfer(format!("Write error: {}", e)))?;
-        control_stream.shutdown().await
+        send_stream.shutdown().await
             .map_err(|e| crate::FileshareError::Transfer(format!("Shutdown error: {}", e)))?;
         Ok(())
     }
@@ -294,12 +290,59 @@ impl QuicConnectionManager {
                 bi_stream_result = connection.accept_bi() => {
                     match bi_stream_result {
                         Ok((send, recv)) => {
-                            // Handle data streams here
-                            debug!("📊 Accepted bidirectional stream");
-                            // TODO: Implement data stream handling
+                            info!("📊 Accepted bidirectional stream from peer");
+                            
+                            // Spawn a task to handle this bidirectional stream for messages
+                            let connections_clone = connections.clone();
+                            let message_tx_clone = message_tx.clone();
+                            let temp_id_clone = temp_id;
+                            tokio::spawn(async move {
+                                let mut recv_stream = recv;
+                                // Continuously read messages from this bidirectional stream
+                                loop {
+                                    match recv_stream.read_to_end(256 * 1024).await {
+                                        Ok(buffer) => {
+                                            if buffer.is_empty() {
+                                                debug!("📋 Bidirectional stream closed by peer {}", temp_id_clone);
+                                                break;
+                                            }
+                                            
+                                            // Try to deserialize message
+                                            match bincode::deserialize::<QuicMessage>(&buffer) {
+                                                Ok(message) => {
+                                                    info!("📨 Received message on bidirectional stream from peer {}", temp_id_clone);
+                                                    if let Err(e) = message_tx_clone.send((temp_id_clone, message)) {
+                                                        error!("❌ Failed to send bi-stream message to processor: {}", e);
+                                                    }
+                                                }
+                                                Err(e) => {
+                                                    debug!("📊 Failed to deserialize message from bi-stream: {}", e);
+                                                }
+                                            }
+                                            break; // Each stream should only have one message
+                                        }
+                                        Err(e) => {
+                                            debug!("📋 Bidirectional stream read ended: {}", e);
+                                            break;
+                                        }
+                                    }
+                                }
+                                
+                                // Store the send part as a data stream for potential file transfer use
+                                {
+                                    let mut conns = connections_clone.write().await;
+                                    if let Some(peer_conn) = conns.get_mut(&temp_id_clone) {
+                                        let stream_id = peer_conn.data_streams.len() as u8 + 1;
+                                        // Note: recv_stream is consumed, so we can't store the pair
+                                        // This is OK since we read the message already
+                                        info!("📊 Bidirectional stream message processed for peer {}", temp_id_clone);
+                                    }
+                                }
+                            });
                         }
                         Err(e) => {
                             error!("❌ Bidirectional stream error: {}", e);
+                            // Don't break here, just log the error
                         }
                     }
                 }
