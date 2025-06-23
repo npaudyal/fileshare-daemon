@@ -21,7 +21,7 @@ const TRANSFER_TIMEOUT_SECONDS: u64 = 3600; // Base timeout: 1 hour per transfer
 const MIN_TRANSFER_TIMEOUT_SECONDS: u64 = 300; // Minimum 5 minutes
 const MAX_TRANSFER_TIMEOUT_SECONDS: u64 = 28800; // Maximum 8 hours
 const CHUNK_TIMEOUT_SECONDS: u64 = 300; // 5 minutes per chunk (more reasonable for large files)
-const PROGRESS_UPDATE_INTERVAL_MS: u64 = 500; // Update progress every 500ms
+const PROGRESS_UPDATE_INTERVAL_MS: u64 = 5000; // PERFORMANCE: Update progress every 5s (was 500ms)
 
 // Use simple message sender instead of DirectPeerSender
 pub type MessageSender = mpsc::UnboundedSender<(Uuid, Message)>;
@@ -801,9 +801,9 @@ impl FileTransferManager {
         let use_streaming = metadata.streaming_mode;
         let total_chunks = metadata.total_chunks;
 
-        // Get parallel chunks setting from configuration
+        // PERFORMANCE: Force batch mode for better speed
         let parallel_chunks = settings.transfer.parallel_chunks;
-        let use_parallel = settings.transfer.parallel_chunks > 1; // Enable parallel mode based on configuration
+        let use_parallel = true; // PERFORMANCE: Always use parallel/batch mode for speed
 
         info!(
             "📊 File: {} bytes, streaming: {}, compression: {:?}, parallel: {} (chunks: {})",
@@ -859,9 +859,9 @@ impl FileTransferManager {
         let use_streaming = metadata.streaming_mode;
         let total_chunks = metadata.total_chunks;
 
-        // Get parallel chunks setting from configuration
+        // PERFORMANCE: Force batch mode for better speed
         let parallel_chunks = settings.transfer.parallel_chunks;
-        let use_parallel = settings.transfer.parallel_chunks > 1; // Enable parallel mode based on configuration
+        let use_parallel = true; // PERFORMANCE: Always use parallel/batch mode for speed
 
         info!(
             "📊 File: {} bytes, streaming: {}, compression: {:?}, parallel: {} (chunks: {})",
@@ -1054,9 +1054,9 @@ impl FileTransferManager {
                 
                 tracker.mark_in_progress(&batch_indices);
                 
-                // OPTIMIZATION: Use larger batches for better performance
+                // PERFORMANCE: Use much larger batches for maximum speed
                 // Send chunks in larger batches to reduce message overhead and better utilize TCP buffers
-                let batch_size = 16; // Increased from 4 to 16 for better TCP utilization
+                let batch_size = 32; // PERFORMANCE: Increased from 16 to 32 for maximum speed
                 let failed_chunks = if active_batch.len() >= batch_size {
                     parallel_sender.send_chunks_batched(active_batch, batch_size).await?
                 } else {

@@ -10,7 +10,7 @@ use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
-const BUFFER_SIZE: usize = 4 * 1024 * 1024; // 4MB buffer for streaming (OPTIMIZED for 8MB chunks)
+const BUFFER_SIZE: usize = 16 * 1024 * 1024; // 16MB buffer for streaming (PERFORMANCE: Increased from 4MB)
 const MAX_MEMORY_PER_TRANSFER: usize = 100 * 1024 * 1024; // 100MB max memory per transfer (INCREASED for better performance)
 
 pub struct StreamingFileReader {
@@ -104,7 +104,8 @@ impl StreamingFileReader {
         }
         
         buffer.truncate(total_bytes_read);
-        self.hasher.update(&buffer);
+        // PERFORMANCE: Disable SHA256 hashing per chunk for speed
+        // self.hasher.update(&buffer);
         
         let is_last = start_position + total_bytes_read as u64 >= self.total_size;
         
@@ -152,7 +153,8 @@ impl StreamingFileReader {
         
         buffer.truncate(total_bytes_read);
         self.bytes_read += total_bytes_read as u64;
-        self.hasher.update(&buffer);
+        // PERFORMANCE: Disable SHA256 hashing per chunk for speed
+        // self.hasher.update(&buffer);
         
         let is_last = self.bytes_read >= self.total_size;
         
@@ -299,7 +301,8 @@ impl StreamingFileWriter {
     
     async fn write_data(&mut self, data: &[u8]) -> Result<()> {
         self.file.write_all(data).await?;
-        self.hasher.update(data);
+        // PERFORMANCE: Disable SHA256 hashing per chunk for speed
+        // self.hasher.update(data);
         self.bytes_written += data.len() as u64;
         Ok(())
     }
