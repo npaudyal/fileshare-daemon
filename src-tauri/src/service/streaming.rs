@@ -8,7 +8,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader, BufWriter};
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
-const BUFFER_SIZE: usize = 8 * 1024 * 1024; // 8MB buffer for streaming (PERFORMANCE OPTIMIZED)
+const BUFFER_SIZE: usize = 64 * 1024 * 1024; // 64MB buffer for streaming (MAXIMUM PERFORMANCE)
 const MAX_MEMORY_PER_TRANSFER: usize = 100 * 1024 * 1024; // 100MB max memory per transfer (INCREASED)
 
 pub struct StreamingFileReader {
@@ -362,9 +362,29 @@ impl StreamingFileWriter {
     }
     
     async fn write_data(&mut self, data: &[u8]) -> Result<()> {
+        let write_start = std::time::Instant::now();
+        
+        // Write data without immediate flush for performance
         self.file.write_all(data).await?;
+        let write_time = write_start.elapsed();
+        
+        // Update hash and tracking
         self.hasher.update(data);
         self.bytes_written += data.len() as u64;
+        
+        // Only flush every 5 chunks or on last chunk to improve performance
+        let chunk_index = self.bytes_written / (16 * 1024 * 1024); // Approximate chunk number
+        if chunk_index % 5 == 0 || self.bytes_written >= self.total_size {
+            let flush_start = std::time::Instant::now();
+            self.file.flush().await?;
+            let flush_time = flush_start.elapsed();
+            info!("💾 DISK_PERF: Chunk ~{} - WRITE: {:.2}ms | FLUSH: {:.2}ms | SIZE: {}MB", 
+                  chunk_index, write_time.as_millis(), flush_time.as_millis(), data.len() / (1024*1024));
+        } else {
+            info!("💾 DISK_PERF: Chunk ~{} - WRITE: {:.2}ms | NO_FLUSH | SIZE: {}MB", 
+                  chunk_index, write_time.as_millis(), data.len() / (1024*1024));
+        }
+        
         Ok(())
     }
     
@@ -446,8 +466,12 @@ impl StreamingFileWriter {
             }
         }
         
-        // Final flush of file buffer
+        // Final flush of file buffer - CRITICAL for data integrity
+        info!("💾 FINALIZE: Starting final flush...");
+        let final_flush_start = std::time::Instant::now();
         self.file.flush().await?;
+        let final_flush_time = final_flush_start.elapsed();
+        info!("💾 FINALIZE: Final flush completed in {:.2}ms", final_flush_time.as_millis());
         
         // Final validation
         if self.bytes_written != self.total_size {
