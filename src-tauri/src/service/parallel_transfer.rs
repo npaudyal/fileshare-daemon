@@ -100,8 +100,8 @@ impl ParallelChunkSender {
     ) -> Result<Vec<u64>> {
         let total_chunks = chunks.len();
 
-        // PERFORMANCE: Use larger batches for better TCP efficiency
-        let effective_batch_size = std::cmp::max(batch_size, 8); // Minimum 8 chunks per batch
+        // PERFORMANCE: Use moderate batches to balance efficiency and message size limits
+        let effective_batch_size = std::cmp::max(batch_size, 4); // Minimum 4 chunks per batch
 
         let failed_chunks = Arc::new(Mutex::new(Vec::new()));
 

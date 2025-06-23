@@ -906,7 +906,7 @@ impl FileTransferManager {
         let start_time = Instant::now();
         
         // OPTIMIZATION: Batch multiple chunks into single messages for better TCP efficiency
-        const CHUNKS_PER_BATCH: usize = 8; // Send 8 chunks per message
+        const CHUNKS_PER_BATCH: usize = 4; // Send 4 chunks per message (reduced to prevent "Message too large" errors)
         let mut chunk_batch = Vec::with_capacity(CHUNKS_PER_BATCH);
         let mut chunk_index = 0u64;
         let mut bytes_sent = 0u64;
@@ -1051,7 +1051,7 @@ impl FileTransferManager {
         let mut bytes_sent = 0u64;
         
         // OPTIMIZATION: Large batch processing for maximum throughput
-        const LARGE_BATCH_SIZE: usize = 16; // Process 16 chunks at once
+        const LARGE_BATCH_SIZE: usize = 4; // Process 4 chunks at once to reduce message size
         let mut active_batch = Vec::with_capacity(LARGE_BATCH_SIZE);
 
         // High-speed chunk processing loop
@@ -1074,8 +1074,8 @@ impl FileTransferManager {
                 
                 tracker.mark_in_progress(&batch_indices);
                 
-                // CRITICAL: Use maximum batch size for TCP efficiency
-                let failed_chunks = parallel_sender.send_chunks_batched(active_batch, 8).await?;
+                // CRITICAL: Use smaller batch size to avoid message size limits
+                let failed_chunks = parallel_sender.send_chunks_batched(active_batch, 4).await?;
                 
                 // Update tracker with successful sends
                 for &chunk_index in &batch_indices {

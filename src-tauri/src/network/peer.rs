@@ -1331,8 +1331,9 @@ impl PeerConnection {
         let message_len = u32::from_be_bytes(len_bytes) as usize;
 
         // Validate message length to prevent memory attacks
-        // Increased from 100MB to 50MB to support 8MB chunks with metadata overhead
-        if message_len > 50_000_000 {
+        // Increased to 150MB to support batched 8-16MB chunks with metadata overhead
+        // Maximum theoretical message: 8 chunks * 16MB + metadata ≈ 130MB
+        if message_len > 150_000_000 {
             return Err(FileshareError::Transfer("Message too large".to_string()));
         }
 
@@ -1355,8 +1356,9 @@ impl PeerConnectionReadHalf {
         let message_len = u32::from_be_bytes(len_bytes) as usize;
 
         // Validate message length to prevent memory attacks
-        // Increased from 100MB to 50MB to support 8MB chunks with metadata overhead
-        if message_len > 50_000_000 {
+        // Increased to 150MB to support batched 8-16MB chunks with metadata overhead
+        // Maximum theoretical message: 8 chunks * 16MB + metadata ≈ 130MB
+        if message_len > 150_000_000 {
             return Err(FileshareError::Transfer("Message too large".to_string()));
         }
 
