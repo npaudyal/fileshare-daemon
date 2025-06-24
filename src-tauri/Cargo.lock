@@ -1360,6 +1360,7 @@ dependencies = [
  "futures",
  "gethostname",
  "global-hotkey",
+ "lazy_static",
  "lz4",
  "mdns",
  "notify-rust",

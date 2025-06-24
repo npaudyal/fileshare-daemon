@@ -13,7 +13,7 @@ use crate::{
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, RwLock};
 use tokio::time::{interval, timeout};
@@ -26,6 +26,11 @@ const PING_TIMEOUT_SECONDS: u64 = 10;
 const MAX_MISSED_PINGS: u32 = 3;
 const RECONNECTION_DELAY_SECONDS: u64 = 5;
 const MAX_RECONNECTION_ATTEMPTS: u32 = 5;
+
+// Global registry for incoming stream managers
+lazy_static::lazy_static! {
+    static ref INCOMING_STREAM_MANAGERS: Mutex<HashMap<Uuid, Arc<StreamManager>>> = Mutex::new(HashMap::new());
+}
 
 #[derive(Debug, Clone)]
 pub struct Peer {
@@ -156,8 +161,19 @@ impl PeerManager {
     ) -> Result<()> {
         info!("🔗 Setting up stream manager for incoming QUIC connection");
         
+        // Get the temporary peer ID for this connection
+        let temp_peer_id = connection.get_peer_id();
+        info!("📋 Generated temporary peer ID for incoming connection: {}", temp_peer_id);
+        
         // Create stream manager for this connection
         let stream_manager = Arc::new(StreamManager::new(connection.clone(), message_tx.clone()));
+
+        // Register the stream manager globally so the handshake handler can find it
+        {
+            let mut registry = INCOMING_STREAM_MANAGERS.lock().unwrap();
+            registry.insert(temp_peer_id, stream_manager.clone());
+            info!("✅ Stream manager registered with temporary ID: {}", temp_peer_id);
+        }
 
         // Start stream listener - this will handle incoming messages and forward them to message_tx
         stream_manager.clone().start_stream_listener().await;
@@ -169,6 +185,14 @@ impl PeerManager {
         loop {
             if connection.is_closed() {
                 info!("📴 Incoming QUIC connection closed");
+                
+                // Clean up the stream manager from global registry
+                {
+                    let mut registry = INCOMING_STREAM_MANAGERS.lock().unwrap();
+                    if registry.remove(&temp_peer_id).is_some() {
+                        info!("🗑️ Cleaned up stream manager for temporary ID: {}", temp_peer_id);
+                    }
+                }
                 break;
             }
             
@@ -699,10 +723,10 @@ impl PeerManager {
                     reason: None,
                 });
 
-                // Send handshake response - try real device ID first, then temporary peer_id
+                // Send handshake response - try multiple strategies
                 let mut response_sent = false;
                 
-                // First try the real device ID (if stream manager was moved)
+                // Strategy 1: Try the real device ID (if stream manager was moved)
                 if let Some(stream_manager) = self.stream_managers.get(device_id) {
                     if let Err(e) = stream_manager.send_control_message(response.clone()).await {
                         warn!("Failed to send handshake response via real ID {}: {}", device_id, e);
@@ -712,14 +736,38 @@ impl PeerManager {
                     }
                 }
                 
-                // If that failed, try the temporary peer_id
+                // Strategy 2: Try the temporary peer_id in regular stream managers
                 if !response_sent {
                     if let Some(stream_manager) = self.stream_managers.get(&peer_id) {
-                        if let Err(e) = stream_manager.send_control_message(response).await {
+                        if let Err(e) = stream_manager.send_control_message(response.clone()).await {
                             error!("Failed to send handshake response via temporary ID {}: {}", peer_id, e);
                         } else {
                             info!("✅ Sent handshake response to peer {} (temporary ID)", peer_id);
                             response_sent = true;
+                        }
+                    }
+                }
+                
+                // Strategy 3: Try the global incoming stream manager registry
+                if !response_sent {
+                    let stream_manager_opt = {
+                        let registry = INCOMING_STREAM_MANAGERS.lock().unwrap();
+                        registry.get(&peer_id).cloned()
+                    };
+                    
+                    if let Some(stream_manager) = stream_manager_opt {
+                        if let Err(e) = stream_manager.send_control_message(response.clone()).await {
+                            error!("Failed to send handshake response via global registry {}: {}", peer_id, e);
+                        } else {
+                            info!("✅ Sent handshake response to peer {} (global registry)", peer_id);
+                            response_sent = true;
+                            
+                            // Move the stream manager from global registry to local storage
+                            let mut registry = INCOMING_STREAM_MANAGERS.lock().unwrap();
+                            if let Some(stream_manager) = registry.remove(&peer_id) {
+                                self.stream_managers.insert(*device_id, stream_manager);
+                                info!("📝 Moved stream manager from global registry to local storage for device {}", device_id);
+                            }
                         }
                     }
                 }
