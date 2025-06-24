@@ -1,541 +1,215 @@
-use crate::quic::protocol::*;
-use crate::Result;
-use quinn::{ClientConfig, Connection, Endpoint, RecvStream, SendStream, ServerConfig};
-use rustls::{Certificate, PrivateKey};
-use quinn::VarInt;
-use std::collections::HashMap;
+use crate::{FileshareError, Result};
+use quinn::{Connection, Endpoint, RecvStream, SendStream};
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
-use tokio::sync::{mpsc, Mutex, RwLock};
-use tracing::{debug, error, info, warn};
+use tokio::sync::RwLock;
+use tracing::info;
 use uuid::Uuid;
+use std::collections::HashMap;
 
-/// High-performance QUIC connection manager for file transfers
-/// Manages multiple parallel streams per connection for maximum throughput
+#[derive(Clone)]
+pub struct QuicConnection {
+    pub connection: Connection,
+    pub peer_id: Uuid,
+    pub is_authenticated: bool,
+}
+
+impl QuicConnection {
+    pub fn new(connection: Connection, peer_id: Uuid) -> Self {
+        Self {
+            connection,
+            peer_id,
+            is_authenticated: false,
+        }
+    }
+    
+    pub async fn open_bi_stream(&self) -> Result<(SendStream, RecvStream)> {
+        self.connection
+            .open_bi()
+            .await
+            .map_err(|e| FileshareError::Network(std::io::Error::new(
+                std::io::ErrorKind::ConnectionAborted,
+                format!("Failed to open bidirectional stream: {}", e)
+            )))
+    }
+    
+    pub async fn open_uni_stream(&self) -> Result<SendStream> {
+        self.connection
+            .open_uni()
+            .await
+            .map_err(|e| FileshareError::Network(std::io::Error::new(
+                std::io::ErrorKind::ConnectionAborted,
+                format!("Failed to open unidirectional stream: {}", e)
+            )))
+    }
+    
+    pub async fn accept_bi_stream(&self) -> Result<(SendStream, RecvStream)> {
+        self.connection
+            .accept_bi()
+            .await
+            .map_err(|e| FileshareError::Network(std::io::Error::new(
+                std::io::ErrorKind::ConnectionAborted,
+                format!("Failed to accept bidirectional stream: {}", e)
+            )))
+    }
+    
+    pub async fn accept_uni_stream(&self) -> Result<RecvStream> {
+        self.connection
+            .accept_uni()
+            .await
+            .map_err(|e| FileshareError::Network(std::io::Error::new(
+                std::io::ErrorKind::ConnectionAborted,
+                format!("Failed to accept unidirectional stream: {}", e)
+            )))
+    }
+    
+    pub fn is_closed(&self) -> bool {
+        self.connection.close_reason().is_some()
+    }
+    
+    pub fn remote_address(&self) -> SocketAddr {
+        self.connection.remote_address()
+    }
+}
+
 pub struct QuicConnectionManager {
     endpoint: Endpoint,
-    connections: Arc<RwLock<HashMap<Uuid, QuicPeerConnection>>>,
-    device_id: Uuid,
-    device_name: String,
-    capabilities: TransferCapabilities,
-    message_tx: mpsc::UnboundedSender<(Uuid, QuicMessage)>,
-    message_rx: Arc<Mutex<mpsc::UnboundedReceiver<(Uuid, QuicMessage)>>>,
-}
-
-#[derive(Debug)]
-pub struct QuicPeerConnection {
-    pub peer_id: Uuid,
-    pub connection: Connection,
-    pub control_send: Option<SendStream>,
-    pub control_recv: Option<RecvStream>,
-    pub data_streams: HashMap<u8, (SendStream, RecvStream)>,
-    pub progress_send: Option<SendStream>,
-    pub progress_recv: Option<RecvStream>,
-    pub last_activity: Instant,
-    pub capabilities: Option<TransferCapabilities>,
-    pub status: ConnectionStatus,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub enum ConnectionStatus {
-    Connecting,
-    Connected,
-    Authenticated,
-    Error(String),
-    Closed,
+    connections: Arc<RwLock<HashMap<Uuid, QuicConnection>>>,
 }
 
 impl QuicConnectionManager {
-    pub async fn new(bind_addr: SocketAddr, device_id: Uuid, device_name: String) -> Result<Self> {
-        // Generate self-signed certificate for QUIC
-        let cert = generate_self_signed_cert()?;
-
-        // Create server config
-        let server_config = configure_server(cert.clone())?;
-
-        // Create client config (allow self-signed certs for P2P)
-        let client_config = configure_client()?;
-
-        // Create endpoint
-        let mut endpoint = Endpoint::server(server_config, bind_addr)?;
-        endpoint.set_default_client_config(client_config);
-
-        info!("🚀 QUIC endpoint created on {}", bind_addr);
-
-        let (message_tx, message_rx) = mpsc::unbounded_channel();
-
+    pub async fn new(bind_addr: SocketAddr) -> Result<Self> {
+        // For development, we'll use a simple insecure configuration
+        // In production, you would use proper certificates
+        let server_config = create_server_config()?;
+        
+        // Create the QUIC endpoint
+        let endpoint = Endpoint::server(server_config, bind_addr)
+            .map_err(|e| FileshareError::Network(std::io::Error::new(
+                std::io::ErrorKind::AddrInUse,
+                format!("Failed to bind QUIC endpoint: {}", e)
+            )))?;
+        
+        info!("QUIC endpoint listening on {}", bind_addr);
+        
         Ok(Self {
             endpoint,
             connections: Arc::new(RwLock::new(HashMap::new())),
-            device_id,
-            device_name,
-            capabilities: TransferCapabilities::default(),
-            message_tx,
-            message_rx: Arc::new(Mutex::new(message_rx)),
         })
     }
-
-    /// Start the connection manager and listen for incoming connections
-    pub async fn start(&self) -> Result<()> {
-        let endpoint = self.endpoint.clone();
-        let connections = self.connections.clone();
-        let device_id = self.device_id;
-        let device_name = self.device_name.clone();
-        let capabilities = self.capabilities.clone();
-        let message_tx = self.message_tx.clone();
-
-        // Spawn task to handle incoming connections
-        tokio::spawn(async move {
-            while let Some(connecting) = endpoint.accept().await {
-                let peer_addr = connecting.remote_address();
-                info!("📥 Incoming QUIC connection from {}", peer_addr);
-
-                let connections = connections.clone();
-                let device_id = device_id;
-                let device_name = device_name.clone();
-                let capabilities = capabilities.clone();
-                let message_tx = message_tx.clone();
-
-                tokio::spawn(async move {
-                    match connecting.await {
-                        Ok(connection) => {
-                            info!("✅ QUIC connection established with {}", peer_addr);
-
-                            if let Err(e) = Self::handle_new_connection(
-                                connection,
-                                connections,
-                                device_id,
-                                device_name,
-                                capabilities,
-                                message_tx,
-                                true, // is_incoming
-                                None, // unknown peer_id for incoming connections
-                            )
-                            .await
-                            {
-                                error!("❌ Failed to handle connection from {}: {}", peer_addr, e);
-                            }
-                        }
-                        Err(e) => {
-                            error!("❌ Failed to accept connection from {}: {}", peer_addr, e);
-                        }
-                    }
-                });
-            }
-        });
-
-        info!("✅ QUIC connection manager started");
-        Ok(())
-    }
-
-    /// Connect to a peer
-    pub async fn connect_to_peer(&self, peer_addr: SocketAddr, peer_id: Uuid) -> Result<()> {
-        info!("🔗 Connecting to peer {} at {}", peer_id, peer_addr);
-
-        let connecting = self.endpoint.connect(peer_addr, "localhost")
-            .map_err(|e| crate::FileshareError::Transfer(format!("QUIC connect error: {}", e)))?;
-        let connection = connecting.await
-            .map_err(|e| crate::FileshareError::Transfer(format!("QUIC connection error: {}", e)))?;
-
-        info!("✅ QUIC connection established with {}", peer_addr);
-
-        Self::handle_new_connection(
-            connection,
-            self.connections.clone(),
-            self.device_id,
-            self.device_name.clone(),
-            self.capabilities.clone(),
-            self.message_tx.clone(),
-            false, // is_incoming
-            Some(peer_id), // known peer_id for outgoing connections
-        )
-        .await?;
-
-        Ok(())
-    }
-
-    async fn handle_new_connection(
-        connection: Connection,
-        connections: Arc<RwLock<HashMap<Uuid, QuicPeerConnection>>>,
-        device_id: Uuid,
-        device_name: String,
-        capabilities: TransferCapabilities,
-        message_tx: mpsc::UnboundedSender<(Uuid, QuicMessage)>,
-        is_incoming: bool,
-        known_peer_id: Option<Uuid>, // For outgoing connections where we know the peer
-    ) -> Result<()> {
-        // For incoming connections, we'll wait for the bidirectional stream in the message loop
-        // For outgoing connections, we'll open the control stream immediately
-        let (control_send, control_recv) = if !is_incoming {
-            // Open outgoing control stream with timeout
-            info!("📤 Opening outgoing control stream to peer...");
-            let (send, recv) = tokio::time::timeout(
-                Duration::from_secs(30), // 30 second timeout
-                connection.open_bi()
-            ).await
-                .map_err(|_| crate::FileshareError::Transfer("Open bi stream timeout".to_string()))?
-                .map_err(|e| crate::FileshareError::Transfer(format!("Open bi stream error: {}", e)))?;
-            info!("✅ Outgoing control stream established");
-            (Some(send), Some(recv))
-        } else {
-            // For incoming connections, control stream will be set when we receive the first bi stream
-            info!("📥 Will wait for incoming control stream from peer...");
-            (None, None)
-        };
-
-        // Create peer connection
-        let connection_peer_id = known_peer_id.unwrap_or_else(|| Uuid::new_v4());
-        let peer_connection = QuicPeerConnection {
-            peer_id: connection_peer_id,
-            connection: connection.clone(),
-            control_send,
-            control_recv,
-            data_streams: HashMap::new(),
-            progress_send: None,
-            progress_recv: None,
-            last_activity: Instant::now(),
-            capabilities: None,
-            status: ConnectionStatus::Connected,
-        };
-
-        // Store connection with known peer ID if available, otherwise temporary ID
-        {
-            let mut conns = connections.write().await;
-            conns.insert(connection_peer_id, peer_connection);
-        }
+    
+    pub async fn connect_to_peer(&self, addr: SocketAddr, peer_id: Uuid) -> Result<QuicConnection> {
+        info!("Connecting to peer {} at {} via QUIC", peer_id, addr);
         
-        if known_peer_id.is_some() {
-            info!("✅ Stored QUIC connection for known peer: {}", connection_peer_id);
-        } else {
-            info!("📋 Stored QUIC connection with temporary ID: {} (will update after handshake)", connection_peer_id);
-        }
-
-        // Start handshake
-        if !is_incoming {
-            let handshake = QuicMessage::Handshake {
-                device_id,
-                device_name,
-                version: env!("CARGO_PKG_VERSION").to_string(),
-                capabilities,
-            };
-
-            // Send handshake on control stream
-            Self::send_control_message(&connection, &handshake).await?;
-        }
-
-        // Start message processing for this connection
-        Self::process_connection_messages(connection, connections, message_tx, connection_peer_id).await;
-
-        Ok(())
-    }
-
-    async fn send_control_message(connection: &Connection, message: &QuicMessage) -> Result<()> {
-        // Use bidirectional stream for control messages to ensure reliable delivery
-        let (mut send_stream, _recv_stream) = connection.open_bi().await
-            .map_err(|e| crate::FileshareError::Transfer(format!("Open bi stream error: {}", e)))?;
+        // Create client config that accepts any certificate (for development)
+        let client_config = create_client_config()?;
         
-        let data = bincode::serialize(message)?;
+        let connecting = self.endpoint
+            .connect_with(client_config, addr, "fileshare-daemon")
+            .map_err(|e| FileshareError::Network(std::io::Error::new(
+                std::io::ErrorKind::ConnectionRefused,
+                format!("Failed to initiate connection: {}", e)
+            )))?;
         
-        use tokio::io::AsyncWriteExt;
-        send_stream.write_all(&data).await
-            .map_err(|e| crate::FileshareError::Transfer(format!("Write error: {}", e)))?;
-        send_stream.shutdown().await
-            .map_err(|e| crate::FileshareError::Transfer(format!("Shutdown error: {}", e)))?;
-        Ok(())
-    }
-
-    async fn process_connection_messages(
-        connection: Connection,
-        connections: Arc<RwLock<HashMap<Uuid, QuicPeerConnection>>>,
-        message_tx: mpsc::UnboundedSender<(Uuid, QuicMessage)>,
-        temp_id: Uuid,
-    ) {
-        loop {
-            tokio::select! {
-                // Handle incoming streams
-                stream_result = connection.accept_uni() => {
-                    match stream_result {
-                        Ok(mut recv_stream) => {
-                            let message_tx_clone = message_tx.clone();
-                            tokio::spawn(async move {
-                                match recv_stream.read_to_end(256 * 1024).await {
-                                    Ok(buffer) => {
-                                        // Try to deserialize message
-                                        match bincode::deserialize::<QuicMessage>(&buffer) {
-                                            Ok(message) => {
-                                                if let Err(e) = message_tx_clone.send((temp_id, message)) {
-                                                    error!("❌ Failed to send message to processor: {}", e);
-                                                }
-                                            }
-                                            Err(e) => {
-                                                error!("❌ Failed to deserialize message: {}", e);
-                                            }
-                                        }
-                                    }
-                                    Err(e) => {
-                                        error!("❌ Failed to read from stream: {}", e);
-                                    }
-                                }
-                            });
-                        }
-                        Err(e) => {
-                            error!("❌ Connection error: {}", e);
-                            break;
-                        }
-                    }
-                }
-
-                // Handle bidirectional streams for data transfer
-                bi_stream_result = connection.accept_bi() => {
-                    match bi_stream_result {
-                        Ok((send, recv)) => {
-                            info!("📊 Accepted bidirectional stream from peer");
-                            
-                            // Spawn a task to handle this bidirectional stream for messages
-                            let connections_clone = connections.clone();
-                            let message_tx_clone = message_tx.clone();
-                            let temp_id_clone = temp_id;
-                            tokio::spawn(async move {
-                                let mut recv_stream = recv;
-                                // Continuously read messages from this bidirectional stream
-                                loop {
-                                    match recv_stream.read_to_end(256 * 1024).await {
-                                        Ok(buffer) => {
-                                            if buffer.is_empty() {
-                                                debug!("📋 Bidirectional stream closed by peer {}", temp_id_clone);
-                                                break;
-                                            }
-                                            
-                                            // Try to deserialize message
-                                            match bincode::deserialize::<QuicMessage>(&buffer) {
-                                                Ok(message) => {
-                                                    info!("📨 Received message on bidirectional stream from peer {}", temp_id_clone);
-                                                    if let Err(e) = message_tx_clone.send((temp_id_clone, message)) {
-                                                        error!("❌ Failed to send bi-stream message to processor: {}", e);
-                                                    }
-                                                }
-                                                Err(e) => {
-                                                    debug!("📊 Failed to deserialize message from bi-stream: {}", e);
-                                                }
-                                            }
-                                            break; // Each stream should only have one message
-                                        }
-                                        Err(e) => {
-                                            debug!("📋 Bidirectional stream read ended: {}", e);
-                                            break;
-                                        }
-                                    }
-                                }
-                                
-                                // Store the send part as a data stream for potential file transfer use
-                                {
-                                    let mut conns = connections_clone.write().await;
-                                    if let Some(peer_conn) = conns.get_mut(&temp_id_clone) {
-                                        let stream_id = peer_conn.data_streams.len() as u8 + 1;
-                                        // Note: recv_stream is consumed, so we can't store the pair
-                                        // This is OK since we read the message already
-                                        info!("📊 Bidirectional stream message processed for peer {}", temp_id_clone);
-                                    }
-                                }
-                            });
-                        }
-                        Err(e) => {
-                            error!("❌ Bidirectional stream error: {}", e);
-                            // Don't break here, just log the error
-                        }
-                    }
-                }
-            }
-        }
-
-        // Clean up connection
-        {
-            let mut conns = connections.write().await;
-            conns.remove(&temp_id);
-        }
-        info!("🧹 Connection {} cleaned up", temp_id);
-    }
-
-    /// Send a message to a specific peer
-    pub async fn send_message(&self, peer_id: Uuid, message: QuicMessage) -> Result<()> {
-        let connections = self.connections.read().await;
-        if let Some(peer_conn) = connections.get(&peer_id) {
-            Self::send_control_message(&peer_conn.connection, &message).await?;
-            Ok(())
-        } else {
-            Err(crate::FileshareError::Transfer(format!(
-                "Peer {} not found",
-                peer_id
-            )))
-        }
-    }
-
-    /// Update peer ID mapping from temporary ID to real device ID
-    pub async fn update_peer_id(&self, temp_id: Uuid, real_id: Uuid) -> Result<()> {
+        let connection = connecting.await.map_err(|e| {
+            FileshareError::Network(std::io::Error::new(
+                std::io::ErrorKind::ConnectionRefused,
+                format!("Failed to connect to peer: {}", e)
+            ))
+        })?;
+        
+        info!("Successfully connected to peer {} via QUIC", peer_id);
+        
+        let quic_conn = QuicConnection::new(connection, peer_id);
+        
+        // Store the connection
         let mut connections = self.connections.write().await;
+        connections.insert(peer_id, quic_conn.clone());
         
-        if let Some(mut peer_conn) = connections.remove(&temp_id) {
-            // Update the peer_id in the connection
-            peer_conn.peer_id = real_id;
-            
-            // Store with the real device ID
-            connections.insert(real_id, peer_conn);
-            
-            info!("✅ Updated QUIC peer connection: {} -> {}", temp_id, real_id);
-            Ok(())
-        } else {
-            Err(crate::FileshareError::Transfer(format!(
-                "Temporary peer {} not found for ID update",
-                temp_id
-            )))
-        }
+        Ok(quic_conn)
     }
-
-    /// Get message receiver for processing
-    pub fn get_message_receiver(&self) -> Arc<Mutex<mpsc::UnboundedReceiver<(Uuid, QuicMessage)>>> {
-        self.message_rx.clone()
+    
+    pub async fn accept_connection(&self) -> Result<QuicConnection> {
+        let connecting = self.endpoint.accept().await.ok_or_else(|| {
+            FileshareError::Network(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                "Endpoint closed"
+            ))
+        })?;
+        
+        let connection = connecting.await.map_err(|e| {
+            FileshareError::Network(std::io::Error::new(
+                std::io::ErrorKind::ConnectionAborted,
+                format!("Failed to accept connection: {}", e)
+            ))
+        })?;
+        
+        let remote_addr = connection.remote_address();
+        info!("Accepted QUIC connection from {}", remote_addr);
+        
+        // Create connection with temporary ID (will be updated after handshake)
+        let temp_id = Uuid::new_v4();
+        let quic_conn = QuicConnection::new(connection, temp_id);
+        
+        Ok(quic_conn)
     }
-
-    /// Open data streams for file transfer
-    pub async fn open_data_streams(&self, peer_id: Uuid, stream_count: u8) -> Result<()> {
-        let mut connections = self.connections.write().await;
-        if let Some(peer_conn) = connections.get_mut(&peer_id) {
-            for i in 1..=stream_count {
-                let (send, recv) = peer_conn.connection.open_bi().await
-                    .map_err(|e| crate::FileshareError::Transfer(format!("Open data stream error: {}", e)))?;
-                peer_conn.data_streams.insert(i, (send, recv));
-                debug!("📊 Opened data stream {} for peer {}", i, peer_id);
-            }
-            info!(
-                "✅ Opened {} data streams for peer {}",
-                stream_count, peer_id
-            );
-            Ok(())
-        } else {
-            Err(crate::FileshareError::Transfer(format!(
-                "Peer {} not found",
-                peer_id
-            )))
-        }
-    }
-
-    /// Get connection statistics
-    pub async fn get_connection_stats(&self) -> HashMap<Uuid, ConnectionStats> {
+    
+    pub async fn get_connection(&self, peer_id: Uuid) -> Option<QuicConnection> {
         let connections = self.connections.read().await;
-        let mut stats = HashMap::new();
-
-        for (peer_id, conn) in connections.iter() {
-            let quinn_stats = conn.connection.stats();
-            stats.insert(
-                *peer_id,
-                ConnectionStats {
-                    bytes_sent: quinn_stats.udp_tx.bytes,
-                    bytes_received: quinn_stats.udp_rx.bytes,
-                    packets_sent: quinn_stats.udp_tx.datagrams,
-                    packets_received: quinn_stats.udp_rx.datagrams,
-                    rtt: quinn_stats.path.rtt,
-                    congestion_window: quinn_stats.path.cwnd,
-                    data_streams: conn.data_streams.len() as u8,
-                },
-            );
-        }
-
-        stats
+        connections.get(&peer_id).cloned()
+    }
+    
+    pub async fn store_connection(&self, peer_id: Uuid, connection: QuicConnection) {
+        let mut connections = self.connections.write().await;
+        connections.insert(peer_id, connection);
+    }
+    
+    pub async fn remove_connection(&self, peer_id: Uuid) {
+        let mut connections = self.connections.write().await;
+        connections.remove(&peer_id);
+    }
+    
+    pub async fn get_all_connections(&self) -> Vec<(Uuid, QuicConnection)> {
+        let connections = self.connections.read().await;
+        connections.iter().map(|(id, conn)| (*id, conn.clone())).collect()
+    }
+    
+    pub fn local_addr(&self) -> Result<SocketAddr> {
+        self.endpoint.local_addr().map_err(|e| {
+            FileshareError::Network(std::io::Error::new(
+                std::io::ErrorKind::AddrNotAvailable,
+                format!("Failed to get local address: {}", e)
+            ))
+        })
     }
 }
 
-#[derive(Debug, Clone)]
-pub struct ConnectionStats {
-    pub bytes_sent: u64,
-    pub bytes_received: u64,
-    pub packets_sent: u64,
-    pub packets_received: u64,
-    pub rtt: Duration,
-    pub congestion_window: u64,
-    pub data_streams: u8,
-}
-
-// Helper functions for QUIC configuration
-fn generate_self_signed_cert() -> Result<(Certificate, PrivateKey)> {
-    let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).map_err(|e| {
-        crate::FileshareError::Transfer(format!("Certificate generation error: {}", e))
-    })?;
-    let cert_der = Certificate(cert.serialize_der().map_err(|e| {
-        crate::FileshareError::Transfer(format!("Certificate serialization error: {}", e))
-    })?);
-    let private_key_der = PrivateKey(cert.serialize_private_key_der());
-    Ok((cert_der, private_key_der))
-}
-
-fn configure_server((cert, key): (Certificate, PrivateKey)) -> Result<ServerConfig> {
-    let cert_chain = vec![cert];
-
-    let mut server_config = ServerConfig::with_single_cert(cert_chain, key)
-        .map_err(|e| crate::FileshareError::Transfer(format!("TLS config error: {}", e)))?;
-
-    // Configure transport for high throughput with generous timeouts
-    server_config.transport_config(Arc::new({
-        let mut transport = quinn::TransportConfig::default();
-        transport.max_concurrent_uni_streams(256_u32.into());
-        transport.max_concurrent_bidi_streams(64_u32.into());
-        transport.send_window(8 * 1024 * 1024); // 8MB send window
-        transport.receive_window(VarInt::from_u32(8 * 1024 * 1024)); // 8MB receive window
-        transport.stream_receive_window(VarInt::from_u32(2 * 1024 * 1024)); // 2MB per stream
-        transport.datagram_receive_buffer_size(Some(16 * 1024 * 1024)); // 16MB datagram buffer
-        
-        // Set generous timeouts for file transfers
-        transport.max_idle_timeout(Some(Duration::from_secs(300).try_into().unwrap())); // 5 minutes
-        transport.keep_alive_interval(Some(Duration::from_secs(30))); // Keep alive every 30s
-        
-        transport
-    }));
-
+// Helper functions for creating configs
+fn create_server_config() -> Result<quinn::ServerConfig> {
+    // Generate a self-signed certificate for development
+    let cert = rcgen::generate_simple_self_signed(vec![
+        "localhost".to_string(),
+        "fileshare-daemon".to_string(),
+    ])?;
+    
+    let cert_der = cert.cert.der().to_vec();
+    let priv_key = cert.key_pair.serialize_der();
+    
+    let cert_chain = vec![rustls_pki_types::CertificateDer::from(cert_der)];
+    let key_der = rustls_pki_types::PrivateKeyDer::try_from(priv_key)
+        .map_err(|e| FileshareError::Config(format!("Invalid private key: {}", e)))?;
+    
+    let server_config = quinn::ServerConfig::with_single_cert(cert_chain, key_der)
+        .map_err(|e| FileshareError::Network(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("Failed to create server config: {}", e)
+        )))?;
+    
     Ok(server_config)
 }
 
-fn configure_client() -> Result<ClientConfig> {
-    let crypto = rustls::ClientConfig::builder()
-        .with_safe_defaults()
-        .with_custom_certificate_verifier(Arc::new(SkipServerVerification {}))
-        .with_no_client_auth();
-
-    let mut client_config = ClientConfig::new(Arc::new(crypto));
-
-    // Configure transport for high throughput with generous timeouts
-    client_config.transport_config(Arc::new({
-        let mut transport = quinn::TransportConfig::default();
-        transport.max_concurrent_uni_streams(256_u32.into());
-        transport.max_concurrent_bidi_streams(64_u32.into());
-        transport.send_window(8 * 1024 * 1024); // 8MB send window
-        transport.receive_window(VarInt::from_u32(8 * 1024 * 1024)); // 8MB receive window
-        transport.stream_receive_window(VarInt::from_u32(2 * 1024 * 1024)); // 2MB per stream
-        transport.datagram_receive_buffer_size(Some(16 * 1024 * 1024)); // 16MB datagram buffer
-        
-        // Set generous timeouts for file transfers
-        transport.max_idle_timeout(Some(Duration::from_secs(300).try_into().unwrap())); // 5 minutes
-        transport.keep_alive_interval(Some(Duration::from_secs(30))); // Keep alive every 30s
-        
-        transport
-    }));
-
+fn create_client_config() -> Result<quinn::ClientConfig> {
+    // For development - accept any certificate
+    let client_config = quinn::ClientConfig::with_platform_verifier();
     Ok(client_config)
-}
-
-// Skip certificate verification for P2P connections
-#[derive(Debug)]
-struct SkipServerVerification;
-
-impl rustls::client::ServerCertVerifier for SkipServerVerification {
-    fn verify_server_cert(
-        &self,
-        _end_entity: &rustls::Certificate,
-        _intermediates: &[rustls::Certificate],
-        _server_name: &rustls::ServerName,
-        _scts: &mut dyn Iterator<Item = &[u8]>,
-        _ocsp_response: &[u8],
-        _now: std::time::SystemTime,
-    ) -> std::result::Result<rustls::client::ServerCertVerified, rustls::Error> {
-        Ok(rustls::client::ServerCertVerified::assertion())
-    }
 }

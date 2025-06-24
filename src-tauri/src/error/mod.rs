@@ -41,3 +41,21 @@ impl From<mdns::Error> for FileshareError {
         FileshareError::Mdns(err.to_string())
     }
 }
+
+// Implement From for rcgen::Error
+impl From<rcgen::Error> for FileshareError {
+    fn from(err: rcgen::Error) -> Self {
+        FileshareError::Config(format!("Certificate generation error: {}", err))
+    }
+}
+
+// Implement From for rustls::Error
+impl From<rustls::Error> for FileshareError {
+    fn from(err: rustls::Error) -> Self {
+        FileshareError::Network(std::io::Error::new(
+            std::io::ErrorKind::Other,
+            format!("TLS error: {}", err),
+        ))
+    }
+}
+

@@ -47,16 +47,13 @@ lz4 = "1.24"
 sysinfo = "0.30"
 # Network optimization
 socket2 = "0.5"
-# QUIC Protocol for high-performance file transfers
-quinn = "0.10"
-rustls = { version = "0.21", features = ["dangerous_configuration"] }
-rcgen = "0.10"
-# Zero-copy and memory mapping
-memmap2 = "0.9"
-# High-performance async
+# QUIC support
+quinn = "0.11"
+rustls = "0.23"
+rustls-pki-types = "1.0"
+rustls-pemfile = "2.0"
+rcgen = "0.13"
 futures = "0.3"
-# Ring buffer for streaming
-ringbuf = "0.4"
 
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.52", features = [

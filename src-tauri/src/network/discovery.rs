@@ -1,4 +1,4 @@
-use crate::{config::Settings, network::peer::PeerManager, Result};
+use crate::{config::Settings, network::peer_quic::PeerManager, Result};
 use serde::{Deserialize, Serialize};
 use serde_json;
 use std::collections::HashMap;

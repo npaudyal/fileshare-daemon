@@ -5,7 +5,6 @@ use crate::{
     network::{DiscoveryService, PeerManager},
     service::file_transfer::TransferDirection,
     utils::format_file_size,
-    quic::QuicIntegration,
     Result,
 };
 use std::sync::Arc;
@@ -20,7 +19,6 @@ pub struct FileshareDaemon {
     clipboard: ClipboardManager,
     shutdown_tx: broadcast::Sender<()>,
     shutdown_rx: broadcast::Receiver<()>,
-    quic_integration: Option<Arc<QuicIntegration>>,
 }
 
 impl FileshareDaemon {
@@ -54,45 +52,6 @@ impl FileshareDaemon {
             clipboard,
             shutdown_tx,
             shutdown_rx,
-            quic_integration: None,
-        })
-    }
-
-    /// Create a new FileshareDaemon with QUIC integration
-    pub async fn new_with_quic(settings: Settings, quic_integration: Option<QuicIntegration>) -> Result<Self> {
-        let settings = Arc::new(settings);
-        let (shutdown_tx, shutdown_rx) = broadcast::channel(1);
-
-        // Wrap QUIC integration in Arc if provided
-        let quic_integration = quic_integration.map(Arc::new);
-
-        // Initialize peer manager with QUIC support
-        let peer_manager = PeerManager::new_with_quic(settings.clone(), quic_integration.clone()).await?;
-        let peer_manager = Arc::new(RwLock::new(peer_manager));
-
-        // Initialize discovery service
-        let discovery = DiscoveryService::new(
-            settings.clone(),
-            peer_manager.clone(),
-            shutdown_tx.subscribe(),
-        )
-        .await?;
-
-        // Initialize hotkey manager
-        let hotkey_manager = HotkeyManager::new()?;
-
-        // Initialize clipboard manager with device ID
-        let clipboard = ClipboardManager::new(settings.device.id);
-
-        Ok(Self {
-            settings,
-            discovery: Some(discovery),
-            peer_manager,
-            hotkey_manager: Some(hotkey_manager),
-            clipboard,
-            shutdown_tx,
-            shutdown_rx,
-            quic_integration,
         })
     }
 
@@ -113,8 +72,6 @@ impl FileshareDaemon {
         let mut hotkey_manager = HotkeyManager::new()?;
         let peer_manager_for_hotkeys = self.peer_manager.clone();
         let clipboard_for_hotkeys = self.clipboard.clone();
-        let quic_integration_for_hotkeys = self.quic_integration.clone();
-        let settings_for_hotkeys = self.settings.clone();
 
         tokio::spawn(async move {
             if let Err(e) = hotkey_manager.start().await {
@@ -126,8 +83,6 @@ impl FileshareDaemon {
                 &mut hotkey_manager,
                 peer_manager_for_hotkeys,
                 clipboard_for_hotkeys,
-                quic_integration_for_hotkeys,
-                settings_for_hotkeys,
             )
             .await;
         });
@@ -216,15 +171,13 @@ impl FileshareDaemon {
         let hotkey_handle = {
             let peer_manager = self.peer_manager.clone();
             let clipboard = self.clipboard.clone();
-            let quic_integration = self.quic_integration.clone();
-            let settings = self.settings.clone();
             let mut hotkey_manager = self.hotkey_manager.take().unwrap();
             let mut shutdown_rx = self.shutdown_tx.subscribe();
 
             tokio::spawn(async move {
                 info!("🎹 Starting hotkey event handler...");
                 tokio::select! {
-                    _ = Self::handle_hotkey_events(&mut hotkey_manager, peer_manager, clipboard, quic_integration, settings) => {
+                    _ = Self::handle_hotkey_events(&mut hotkey_manager, peer_manager, clipboard) => {
                         info!("🎹 Hotkey handler stopped");
                     }
                     _ = shutdown_rx.recv() => {
@@ -257,8 +210,6 @@ impl FileshareDaemon {
         hotkey_manager: &mut HotkeyManager,
         peer_manager: Arc<RwLock<PeerManager>>,
         clipboard: ClipboardManager,
-        quic_integration: Option<Arc<QuicIntegration>>,
-        settings: Arc<Settings>,
     ) {
         info!("🎹 Enhanced hotkey event handler active and listening...");
 
@@ -283,8 +234,6 @@ impl FileshareDaemon {
                         if let Err(e) = Self::handle_paste_operation_enhanced(
                             clipboard.clone(),
                             peer_manager.clone(),
-                            quic_integration.clone(),
-                            settings.clone(),
                         )
                         .await
                         {
@@ -402,8 +351,6 @@ impl FileshareDaemon {
     async fn handle_paste_operation_enhanced(
         clipboard: ClipboardManager,
         peer_manager: Arc<RwLock<PeerManager>>,
-        quic_integration: Option<Arc<QuicIntegration>>,
-        settings: Arc<Settings>,
     ) -> Result<()> {
         info!("📁 Handling enhanced paste operation with validation");
 
@@ -450,104 +397,24 @@ impl FileshareDaemon {
                 file_size_mb
             );
 
-            // Try QUIC first for high-speed transfer
-            let mut use_quic = false;
-            info!("🔍 Starting QUIC connection attempt...");
-            if let Some(ref quic) = quic_integration {
-                info!("✅ QUIC integration available");
-                // Get peer info from peer manager to get real IP address
-                let pm = peer_manager.read().await;
-                info!("✅ Got peer manager lock");
-                if let Some(peer) = pm.get_peer(&source_device) {
-                    info!("✅ Found peer in discovery: {}", source_device);
-                    let peer_ip = peer.device_info.addr.ip();
-                    let quic_port = settings.network.port + settings.network.quic_port_offset;
-                    let quic_addr = format!("{}:{}", peer_ip, quic_port);
-                    
-                    info!("🚀 Attempting QUIC connection to {} for high-speed transfer", quic_addr);
-                    
-                    // Try to establish QUIC connection
-                    match quic.connect_to_peer(
-                        quic_addr.parse().map_err(|e| crate::FileshareError::Config(format!("Invalid QUIC address: {}", e)))?,
-                        source_device
-                    ).await {
-                        Ok(()) => {
-                            info!("✅ QUIC connection established for high-speed transfer to {}", quic_addr);
-                            
-                            // Wait a moment for handshake to complete
-                            tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
-                            info!("⏰ Waited for QUIC handshake completion");
-                            
-                            use_quic = true;
-                        }
-                        Err(e) => {
-                            error!("❌ QUIC connection to {} failed, falling back to TCP: {}", quic_addr, e);
-                            use_quic = false;
-                        }
-                    }
-                } else {
-                    info!("📡 Peer {} not found in discovery, using TCP", source_device);
-                }
-            } else {
-                info!("⚠️ QUIC integration not available");
-            }
-            
-            info!("🔍 About to proceed with file transfer, use_quic = {}", use_quic);
+            // Send file request to source device
+            let request_id = uuid::Uuid::new_v4();
+            let message = crate::network::protocol::Message::new(
+                crate::network::protocol::MessageType::FileRequest {
+                    request_id,
+                    file_path: source_file_path,
+                    target_path: target_path.to_string_lossy().to_string(),
+                },
+            );
 
-            info!("🔍 Debug: use_quic = {}, quic_integration available = {}", use_quic, quic_integration.is_some());
-            
-            let send_result = if use_quic {
-                // Use QUIC for high-speed file transfer
-                info!("🚀 Initiating QUIC file transfer for high-speed delivery");
-                
-                if let Some(ref quic) = quic_integration {
-                    match quic.request_file(
-                        source_device,
-                        source_file_path.clone(),
-                        target_path.to_string_lossy().to_string(),
-                    ).await {
-                        Ok(request_id) => {
-                            info!("✅ QUIC file request sent with ID: {}", request_id);
-                            Ok(())
-                        }
-                        Err(e) => {
-                            warn!("⚠️ QUIC file transfer failed: {}, falling back to TCP", e);
-                            // Fall back to TCP
-                            let request_id = uuid::Uuid::new_v4();
-                            let message = crate::network::protocol::Message::new(
-                                crate::network::protocol::MessageType::FileRequest {
-                                    request_id,
-                                    file_path: source_file_path,
-                                    target_path: target_path.to_string_lossy().to_string(),
-                                },
-                            );
-                            
-                            let mut pm = peer_manager.write().await;
-                            pm.send_message_to_peer(source_device, message).await
-                        }
-                    }
-                } else {
-                    return Err(crate::FileshareError::Config("QUIC integration not available".to_string()));
-                }
-            } else {
-                // Standard TCP file transfer
-                let request_id = uuid::Uuid::new_v4();
-                let message = crate::network::protocol::Message::new(
-                    crate::network::protocol::MessageType::FileRequest {
-                        request_id,
-                        file_path: source_file_path,
-                        target_path: target_path.to_string_lossy().to_string(),
-                    },
-                );
-
+            // Send the message (extract this into a separate scope to avoid borrow conflicts)
+            let send_result = {
                 let mut pm = peer_manager.write().await;
                 pm.send_message_to_peer(source_device, message).await
             };
 
-            info!("🔍 File transfer request completed, checking result...");
             match send_result {
                 Ok(()) => {
-                    info!("✅ File transfer request sent successfully");
                     // Show enhanced notification with file details
                     let file_size_mb = file_size as f64 / (1024.0 * 1024.0);
 
@@ -589,11 +456,8 @@ impl FileshareDaemon {
                     return Err(e);
                 }
             }
-        } else {
-            info!("📋 No network clipboard content available for paste");
         }
 
-        info!("✅ Enhanced paste operation completed");
         Ok(())
     }
 

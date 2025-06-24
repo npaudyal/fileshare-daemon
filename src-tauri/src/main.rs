@@ -1174,35 +1174,9 @@ async fn start_daemon(app_handle: tauri::AppHandle) -> Result<(), Box<dyn std::e
         settings_lock.clone()
     };
 
-    // Create QUIC integration if enabled
-    let quic_integration = if settings.network.quic_enabled {
-        let bind_addr = format!("0.0.0.0:{}", settings.network.port + settings.network.quic_port_offset)
-            .parse()
-            .map_err(|e| format!("Invalid QUIC bind address: {}", e))?;
-
-        info!("🚀 Initializing QUIC integration on {}", bind_addr);
-        
-        let quic = fileshare_daemon::quic::QuicIntegration::new(
-            bind_addr,
-            settings.device.id,
-            settings.device.name.clone(),
-        ).await
-        .map_err(|e| format!("Failed to create QUIC integration: {}", e))?;
-
-        // Start QUIC services
-        quic.start().await
-            .map_err(|e| format!("Failed to start QUIC: {}", e))?;
-
-        info!("✅ QUIC integration started successfully");
-        Some(quic)
-    } else {
-        info!("📡 QUIC disabled in settings, using TCP only");
-        None
-    };
-
-    // Create the daemon with QUIC support
+    // Create the daemon wrapped in Arc for shared ownership
     let daemon = Arc::new(
-        FileshareDaemon::new_with_quic(settings, quic_integration)
+        FileshareDaemon::new(settings)
             .await
             .map_err(|e| format!("Failed to create daemon: {}", e))?,
     );

@@ -1,13 +1,9 @@
-pub mod protocol;
 pub mod connection;
-pub mod transfer;
+pub mod protocol;
 pub mod stream_manager;
-pub mod progress;
-pub mod integration;
-pub mod demo;
+pub mod transfer;
 
-// Re-export main types for easier usage
-pub use integration::QuicIntegration;
-pub use protocol::{QuicMessage, QuicFileMetadata, TransferCapabilities, CompressionType};
-pub use transfer::{TransferStatus, TransferDirection};
-pub use connection::ConnectionStats;
+pub use connection::{QuicConnection, QuicConnectionManager};
+pub use protocol::{QuicMessage, StreamType};
+pub use stream_manager::StreamManager;
+pub use transfer::{QuicFileTransfer, ParallelTransferManager};
