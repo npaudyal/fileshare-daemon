@@ -165,20 +165,25 @@ impl FileshareDaemon {
         });
 
         // Handle messages from peers
+        // Extract the message receiver to avoid holding the lock while waiting
+        let mut message_rx = {
+            let mut pm = peer_manager.write().await;
+            std::mem::replace(&mut pm.message_rx, tokio::sync::mpsc::unbounded_channel().1)
+        };
+
         loop {
-            let (peer_id, message) = {
-                let mut pm = peer_manager.write().await;
-                match pm.message_rx.recv().await {
-                    Some((peer_id, message)) => (peer_id, message),
-                    None => {
-                        warn!("Message channel closed");
-                        break;
-                    }
+            // Wait for messages without holding any locks
+            let (peer_id, message) = match message_rx.recv().await {
+                Some((peer_id, message)) => (peer_id, message),
+                None => {
+                    warn!("Message channel closed");
+                    break;
                 }
             };
 
             info!("📨 Received message from {}: {:?}", peer_id, message.message_type);
 
+            // Only lock when handling the message
             let mut pm = peer_manager.write().await;
             if let Err(e) = pm.handle_message(peer_id, message, &clipboard).await {
                 error!("❌ Failed to handle message from {}: {}", peer_id, e);

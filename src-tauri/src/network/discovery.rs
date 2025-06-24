@@ -270,12 +270,15 @@ impl DiscoveryService {
         );
 
         // Update discovered devices
+        info!("📥 Updating discovered devices map for: {}", device_info.name);
         {
             let mut devices = discovered_devices.write().await;
             devices.insert(device_id, device_info.clone());
+            info!("✅ Device {} added to discovered devices map", device_info.name);
         }
 
         // Notify peer manager
+        info!("🔄 About to notify peer manager about device: {}", device_info.name);
         {
             let mut pm = peer_manager.write().await;
             info!("🔄 Notifying peer manager about device: {}", device_info.name);
