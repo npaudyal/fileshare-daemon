@@ -2,11 +2,8 @@ use crate::{
     config::Settings,
     network::{discovery::DeviceInfo, protocol::*},
     quic::{
-        ParallelTransferManager, QuicConnection, QuicConnectionManager, QuicFileTransfer,
+        OptimizedTransfer, OptimizedReceiver, QuicConnection, QuicConnectionManager,
         StreamManager,
-    },
-    service::file_transfer::{
-        FileTransferManager, MessageSender, TransferDirection, TransferStatus,
     },
     FileshareError, Result,
 };
@@ -27,12 +24,7 @@ const MAX_MISSED_PINGS: u32 = 3;
 const RECONNECTION_DELAY_SECONDS: u64 = 5;
 const MAX_RECONNECTION_ATTEMPTS: u32 = 5;
 
-// Global registry for incoming stream managers
-lazy_static::lazy_static! {
-    static ref INCOMING_STREAM_MANAGERS: Mutex<HashMap<Uuid, Arc<StreamManager>>> = Mutex::new(HashMap::new());
-}
-
-// Removed SimpleFileReceiver - using direct QUIC streams for blazing speed
+// Removed global registry and SimpleFileReceiver - using direct QUIC streams
 
 #[derive(Debug, Clone)]
 pub struct Peer {
@@ -69,24 +61,20 @@ pub struct ConnectionStats {
 pub struct PeerManager {
     settings: Arc<Settings>,
     pub peers: HashMap<Uuid, Peer>,
-    pub file_transfer: Arc<RwLock<FileTransferManager>>,
     pub message_tx: mpsc::UnboundedSender<(Uuid, Message)>,
     pub message_rx: mpsc::UnboundedReceiver<(Uuid, Message)>,
     // QUIC components
     quic_manager: Arc<QuicConnectionManager>,
     stream_managers: HashMap<Uuid, Arc<StreamManager>>,
-    parallel_transfer_manager: Arc<ParallelTransferManager>,
     // Mapping from temporary connection IDs to real device IDs
     temp_to_real_id_map: HashMap<Uuid, Uuid>,
-    // Removed active_receivers - using direct QUIC streams
+    // Temporary storage for incoming stream managers before handshake
+    incoming_stream_managers: Arc<RwLock<HashMap<Uuid, Arc<StreamManager>>>>,
 }
 
 impl PeerManager {
     pub async fn new(settings: Arc<Settings>) -> Result<Self> {
         let (message_tx, message_rx) = mpsc::unbounded_channel();
-        let file_transfer = Arc::new(RwLock::new(
-            FileTransferManager::new(settings.clone()).await?,
-        ));
 
         // Create QUIC connection manager
         let bind_addr: SocketAddr = format!("0.0.0.0:{}", settings.network.port)
@@ -97,23 +85,16 @@ impl PeerManager {
             )))?;
         let quic_manager = Arc::new(QuicConnectionManager::new(bind_addr).await?);
 
-        // Create parallel transfer manager
-        let parallel_transfer_manager = Arc::new(ParallelTransferManager::new(16));
-
         let peer_manager = Self {
             settings,
             peers: HashMap::new(),
-            file_transfer,
             message_tx: message_tx.clone(),
             message_rx,
             quic_manager,
             stream_managers: HashMap::new(),
-            parallel_transfer_manager,
             temp_to_real_id_map: HashMap::new(),
+            incoming_stream_managers: Arc::new(RwLock::new(HashMap::new())),
         };
-
-        // Set up the message sender for file transfers
-        peer_manager.set_file_transfer_message_sender().await;
 
         // Start accepting QUIC connections
         peer_manager.start_quic_listener();
@@ -124,6 +105,7 @@ impl PeerManager {
     fn start_quic_listener(&self) {
         let quic_manager = self.quic_manager.clone();
         let message_tx = self.message_tx.clone();
+        let incoming_managers = self.incoming_stream_managers.clone();
 
         tokio::spawn(async move {
             loop {
@@ -135,18 +117,33 @@ impl PeerManager {
                         );
 
                         // Handle the connection in a separate task
-                        let quic_manager = quic_manager.clone();
                         let message_tx = message_tx.clone();
+                        let incoming_managers = incoming_managers.clone();
 
                         tokio::spawn(async move {
-                            if let Err(e) = Self::handle_incoming_quic_connection(
-                                connection,
-                                quic_manager,
-                                message_tx,
-                            )
-                            .await
+                            let temp_id = connection.get_peer_id();
+                            let stream_manager = Arc::new(StreamManager::new(connection.clone(), message_tx.clone()));
+                            
+                            // Store in incoming managers
                             {
-                                error!("Error handling QUIC connection: {}", e);
+                                let mut managers = incoming_managers.write().await;
+                                managers.insert(temp_id, stream_manager.clone());
+                                info!("✅ Stored incoming stream manager with temp ID: {}", temp_id);
+                            }
+                            
+                            // Start the stream listener
+                            stream_manager.start_stream_listener().await;
+                            
+                            // Keep connection alive
+                            loop {
+                                if connection.is_closed() {
+                                    info!("📴 Incoming QUIC connection closed");
+                                    // Clean up
+                                    let mut managers = incoming_managers.write().await;
+                                    managers.remove(&temp_id);
+                                    break;
+                                }
+                                tokio::time::sleep(Duration::from_secs(1)).await;
                             }
                         });
                     }
@@ -160,59 +157,6 @@ impl PeerManager {
         });
     }
 
-    async fn handle_incoming_quic_connection(
-        connection: QuicConnection,
-        _quic_manager: Arc<QuicConnectionManager>,
-        message_tx: mpsc::UnboundedSender<(Uuid, Message)>,
-    ) -> Result<()> {
-        info!("🔗 Setting up stream manager for incoming QUIC connection");
-        
-        // Get the temporary peer ID for this connection
-        let temp_peer_id = connection.get_peer_id();
-        info!("📋 Generated temporary peer ID for incoming connection: {}", temp_peer_id);
-        
-        // Create stream manager for this connection
-        let stream_manager = Arc::new(StreamManager::new(connection.clone(), message_tx.clone()));
-
-        // Register the stream manager globally so the handshake handler can find it
-        {
-            let mut registry = INCOMING_STREAM_MANAGERS.lock().unwrap();
-            registry.insert(temp_peer_id, stream_manager.clone());
-            info!("✅ Stream manager registered with temporary ID: {}", temp_peer_id);
-        }
-
-        // Start stream listener - this will handle incoming messages and forward them to message_tx
-        stream_manager.clone().start_stream_listener().await;
-
-        info!("✅ Stream manager started for incoming connection, handshake will be handled by main message handler");
-        
-        // Keep the connection alive by monitoring connection status
-        // The stream manager handles all message processing in background tasks
-        loop {
-            if connection.is_closed() {
-                info!("📴 Incoming QUIC connection closed");
-                
-                // Clean up the stream manager from global registry
-                {
-                    let mut registry = INCOMING_STREAM_MANAGERS.lock().unwrap();
-                    if registry.remove(&temp_peer_id).is_some() {
-                        info!("🗑️ Cleaned up stream manager for temporary ID: {}", temp_peer_id);
-                    }
-                }
-                break;
-            }
-            
-            // Sleep for a bit to avoid busy waiting
-            tokio::time::sleep(Duration::from_secs(1)).await;
-        }
-        
-        Ok(())
-    }
-
-    async fn set_file_transfer_message_sender(&self) {
-        let mut ft = self.file_transfer.write().await;
-        ft.set_message_sender(self.message_tx.clone());
-    }
 
     /// Resolve a peer ID, mapping temporary IDs to real device IDs when available
     fn resolve_peer_id(&self, peer_id: Uuid) -> Uuid {
@@ -421,17 +365,19 @@ impl PeerManager {
             .ok_or_else(|| FileshareError::Transfer("No stream manager for peer".to_string()))?
             .clone();
 
-        // Start parallel file transfer using QUIC
-        let transfer_id = self
-            .parallel_transfer_manager
-            .start_transfer(stream_manager, peer_id, file_path)
-            .await?;
+        // Use optimized transfer
+        tokio::spawn(async move {
+            if let Err(e) = OptimizedTransfer::transfer_file(
+                stream_manager,
+                file_path,
+                String::new(), // Target path will be determined by receiver
+                peer_id,
+            ).await {
+                error!("❌ File transfer failed: {}", e);
+            }
+        });
 
-        info!(
-            "Started QUIC file transfer {} to peer {}",
-            transfer_id, peer_id
-        );
-
+        info!("Started optimized QUIC file transfer to peer {}", peer_id);
         Ok(())
     }
 
@@ -645,21 +591,7 @@ impl PeerManager {
                 clipboard.clear().await;
             }
 
-            // REMOVED: FileOffer/FileChunk handling - we use direct QUIC streams now for maximum speed
-
-            MessageType::TransferComplete {
-                transfer_id,
-                checksum,
-            } => {
-                info!(
-                    "✅ Received TransferComplete for transfer {} from peer {}",
-                    transfer_id, peer_id
-                );
-
-                let mut ft = self.file_transfer.write().await;
-                ft.handle_transfer_complete(peer_id, *transfer_id, checksum.clone())
-                    .await?;
-            }
+            // REMOVED: FileOffer/FileChunk/TransferComplete handling - we use direct QUIC streams now
 
             MessageType::Handshake {
                 device_id,
@@ -671,25 +603,37 @@ impl PeerManager {
                     device_name, device_id, version
                 );
 
-                // Always create or update peer entry for incoming handshakes
-                // This handles the race condition where handshake arrives before discovery
-                
+                // Check if we need to move stream manager from temp to real ID
+                let stream_manager_to_move = if peer_id != *device_id {
+                    // First try local stream managers
+                    if let Some(sm) = self.stream_managers.remove(&peer_id) {
+                        Some(sm)
+                    } else {
+                        // Then try incoming stream managers
+                        let mut incoming = self.incoming_stream_managers.write().await;
+                        incoming.remove(&peer_id)
+                    }
+                } else {
+                    None
+                };
+
+                // Update or create peer entry
                 if let Some(peer) = self.peers.get_mut(device_id) {
-                    // Update existing peer (from discovery or previous handshake)
-                    info!("✅ Updating existing peer {}: {}", device_id, device_name);
+                    // Update existing peer (from discovery)
+                    info!("✅ Updating existing peer {} from {:?} to Authenticated", device_id, peer.connection_status);
                     peer.device_info.name = device_name.clone();
                     peer.connection_status = ConnectionStatus::Authenticated;
                     peer.ping_failures = 0;
                     peer.reconnection_attempts = 0;
+                    peer.last_seen = Instant::now();
                 } else {
-                    // Create new peer entry for incoming connection
-                    // This is normal for incoming connections that arrive before discovery
-                    info!("🆕 Creating peer entry for incoming handshake: {} ({})", device_name, device_id);
+                    // Create new peer entry for incoming connection (before discovery)
+                    info!("🆕 Creating peer entry for incoming connection: {} ({})", device_name, device_id);
                     
                     let device_info = DeviceInfo {
                         id: *device_id,
                         name: device_name.clone(),
-                        addr: "0.0.0.0:0".parse().unwrap(), // Will be updated by discovery later
+                        addr: "0.0.0.0:0".parse().unwrap(), // Will be updated by discovery
                         last_seen: std::time::SystemTime::now()
                             .duration_since(std::time::UNIX_EPOCH)
                             .unwrap()
@@ -709,77 +653,37 @@ impl PeerManager {
                     self.peers.insert(*device_id, peer);
                 }
                 
-                // Always move stream manager from temporary ID to real device ID
-                if peer_id != *device_id {
-                    if let Some(stream_manager) = self.stream_managers.remove(&peer_id) {
-                        info!("📝 Moving stream manager from temporary ID {} to real ID {}", peer_id, device_id);
-                        self.stream_managers.insert(*device_id, stream_manager);
-                        // Store the mapping from temporary ID to real device ID
-                        self.temp_to_real_id_map.insert(peer_id, *device_id);
-                        info!("🔗 Stored temp-to-real ID mapping: {} -> {}", peer_id, device_id);
-                    }
-                }
-
-                // Send handshake response to the real device ID
-                let response = Message::new(MessageType::HandshakeResponse {
-                    accepted: true,
-                    reason: None,
-                });
-
-                // Send handshake response - try multiple strategies
-                let mut response_sent = false;
-                
-                // Strategy 1: Try the real device ID (if stream manager was moved)
-                if let Some(stream_manager) = self.stream_managers.get(device_id) {
-                    if let Err(e) = stream_manager.send_control_message(response.clone()).await {
-                        warn!("Failed to send handshake response via real ID {}: {}", device_id, e);
-                    } else {
-                        info!("✅ Sent handshake response to peer {} (real ID)", device_id);
-                        response_sent = true;
-                    }
-                }
-                
-                // Strategy 2: Try the temporary peer_id in regular stream managers
-                if !response_sent {
-                    if let Some(stream_manager) = self.stream_managers.get(&peer_id) {
-                        if let Err(e) = stream_manager.send_control_message(response.clone()).await {
-                            error!("Failed to send handshake response via temporary ID {}: {}", peer_id, e);
-                        } else {
-                            info!("✅ Sent handshake response to peer {} (temporary ID)", peer_id);
-                            response_sent = true;
-                        }
-                    }
-                }
-                
-                // Strategy 3: Try the global incoming stream manager registry
-                if !response_sent {
-                    let stream_manager_opt = {
-                        let registry = INCOMING_STREAM_MANAGERS.lock().unwrap();
-                        registry.get(&peer_id).cloned()
-                    };
+                // Move stream manager if needed
+                if let Some(stream_manager) = stream_manager_to_move {
+                    info!("📝 Moving stream manager from temporary ID {} to real ID {}", peer_id, device_id);
+                    self.stream_managers.insert(*device_id, stream_manager.clone());
+                    self.temp_to_real_id_map.insert(peer_id, *device_id);
                     
-                    if let Some(stream_manager) = stream_manager_opt {
-                        if let Err(e) = stream_manager.send_control_message(response.clone()).await {
-                            error!("Failed to send handshake response via global registry {}: {}", peer_id, e);
+                    // Send handshake response immediately using the moved stream manager
+                    let response = Message::new(MessageType::HandshakeResponse {
+                        accepted: true,
+                        reason: None,
+                    });
+                    
+                    if let Err(e) = stream_manager.send_control_message(response).await {
+                        error!("❌ Failed to send handshake response: {}", e);
+                    } else {
+                        info!("✅ Sent handshake response to peer {} successfully", device_id);
+                    }
+                } else if peer_id == *device_id {
+                    // For outgoing connections where peer_id already matches device_id
+                    if let Some(stream_manager) = self.stream_managers.get(device_id) {
+                        let response = Message::new(MessageType::HandshakeResponse {
+                            accepted: true,
+                            reason: None,
+                        });
+                        
+                        if let Err(e) = stream_manager.send_control_message(response).await {
+                            error!("❌ Failed to send handshake response: {}", e);
                         } else {
-                            info!("✅ Sent handshake response to peer {} (global registry)", peer_id);
-                            response_sent = true;
-                            
-                            // Move the stream manager from global registry to local storage
-                            let mut registry = INCOMING_STREAM_MANAGERS.lock().unwrap();
-                            if let Some(stream_manager) = registry.remove(&peer_id) {
-                                self.stream_managers.insert(*device_id, stream_manager);
-                                // Store the mapping from temporary ID to real device ID
-                                self.temp_to_real_id_map.insert(peer_id, *device_id);
-                                info!("📝 Moved stream manager from global registry to local storage for device {}", device_id);
-                                info!("🔗 Stored temp-to-real ID mapping: {} -> {}", peer_id, device_id);
-                            }
+                            info!("✅ Sent handshake response to peer {} successfully", device_id);
                         }
                     }
-                }
-                
-                if !response_sent {
-                    error!("❌ No stream manager found for peer {} (real) or {} (temp) after handshake", device_id, peer_id);
                 }
             }
 
@@ -838,7 +742,7 @@ impl PeerManager {
                     peer_id, file_path, target_path
                 );
 
-                // Validate that the requested file exists and send it
+                // Validate that the requested file exists
                 let source_path = PathBuf::from(file_path);
                 
                 if !source_path.exists() {
@@ -869,28 +773,28 @@ impl PeerManager {
                     return Ok(());
                 }
 
-                // ULTRA-FAST: Direct QUIC streaming without FileOffer/FileTransferManager overhead
+                // Use the new optimized transfer
                 let stream_manager_opt = self.stream_managers.get(&resolved_peer_id).cloned();
                 
                 if let Some(stream_manager) = stream_manager_opt {
                     let source_path_clone = source_path.clone();
                     let target_path_clone = target_path.clone();
                     
-                    info!("🚀 Starting ULTRA-FAST QUIC transfer: {} -> {}", file_path, target_path);
+                    info!("🚀 Starting optimized QUIC transfer: {} -> {}", file_path, target_path);
                     
-                    // Start blazing fast transfer immediately
+                    // Start optimized transfer
                     tokio::spawn(async move {
-                        if let Err(e) = Self::blazing_fast_transfer(
+                        if let Err(e) = OptimizedTransfer::transfer_file(
                             stream_manager,
                             source_path_clone,
                             target_path_clone,
                             resolved_peer_id,
                         ).await {
-                            error!("❌ Fast transfer failed: {}", e);
+                            error!("❌ Transfer failed: {}", e);
                         }
                     });
                     
-                    info!("✅ BLAZING fast transfer initiated: {} -> {}", file_path, target_path);
+                    info!("✅ Optimized transfer initiated: {} -> {}", file_path, target_path);
                 } else {
                     error!("❌ No stream manager found for peer {}", resolved_peer_id);
                 }
@@ -924,105 +828,5 @@ impl PeerManager {
         }
 
         Ok(())
-    }
-    
-    // BLAZING FAST direct file transfer using QUIC streams
-    async fn blazing_fast_transfer(
-        stream_manager: Arc<StreamManager>,
-        source_path: PathBuf,
-        target_path: String,
-        peer_id: Uuid,
-    ) -> Result<()> {
-        let start_time = std::time::Instant::now();
-        
-        // Get file info
-        let file_size = tokio::fs::metadata(&source_path).await?.len();
-        let filename = source_path.file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("unknown")
-            .to_string();
-            
-        info!("🚀 BLAZING TRANSFER: {} ({:.1} MB) -> peer {}", 
-              filename, file_size as f64 / (1024.0 * 1024.0), peer_id);
-        
-        // Use single stream for maximum reliability and simplicity
-        let mut stream = stream_manager.open_file_transfer_streams(1).await?
-            .into_iter().next()
-            .ok_or_else(|| FileshareError::Transfer("Failed to create stream".to_string()))?;
-        
-        info!("📊 Using single high-speed stream for maximum reliability");
-        
-        use tokio::io::AsyncWriteExt;
-        
-        // Send file info header
-        let file_info = format!("FILEINFO|{}|{}|{}", filename, file_size, target_path);
-        let info_bytes = file_info.as_bytes();
-        stream.write_all(&(info_bytes.len() as u32).to_be_bytes()).await
-            .map_err(|e| FileshareError::Transfer(format!("Failed to write header: {}", e)))?;
-        stream.write_all(info_bytes).await
-            .map_err(|e| FileshareError::Transfer(format!("Failed to write info: {}", e)))?;
-        
-        // Read and send file data in large chunks
-        let mut file = tokio::fs::File::open(&source_path).await?;
-        let mut buffer = vec![0u8; 2 * 1024 * 1024]; // 2MB buffer for maximum speed
-        let mut total_sent = 0u64;
-        
-        info!("📖 Starting blazing fast transfer...");
-        
-        loop {
-            use tokio::io::AsyncReadExt;
-            match file.read(&mut buffer).await {
-                Ok(0) => break, // EOF
-                Ok(n) => {
-                    stream.write_all(&buffer[0..n]).await
-                        .map_err(|e| FileshareError::Transfer(format!("Failed to write data: {}", e)))?;
-                    total_sent += n as u64;
-                    
-                    if total_sent % (20 * 1024 * 1024) == 0 { // Log every 20MB
-                        info!("📤 Sent {:.1} MB of {:.1} MB", 
-                              total_sent as f64 / (1024.0 * 1024.0), 
-                              file_size as f64 / (1024.0 * 1024.0));
-                    }
-                }
-                Err(e) => {
-                    error!("File read error: {}", e);
-                    break;
-                }
-            }
-        }
-        
-        stream.finish()
-            .map_err(|e| FileshareError::Transfer(format!("Failed to finish stream: {}", e)))?;
-        
-        let duration = start_time.elapsed();
-        let speed_mbps = (file_size as f64 * 8.0) / (duration.as_secs_f64() * 1_000_000.0);
-        
-        info!("🎉 BLAZING TRANSFER COMPLETE: {:.1} MB in {:.2}s ({:.1} Mbps)", 
-              file_size as f64 / (1024.0 * 1024.0), duration.as_secs_f64(), speed_mbps);
-        
-        Ok(())
-    }
-    
-    // For very large files that don't fit in memory
-    async fn blazing_streaming_transfer(
-        stream_manager: Arc<StreamManager>,
-        source_path: PathBuf,
-        target_path: String,
-        peer_id: Uuid,
-    ) -> Result<()> {
-        info!("🌊 BLAZING STREAMING for large file: {:?}", source_path);
-        
-        // Use QuicFileTransfer for streaming very large files
-        let transfer_id = Uuid::new_v4();
-        let quic_transfer = crate::quic::QuicFileTransfer::new(stream_manager, peer_id, transfer_id);
-        
-        // Create minimal metadata
-        let file_size = tokio::fs::metadata(&source_path).await?.len();
-        let chunk_size = 4 * 1024 * 1024; // 4MB chunks for large files
-        
-        let metadata = FileMetadata::from_path_with_chunk_size(&source_path, chunk_size)?
-            .with_target_dir(Some(target_path));
-        
-        quic_transfer.send_file_parallel(source_path, metadata).await
     }
 }

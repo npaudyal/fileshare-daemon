@@ -224,17 +224,12 @@ async fn test_file_transfer(state: tauri::State<'_, AppState>) -> Result<String,
         let pm = daemon_ref.peer_manager.read().await;
         let stats = pm.get_connection_stats();
 
-        let ft = pm.file_transfer.read().await;
-        let active_transfers = ft.get_active_transfers();
-
         Ok(format!(
             "📊 Transfer System Status:\n\
             Connections: {} total ({} healthy)\n\
-            Active Transfers: {}\n\
-            System: Ready with streaming support (unlimited file size)",
+            System: Ready with optimized QUIC streaming (unlimited file size)",
             stats.total,
-            stats.authenticated,
-            active_transfers.len()
+            stats.authenticated
         ))
     } else {
         Err("Daemon not ready".to_string())
@@ -277,7 +272,7 @@ async fn test_discovery_status(state: tauri::State<'_, AppState>) -> Result<Stri
         let discovered_devices = daemon_ref.get_discovered_devices().await;
         let pm = daemon_ref.peer_manager.read().await;
         let peers: Vec<_> = pm.peers.values().collect();
-        
+
         let settings = daemon_ref.get_settings();
         let mut result = format!(
             "🔍 Discovery Status:\n\
@@ -911,113 +906,29 @@ async fn refresh_devices(_state: tauri::State<'_, AppState>) -> Result<(), Strin
 // Transfer progress and control commands
 #[tauri::command]
 async fn get_active_transfers(
-    state: tauri::State<'_, AppState>,
+    _state: tauri::State<'_, AppState>,
 ) -> Result<Vec<serde_json::Value>, String> {
-    if let Some(daemon_ref) = state.daemon_ref.lock().await.as_ref() {
-        let pm = daemon_ref.peer_manager.read().await;
-        let ft = pm.file_transfer.read().await;
-        let active_transfers = ft.get_active_transfers();
-
-        let mut transfers = Vec::new();
-        for transfer in active_transfers {
-            let progress = ft.get_transfer_progress(transfer.id).unwrap_or(0.0);
-            let speed = transfer.speed_bps;
-            let direction = match transfer.direction {
-                fileshare_daemon::service::file_transfer::TransferDirection::Outgoing => "upload",
-                fileshare_daemon::service::file_transfer::TransferDirection::Incoming => "download",
-            };
-            let status = match &transfer.status {
-                fileshare_daemon::service::file_transfer::TransferStatus::Active => "active",
-                fileshare_daemon::service::file_transfer::TransferStatus::Paused => "paused",
-                fileshare_daemon::service::file_transfer::TransferStatus::Completed => "completed",
-                fileshare_daemon::service::file_transfer::TransferStatus::Error(_) => "error",
-                fileshare_daemon::service::file_transfer::TransferStatus::Cancelled => "error",
-                _ => "pending",
-            };
-
-            transfers.push(serde_json::json!({
-                "id": transfer.id.to_string(),
-                "fileName": transfer.file_path.file_name().unwrap_or_default().to_string_lossy(),
-                "fileSize": transfer.metadata.size,
-                "progress": progress,
-                "speed": speed,
-                "direction": direction,
-                "status": status,
-                "peerId": transfer.peer_id.to_string(),
-                "peerName": "Unknown Device", // TODO: Get actual peer name
-                "startTime": transfer.created_at.elapsed().as_secs(),
-                "error": match &transfer.status {
-                    fileshare_daemon::service::file_transfer::TransferStatus::Error(msg) => Some(msg.clone()),
-                    _ => None,
-                }
-            }));
-        }
-
-        Ok(transfers)
-    } else {
-        Err("Daemon not ready".to_string())
-    }
+    // With optimized QUIC transfers, we don't track transfers in the old way
+    // Transfers are handled directly by stream managers
+    Ok(Vec::new())
 }
 
 #[tauri::command]
 async fn toggle_transfer_pause(
-    transfer_id: String,
-    state: tauri::State<'_, AppState>,
+    _transfer_id: String,
+    _state: tauri::State<'_, AppState>,
 ) -> Result<(), String> {
-    let transfer_uuid =
-        Uuid::parse_str(&transfer_id).map_err(|e| format!("Invalid transfer ID: {}", e))?;
-
-    if let Some(daemon_ref) = state.daemon_ref.lock().await.as_ref() {
-        let pm = daemon_ref.peer_manager.read().await;
-        let mut ft = pm.file_transfer.write().await;
-
-        if let Some(transfer) = ft.active_transfers.get_mut(&transfer_uuid) {
-            match &transfer.status {
-                fileshare_daemon::service::file_transfer::TransferStatus::Active => {
-                    transfer.status =
-                        fileshare_daemon::service::file_transfer::TransferStatus::Paused;
-                    info!("⏸️ Transfer {} paused", transfer_id);
-                }
-                fileshare_daemon::service::file_transfer::TransferStatus::Paused => {
-                    transfer.status =
-                        fileshare_daemon::service::file_transfer::TransferStatus::Active;
-                    info!("▶️ Transfer {} resumed", transfer_id);
-                }
-                _ => {
-                    return Err("Transfer cannot be paused/resumed in current state".to_string());
-                }
-            }
-            Ok(())
-        } else {
-            Err("Transfer not found".to_string())
-        }
-    } else {
-        Err("Daemon not ready".to_string())
-    }
+    // Optimized QUIC transfers don't support pause/resume yet
+    Err("Transfer pause/resume not supported with optimized QUIC transfers".to_string())
 }
 
 #[tauri::command]
 async fn cancel_transfer(
-    transfer_id: String,
-    state: tauri::State<'_, AppState>,
+    _transfer_id: String,
+    _state: tauri::State<'_, AppState>,
 ) -> Result<(), String> {
-    let transfer_uuid =
-        Uuid::parse_str(&transfer_id).map_err(|e| format!("Invalid transfer ID: {}", e))?;
-
-    if let Some(daemon_ref) = state.daemon_ref.lock().await.as_ref() {
-        let pm = daemon_ref.peer_manager.read().await;
-        let mut ft = pm.file_transfer.write().await;
-
-        if let Some(transfer) = ft.active_transfers.get_mut(&transfer_uuid) {
-            transfer.status = fileshare_daemon::service::file_transfer::TransferStatus::Cancelled;
-            info!("🚫 Transfer {} cancelled", transfer_id);
-            Ok(())
-        } else {
-            Err("Transfer not found".to_string())
-        }
-    } else {
-        Err("Daemon not ready".to_string())
-    }
+    // Optimized QUIC transfers don't support cancellation yet
+    Err("Transfer cancellation not supported with optimized QUIC transfers".to_string())
 }
 
 #[tauri::command]

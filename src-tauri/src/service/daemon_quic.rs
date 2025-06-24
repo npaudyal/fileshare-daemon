@@ -144,25 +144,6 @@ impl FileshareDaemon {
             }
         });
 
-        // Start file transfer health monitoring
-        let transfer_pm = peer_manager.clone();
-        let transfer_monitor = tokio::spawn(async move {
-            let mut interval = tokio::time::interval(Duration::from_secs(10));
-            loop {
-                interval.tick().await;
-
-                let pm = transfer_pm.read().await;
-                let mut ft = pm.file_transfer.write().await;
-
-                // Monitor transfer health
-                if let Err(e) = ft.monitor_transfer_health().await {
-                    error!("❌ Transfer health monitoring error: {}", e);
-                }
-
-                // Enhanced cleanup
-                ft.cleanup_stale_transfers_enhanced();
-            }
-        });
 
         // Handle messages from peers
         // Extract the message receiver to avoid holding the lock while waiting
@@ -192,7 +173,6 @@ impl FileshareDaemon {
 
         // Clean up
         health_monitor.abort();
-        transfer_monitor.abort();
 
         Ok(())
     }
