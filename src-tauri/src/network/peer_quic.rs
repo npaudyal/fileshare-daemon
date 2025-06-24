@@ -74,6 +74,8 @@ pub struct PeerManager {
     quic_manager: Arc<QuicConnectionManager>,
     stream_managers: HashMap<Uuid, Arc<StreamManager>>,
     parallel_transfer_manager: Arc<ParallelTransferManager>,
+    // Mapping from temporary connection IDs to real device IDs
+    temp_to_real_id_map: HashMap<Uuid, Uuid>,
 }
 
 impl PeerManager {
@@ -104,6 +106,7 @@ impl PeerManager {
             quic_manager,
             stream_managers: HashMap::new(),
             parallel_transfer_manager,
+            temp_to_real_id_map: HashMap::new(),
         };
 
         // Set up the message sender for file transfers
@@ -206,6 +209,11 @@ impl PeerManager {
     async fn set_file_transfer_message_sender(&self) {
         let mut ft = self.file_transfer.write().await;
         ft.set_message_sender(self.message_tx.clone());
+    }
+
+    /// Resolve a peer ID, mapping temporary IDs to real device IDs when available
+    fn resolve_peer_id(&self, peer_id: Uuid) -> Uuid {
+        self.temp_to_real_id_map.get(&peer_id).copied().unwrap_or(peer_id)
     }
 
     pub async fn get_all_discovered_devices(&self) -> Vec<DeviceInfo> {
@@ -348,32 +356,38 @@ impl PeerManager {
     }
 
     pub async fn send_message_to_peer(&mut self, peer_id: Uuid, message: Message) -> Result<()> {
+        // Resolve the peer ID (map temporary to real ID if needed)
+        let resolved_peer_id = self.resolve_peer_id(peer_id);
+        
         info!(
-            "Attempting to send message to peer {}: {:?}",
-            peer_id, message.message_type
+            "Attempting to send message to peer {} (resolved to {}): {:?}",
+            peer_id, resolved_peer_id, message.message_type
         );
 
-        if let Some(stream_manager) = self.stream_managers.get(&peer_id) {
+        if let Some(stream_manager) = self.stream_managers.get(&resolved_peer_id) {
             stream_manager.send_control_message(message).await?;
-            info!("✅ Successfully sent message to peer {}", peer_id);
+            info!("✅ Successfully sent message to peer {} (resolved to {})", peer_id, resolved_peer_id);
             Ok(())
         } else {
-            error!("❌ No active QUIC connection to peer {}", peer_id);
+            error!("❌ No active QUIC connection to peer {} (resolved to {})", peer_id, resolved_peer_id);
             Err(FileshareError::Transfer(format!(
-                "No active QUIC connection to peer {}",
-                peer_id
+                "No active QUIC connection to peer {} (resolved to {})",
+                peer_id, resolved_peer_id
             )))
         }
     }
 
     pub async fn send_direct_to_connection(&self, peer_id: Uuid, message: Message) -> Result<()> {
-        if let Some(stream_manager) = self.stream_managers.get(&peer_id) {
+        // Resolve the peer ID (map temporary to real ID if needed)
+        let resolved_peer_id = self.resolve_peer_id(peer_id);
+        
+        if let Some(stream_manager) = self.stream_managers.get(&resolved_peer_id) {
             stream_manager.send_control_message(message).await?;
             Ok(())
         } else {
             Err(FileshareError::Transfer(format!(
-                "No connection to peer {}",
-                peer_id
+                "No connection to peer {} (resolved to {})",
+                peer_id, resolved_peer_id
             )))
         }
     }
@@ -495,6 +509,9 @@ impl PeerManager {
                 // Remove stream manager
                 self.stream_managers.remove(&peer_id);
 
+                // Clean up any temporary ID mappings pointing to this peer
+                self.temp_to_real_id_map.retain(|_temp_id, real_id| *real_id != peer_id);
+
                 // Remove from QUIC connections
                 self.quic_manager.remove_connection(peer_id).await;
 
@@ -579,8 +596,11 @@ impl PeerManager {
         message: Message,
         clipboard: &crate::clipboard::ClipboardManager,
     ) -> Result<()> {
-        // Update last seen timestamp
-        if let Some(peer) = self.peers.get_mut(&peer_id) {
+        // Resolve peer ID for peer lookups (temp -> real ID mapping)
+        let resolved_peer_id = self.resolve_peer_id(peer_id);
+        
+        // Update last seen timestamp (use resolved ID for peer lookups)
+        if let Some(peer) = self.peers.get_mut(&resolved_peer_id) {
             peer.last_seen = Instant::now();
         }
 
@@ -593,7 +613,7 @@ impl PeerManager {
 
             MessageType::Pong => {
                 debug!("Received pong from {}", peer_id);
-                if let Some(peer) = self.peers.get_mut(&peer_id) {
+                if let Some(peer) = self.peers.get_mut(&resolved_peer_id) {
                     peer.last_ping = Some(Instant::now());
                     peer.ping_failures = 0;
                 }
@@ -714,6 +734,9 @@ impl PeerManager {
                     if let Some(stream_manager) = self.stream_managers.remove(&peer_id) {
                         info!("📝 Moving stream manager from temporary ID {} to real ID {}", peer_id, device_id);
                         self.stream_managers.insert(*device_id, stream_manager);
+                        // Store the mapping from temporary ID to real device ID
+                        self.temp_to_real_id_map.insert(peer_id, *device_id);
+                        info!("🔗 Stored temp-to-real ID mapping: {} -> {}", peer_id, device_id);
                     }
                 }
 
@@ -766,7 +789,10 @@ impl PeerManager {
                             let mut registry = INCOMING_STREAM_MANAGERS.lock().unwrap();
                             if let Some(stream_manager) = registry.remove(&peer_id) {
                                 self.stream_managers.insert(*device_id, stream_manager);
+                                // Store the mapping from temporary ID to real device ID
+                                self.temp_to_real_id_map.insert(peer_id, *device_id);
                                 info!("📝 Moved stream manager from global registry to local storage for device {}", device_id);
+                                info!("🔗 Stored temp-to-real ID mapping: {} -> {}", peer_id, device_id);
                             }
                         }
                     }
@@ -784,13 +810,13 @@ impl PeerManager {
                     // Find the peer by peer_id (could be temporary or real ID)
                     let mut found_peer = false;
                     
-                    // First try to find by the peer_id directly
-                    if let Some(peer) = self.peers.get_mut(&peer_id) {
+                    // First try to find by the resolved peer_id
+                    if let Some(peer) = self.peers.get_mut(&resolved_peer_id) {
                         peer.connection_status = ConnectionStatus::Authenticated;
                         peer.ping_failures = 0;
                         peer.reconnection_attempts = 0;
                         found_peer = true;
-                        info!("🔒 Peer {} authenticated via direct ID", peer_id);
+                        info!("🔒 Peer {} (resolved to {}) authenticated via direct ID", peer_id, resolved_peer_id);
                     } else {
                         // If not found, this might be a response where we need to find by stream manager
                         // Look through all peers to find one that matches this connection
