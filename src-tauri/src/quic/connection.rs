@@ -3,7 +3,7 @@ use quinn::{Connection, Endpoint, RecvStream, SendStream};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::sync::RwLock;
-use tracing::info;
+use tracing::{error, info};
 use uuid::Uuid;
 use std::collections::HashMap;
 
@@ -99,19 +99,26 @@ impl QuicConnectionManager {
     }
     
     pub async fn connect_to_peer(&self, addr: SocketAddr, peer_id: Uuid) -> Result<QuicConnection> {
-        info!("Connecting to peer {} at {} via QUIC", peer_id, addr);
+        info!("🔗 Initiating QUIC connection to peer {} at {}", peer_id, addr);
         
         // Create client config that accepts any certificate (for development)
         let client_config = create_client_config()?;
+        info!("✅ Created QUIC client config");
         
+        info!("🔄 Attempting QUIC endpoint connection...");
         let connecting = self.endpoint
             .connect_with(client_config, addr, "fileshare-daemon")
-            .map_err(|e| FileshareError::Network(std::io::Error::new(
-                std::io::ErrorKind::ConnectionRefused,
-                format!("Failed to initiate connection: {}", e)
-            )))?;
+            .map_err(|e| {
+                error!("❌ Failed to initiate QUIC connection: {}", e);
+                FileshareError::Network(std::io::Error::new(
+                    std::io::ErrorKind::ConnectionRefused,
+                    format!("Failed to initiate connection: {}", e)
+                ))
+            })?;
         
+        info!("⏳ Waiting for QUIC connection to establish...");
         let connection = connecting.await.map_err(|e| {
+            error!("❌ QUIC connection failed: {}", e);
             FileshareError::Network(std::io::Error::new(
                 std::io::ErrorKind::ConnectionRefused,
                 format!("Failed to connect to peer: {}", e)
@@ -209,7 +216,72 @@ fn create_server_config() -> Result<quinn::ServerConfig> {
 }
 
 fn create_client_config() -> Result<quinn::ClientConfig> {
-    // For development - accept any certificate
-    let client_config = quinn::ClientConfig::with_platform_verifier();
+    // For development - accept any certificate (including self-signed)
+    use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
+    use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
+    use rustls::{DigitallySignedStruct, SignatureScheme};
+    
+    #[derive(Debug)]
+    struct SkipServerVerification;
+
+    impl ServerCertVerifier for SkipServerVerification {
+        fn verify_server_cert(
+            &self,
+            _end_entity: &CertificateDer<'_>,
+            _intermediates: &[CertificateDer<'_>],
+            _server_name: &ServerName<'_>,
+            _ocsp_response: &[u8],
+            _now: UnixTime,
+        ) -> std::result::Result<ServerCertVerified, rustls::Error> {
+            Ok(ServerCertVerified::assertion())
+        }
+
+        fn verify_tls12_signature(
+            &self,
+            _message: &[u8],
+            _cert: &CertificateDer<'_>,
+            _dss: &DigitallySignedStruct,
+        ) -> std::result::Result<HandshakeSignatureValid, rustls::Error> {
+            Ok(HandshakeSignatureValid::assertion())
+        }
+
+        fn verify_tls13_signature(
+            &self,
+            _message: &[u8],
+            _cert: &CertificateDer<'_>,
+            _dss: &DigitallySignedStruct,
+        ) -> std::result::Result<HandshakeSignatureValid, rustls::Error> {
+            Ok(HandshakeSignatureValid::assertion())
+        }
+
+        fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+            vec![
+                SignatureScheme::RSA_PKCS1_SHA1,
+                SignatureScheme::ECDSA_SHA1_Legacy,
+                SignatureScheme::RSA_PKCS1_SHA256,
+                SignatureScheme::ECDSA_NISTP256_SHA256,
+                SignatureScheme::RSA_PKCS1_SHA384,
+                SignatureScheme::ECDSA_NISTP384_SHA384,
+                SignatureScheme::RSA_PKCS1_SHA512,
+                SignatureScheme::ECDSA_NISTP521_SHA512,
+                SignatureScheme::RSA_PSS_SHA256,
+                SignatureScheme::RSA_PSS_SHA384,
+                SignatureScheme::RSA_PSS_SHA512,
+                SignatureScheme::ED25519,
+                SignatureScheme::ED448,
+            ]
+        }
+    }
+
+    let crypto = rustls::ClientConfig::builder()
+        .dangerous()
+        .with_custom_certificate_verifier(std::sync::Arc::new(SkipServerVerification))
+        .with_no_client_auth();
+
+    let client_config = quinn::ClientConfig::new(std::sync::Arc::new(
+        quinn::crypto::rustls::QuicClientConfig::try_from(crypto)
+            .map_err(|e| FileshareError::Config(format!("Failed to create QUIC client config: {}", e)))?,
+    ));
+    
     Ok(client_config)
 }
