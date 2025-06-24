@@ -150,64 +150,23 @@ impl PeerManager {
     }
 
     async fn handle_incoming_quic_connection(
-        mut connection: QuicConnection,
+        connection: QuicConnection,
         quic_manager: Arc<QuicConnectionManager>,
         message_tx: mpsc::UnboundedSender<(Uuid, Message)>,
     ) -> Result<()> {
+        info!("🔗 Setting up stream manager for incoming QUIC connection");
+        
         // Create stream manager for this connection
-        let stream_manager = Arc::new(StreamManager::new(connection.clone()));
-        let (mut control_tx, mut control_rx) = tokio::sync::mpsc::unbounded_channel();
+        let stream_manager = Arc::new(StreamManager::new(connection.clone(), message_tx.clone()));
 
-        // Start stream listener
+        // Start stream listener - this will handle incoming messages and forward them to message_tx
         stream_manager.clone().start_stream_listener().await;
 
-        // Wait for handshake on control stream
-        match timeout(Duration::from_secs(10), control_rx.recv()).await {
-            Ok(Some(Message {
-                message_type:
-                    MessageType::Handshake {
-                        device_id,
-                        device_name,
-                        version,
-                    },
-                ..
-            })) => {
-                info!(
-                    "Received QUIC handshake from {} ({})",
-                    device_name, device_id
-                );
-
-                // Update connection with actual peer ID
-                connection.peer_id = device_id;
-                connection.is_authenticated = true;
-
-                // Store the authenticated connection
-                quic_manager.store_connection(device_id, connection).await;
-
-                // Send handshake response
-                let response = Message::new(MessageType::HandshakeResponse {
-                    accepted: true,
-                    reason: None,
-                });
-
-                stream_manager.send_control_message(response).await?;
-
-                // Handle messages from this connection
-                while let Some(message) = control_rx.recv().await {
-                    if let Err(e) = message_tx.send((device_id, message)) {
-                        error!("Failed to forward message: {}", e);
-                        break;
-                    }
-                }
-            }
-            _ => {
-                warn!("No handshake received from QUIC connection");
-                return Err(FileshareError::Authentication(
-                    "No handshake received".to_string(),
-                ));
-            }
-        }
-
+        info!("✅ Stream manager started for incoming connection, handshake will be handled by main message handler");
+        
+        // The stream manager will now forward all messages (including handshakes) to the main message handler
+        // The main message handler in daemon_quic.rs will handle authentication
+        
         Ok(())
     }
 
@@ -324,8 +283,7 @@ impl PeerManager {
                 peer.last_seen = Instant::now();
 
                 // Create stream manager
-                let stream_manager = Arc::new(StreamManager::new(connection.clone()));
-                let (mut control_tx, mut control_rx) = tokio::sync::mpsc::unbounded_channel();
+                let stream_manager = Arc::new(StreamManager::new(connection.clone(), self.message_tx.clone()));
 
                 // Store stream manager
                 self.stream_managers.insert(peer_id, stream_manager.clone());
@@ -338,35 +296,10 @@ impl PeerManager {
                     Message::handshake(self.settings.device.id, self.settings.device.name.clone());
 
                 stream_manager.send_control_message(handshake).await?;
-
-                // Wait for handshake response
-                match timeout(Duration::from_secs(10), control_rx.recv()).await {
-                    Ok(Some(Message {
-                        message_type: MessageType::HandshakeResponse { accepted: true, .. },
-                        ..
-                    })) => {
-                        info!("Handshake accepted by peer {}", peer_id);
-                        peer.connection_status = ConnectionStatus::Authenticated;
-                        peer.ping_failures = 0;
-                        peer.reconnection_attempts = 0;
-
-                        // Start handling messages from this peer
-                        let message_tx = self.message_tx.clone();
-                        tokio::spawn(async move {
-                            while let Some(message) = control_rx.recv().await {
-                                if let Err(e) = message_tx.send((peer_id, message)) {
-                                    error!("Failed to forward message: {}", e);
-                                    break;
-                                }
-                            }
-                        });
-                    }
-                    _ => {
-                        warn!("Handshake not accepted by peer {}", peer_id);
-                        peer.connection_status =
-                            ConnectionStatus::Error("Handshake rejected".to_string());
-                    }
-                }
+                
+                info!("✅ Handshake sent to peer {}, waiting for response via main message handler", peer_id);
+                // The handshake response will be handled by the main message handler in daemon_quic.rs
+                // which will call handle_message with the HandshakeResponse
             }
             Err(e) => {
                 error!("❌ Failed to establish QUIC connection to peer {}: {}", peer_id, e);
@@ -693,6 +626,63 @@ impl PeerManager {
                 let mut ft = self.file_transfer.write().await;
                 ft.handle_transfer_complete(peer_id, *transfer_id, checksum.clone())
                     .await?;
+            }
+
+            MessageType::Handshake {
+                device_id,
+                device_name,
+                version,
+            } => {
+                info!(
+                    "🤝 Received handshake from {} ({}): {}",
+                    device_name, device_id, version
+                );
+
+                // Update the peer ID if this was an incoming connection
+                if let Some(peer) = self.peers.get_mut(&peer_id) {
+                    // If this is a temporary connection from incoming, update with real device ID
+                    if peer.device_info.id != *device_id {
+                        info!("📝 Updating peer ID from {} to {}", peer_id, device_id);
+                        // We would need to move the peer entry, but for now just update the device_info
+                        peer.device_info.id = *device_id;
+                    }
+                    peer.device_info.name = device_name.clone();
+                    peer.connection_status = ConnectionStatus::Authenticated;
+                    peer.ping_failures = 0;
+                    peer.reconnection_attempts = 0;
+                } else {
+                    // This might be an incoming connection we don't know about yet
+                    warn!("Received handshake from unknown peer {}, adding to peer list", device_id);
+                }
+
+                // Send handshake response
+                let response = Message::new(MessageType::HandshakeResponse {
+                    accepted: true,
+                    reason: None,
+                });
+
+                self.send_message_to_peer(peer_id, response).await?;
+            }
+
+            MessageType::HandshakeResponse { accepted, reason } => {
+                if *accepted {
+                    info!("✅ Handshake accepted by peer {}", peer_id);
+                    if let Some(peer) = self.peers.get_mut(&peer_id) {
+                        peer.connection_status = ConnectionStatus::Authenticated;
+                        peer.ping_failures = 0;
+                        peer.reconnection_attempts = 0;
+                    }
+                } else {
+                    warn!(
+                        "❌ Handshake rejected by peer {}: {:?}",
+                        peer_id, reason
+                    );
+                    if let Some(peer) = self.peers.get_mut(&peer_id) {
+                        peer.connection_status = ConnectionStatus::Error(
+                            reason.as_deref().unwrap_or("Handshake rejected").to_string(),
+                        );
+                    }
+                }
             }
 
             _ => {

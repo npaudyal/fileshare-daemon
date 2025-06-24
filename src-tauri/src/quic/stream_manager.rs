@@ -17,8 +17,7 @@ pub struct StreamManager {
     connection: QuicConnection,
     active_streams: Arc<RwLock<HashMap<Uuid, StreamHandle>>>,
     stream_semaphore: Arc<Semaphore>,
-    control_tx: mpsc::UnboundedSender<Message>,
-    control_rx: Arc<RwLock<Option<mpsc::UnboundedReceiver<Message>>>>,
+    control_tx: mpsc::UnboundedSender<(Uuid, Message)>,
 }
 
 #[derive(Clone)]
@@ -29,15 +28,12 @@ struct StreamHandle {
 }
 
 impl StreamManager {
-    pub fn new(connection: QuicConnection) -> Self {
-        let (control_tx, _control_rx) = mpsc::unbounded_channel();
-        
+    pub fn new(connection: QuicConnection, control_tx: mpsc::UnboundedSender<(Uuid, Message)>) -> Self {
         Self {
             connection,
             active_streams: Arc::new(RwLock::new(HashMap::new())),
             stream_semaphore: Arc::new(Semaphore::new(MAX_CONCURRENT_STREAMS)),
             control_tx,
-            control_rx: Arc::new(RwLock::new(None)),
         }
     }
     
@@ -101,7 +97,9 @@ impl StreamManager {
                 loop {
                     match QuicProtocol::read_message(&mut recv).await {
                         Ok(message) => {
-                            if let Err(e) = self.control_tx.send(message) {
+                            // Get the peer ID from the connection's remote address
+                            let peer_id = self.connection.get_peer_id();
+                            if let Err(e) = self.control_tx.send((peer_id, message)) {
                                 error!("Failed to forward control message: {}", e);
                                 break;
                             }
@@ -147,7 +145,8 @@ impl StreamManager {
                                 chunk,
                             });
                             
-                            if let Err(e) = self.control_tx.send(message) {
+                            let peer_id = self.connection.get_peer_id();
+                            if let Err(e) = self.control_tx.send((peer_id, message)) {
                                 error!("Failed to forward chunk message: {}", e);
                                 break;
                             }

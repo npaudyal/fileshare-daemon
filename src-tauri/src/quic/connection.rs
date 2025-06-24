@@ -70,6 +70,10 @@ impl QuicConnection {
     pub fn remote_address(&self) -> SocketAddr {
         self.connection.remote_address()
     }
+    
+    pub fn get_peer_id(&self) -> Uuid {
+        self.peer_id
+    }
 }
 
 pub struct QuicConnectionManager {
