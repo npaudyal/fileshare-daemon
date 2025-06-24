@@ -151,7 +151,7 @@ impl PeerManager {
 
     async fn handle_incoming_quic_connection(
         connection: QuicConnection,
-        quic_manager: Arc<QuicConnectionManager>,
+        _quic_manager: Arc<QuicConnectionManager>,
         message_tx: mpsc::UnboundedSender<(Uuid, Message)>,
     ) -> Result<()> {
         info!("🔗 Setting up stream manager for incoming QUIC connection");
@@ -164,8 +164,17 @@ impl PeerManager {
 
         info!("✅ Stream manager started for incoming connection, handshake will be handled by main message handler");
         
-        // The stream manager will now forward all messages (including handshakes) to the main message handler
-        // The main message handler in daemon_quic.rs will handle authentication
+        // Keep the connection alive by monitoring connection status
+        // The stream manager handles all message processing in background tasks
+        loop {
+            if connection.is_closed() {
+                info!("📴 Incoming QUIC connection closed");
+                break;
+            }
+            
+            // Sleep for a bit to avoid busy waiting
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        }
         
         Ok(())
     }
