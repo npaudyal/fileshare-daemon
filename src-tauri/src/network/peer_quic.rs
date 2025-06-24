@@ -945,73 +945,54 @@ impl PeerManager {
         info!("🚀 BLAZING TRANSFER: {} ({:.1} MB) -> peer {}", 
               filename, file_size as f64 / (1024.0 * 1024.0), peer_id);
         
-        // Open multiple parallel streams for maximum speed
-        let num_streams = 16; // MAXIMUM parallelism
-        let mut streams = stream_manager.open_file_transfer_streams(num_streams).await?;
+        // Use single stream for maximum reliability and simplicity
+        let mut stream = stream_manager.open_file_transfer_streams(1).await?
+            .into_iter().next()
+            .ok_or_else(|| FileshareError::Transfer("Failed to create stream".to_string()))?;
         
-        // Read file in large chunks for maximum throughput
-        let chunk_size = 2 * 1024 * 1024; // 2MB chunks for maximum speed
+        info!("📊 Using single high-speed stream for maximum reliability");
         
-        let total_chunks = (file_size + chunk_size as u64 - 1) / chunk_size as u64;
-        let chunks_per_stream = (total_chunks + num_streams as u64 - 1) / num_streams as u64;
+        use tokio::io::AsyncWriteExt;
         
-        info!("📊 Using {} streams, {} chunks of {}MB each", 
-              num_streams, total_chunks, chunk_size / (1024 * 1024));
+        // Send file info header
+        let file_info = format!("FILEINFO|{}|{}|{}", filename, file_size, target_path);
+        let info_bytes = file_info.as_bytes();
+        stream.write_all(&(info_bytes.len() as u32).to_be_bytes()).await
+            .map_err(|e| FileshareError::Transfer(format!("Failed to write header: {}", e)))?;
+        stream.write_all(info_bytes).await
+            .map_err(|e| FileshareError::Transfer(format!("Failed to write info: {}", e)))?;
         
-        // Send file info first (minimal overhead)
-        let file_info = format!("{}|{}|{}", filename, file_size, target_path);
-        if let Some(stream) = streams.get_mut(0) {
-            use tokio::io::AsyncWriteExt;
-            let info_bytes = file_info.as_bytes();
-            stream.write_all(&(info_bytes.len() as u32).to_be_bytes()).await
-                .map_err(|e| FileshareError::Transfer(format!("Failed to write: {}", e)))?;
-            stream.write_all(info_bytes).await
-                .map_err(|e| FileshareError::Transfer(format!("Failed to write: {}", e)))?;
-        }
+        // Read and send file data in large chunks
+        let mut file = tokio::fs::File::open(&source_path).await?;
+        let mut buffer = vec![0u8; 2 * 1024 * 1024]; // 2MB buffer for maximum speed
+        let mut total_sent = 0u64;
         
-        // Read entire file into memory for maximum speed (if reasonable size)
-        let file_data = if file_size < 1024 * 1024 * 1024 { // < 1GB
-            tokio::fs::read(&source_path).await?
-        } else {
-            // For very large files, use streaming
-            return Self::blazing_streaming_transfer(stream_manager, source_path, target_path, peer_id).await;
-        };
+        info!("📖 Starting blazing fast transfer...");
         
-        info!("📖 File loaded into memory, starting parallel transmission...");
-        
-        // Split data across streams and send in parallel
-        let mut tasks = Vec::new();
-        for (stream_idx, mut stream) in streams.into_iter().enumerate() {
-            let start_chunk = stream_idx as u64 * chunks_per_stream;
-            let end_chunk = ((stream_idx + 1) as u64 * chunks_per_stream).min(total_chunks);
-            
-            if start_chunk >= total_chunks { break; }
-            
-            let stream_data = {
-                let start_byte = (start_chunk * chunk_size as u64) as usize;
-                let end_byte = ((end_chunk * chunk_size as u64) as usize).min(file_data.len());
-                file_data[start_byte..end_byte].to_vec()
-            };
-            
-            let task = tokio::spawn(async move {
-                use tokio::io::AsyncWriteExt;
-                
-                if let Err(e) = stream.write_all(&stream_data).await {
-                    error!("Stream {} write failed: {}", stream_idx, e);
-                } else {
-                    info!("✅ Stream {} sent {} bytes", stream_idx, stream_data.len());
+        loop {
+            use tokio::io::AsyncReadExt;
+            match file.read(&mut buffer).await {
+                Ok(0) => break, // EOF
+                Ok(n) => {
+                    stream.write_all(&buffer[0..n]).await
+                        .map_err(|e| FileshareError::Transfer(format!("Failed to write data: {}", e)))?;
+                    total_sent += n as u64;
+                    
+                    if total_sent % (20 * 1024 * 1024) == 0 { // Log every 20MB
+                        info!("📤 Sent {:.1} MB of {:.1} MB", 
+                              total_sent as f64 / (1024.0 * 1024.0), 
+                              file_size as f64 / (1024.0 * 1024.0));
+                    }
                 }
-                
-                let _ = stream.finish();
-            });
-            
-            tasks.push(task);
+                Err(e) => {
+                    error!("File read error: {}", e);
+                    break;
+                }
+            }
         }
         
-        // Wait for all streams to complete
-        for task in tasks {
-            let _ = task.await;
-        }
+        stream.finish()
+            .map_err(|e| FileshareError::Transfer(format!("Failed to finish stream: {}", e)))?;
         
         let duration = start_time.elapsed();
         let speed_mbps = (file_size as f64 * 8.0) / (duration.as_secs_f64() * 1_000_000.0);
