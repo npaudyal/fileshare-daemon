@@ -848,6 +848,77 @@ impl PeerManager {
                 }
             }
 
+            MessageType::FileRequest {
+                request_id,
+                file_path,
+                target_path,
+            } => {
+                info!(
+                    "📁 Received file request from {}: {} -> {}",
+                    peer_id, file_path, target_path
+                );
+
+                // Validate that the requested file exists and send it
+                let source_path = PathBuf::from(file_path);
+                
+                if !source_path.exists() {
+                    error!("❌ Requested file does not exist: {}", file_path);
+                    
+                    // Send rejection response
+                    let response = Message::new(MessageType::FileRequestResponse {
+                        request_id: *request_id,
+                        accepted: false,
+                        reason: Some("File does not exist".to_string()),
+                    });
+                    
+                    if let Err(e) = self.send_message_to_peer(peer_id, response).await {
+                        error!("Failed to send file request rejection: {}", e);
+                    }
+                    return Ok(());
+                }
+
+                // Send acceptance response first
+                let response = Message::new(MessageType::FileRequestResponse {
+                    request_id: *request_id,
+                    accepted: true,
+                    reason: None,
+                });
+                
+                if let Err(e) = self.send_message_to_peer(peer_id, response).await {
+                    error!("Failed to send file request acceptance: {}", e);
+                    return Ok(());
+                }
+
+                // Start file transfer using the existing file transfer manager
+                let mut ft = self.file_transfer.write().await;
+                match ft.send_file_with_target_dir(resolved_peer_id, source_path, Some(target_path.clone())).await {
+                    Ok(_) => {
+                        info!("✅ File transfer initiated for request {}: {} -> {}", request_id, file_path, target_path);
+                    }
+                    Err(e) => {
+                        error!("❌ Failed to start file transfer for request {}: {}", request_id, e);
+                    }
+                }
+            }
+
+            MessageType::FileRequestResponse {
+                request_id,
+                accepted,
+                reason,
+            } => {
+                if *accepted {
+                    info!("✅ File request {} accepted by peer {}", request_id, peer_id);
+                    // File transfer will start automatically from the accepting peer
+                } else {
+                    warn!(
+                        "❌ File request {} rejected by peer {}: {}",
+                        request_id,
+                        peer_id,
+                        reason.as_deref().unwrap_or("No reason provided")
+                    );
+                }
+            }
+
             _ => {
                 debug!(
                     "Unhandled message type from {}: {:?}",
