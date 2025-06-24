@@ -45,6 +45,8 @@ impl QuicProtocol {
         let data = bincode::serialize(message)?;
         let len = data.len() as u32;
         
+        debug!("Writing message of {} bytes, type: {:?}", len, message.message_type);
+        
         // Write length prefix
         stream.write_all(&len.to_be_bytes()).await.map_err(|e| {
             FileshareError::Network(std::io::Error::new(
@@ -76,10 +78,13 @@ impl QuicProtocol {
         
         let len = u32::from_be_bytes(len_bytes) as usize;
         
-        // Validate message length
+        // Validate message length  
         if len > 50_000_000 { // 50MB max
-            return Err(FileshareError::Transfer("Message too large".to_string()));
+            error!("Message too large: {} bytes", len);
+            return Err(FileshareError::Transfer(format!("Message too large: {} bytes", len)));
         }
+        
+        debug!("Reading message of {} bytes", len);
         
         // Read message data
         let mut data = vec![0u8; len];
@@ -98,25 +103,57 @@ impl QuicProtocol {
     
     pub async fn write_stream_header(stream: &mut SendStream, stream_type: StreamType) -> Result<()> {
         let header = bincode::serialize(&stream_type)?;
+        let len = header.len() as u32;
+        
+        debug!("Writing stream header: {:?} ({} bytes)", stream_type, len);
+        
+        // Write length prefix
+        stream.write_all(&len.to_be_bytes()).await.map_err(|e| {
+            FileshareError::Network(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                format!("Failed to write stream header length: {}", e)
+            ))
+        })?;
+        
+        // Write header data
         stream.write_all(&header).await.map_err(|e| {
             FileshareError::Network(std::io::Error::new(
                 std::io::ErrorKind::BrokenPipe,
-                format!("Failed to write stream header: {}", e)
+                format!("Failed to write stream header data: {}", e)
             ))
         })?;
         Ok(())
     }
     
     pub async fn read_stream_header(stream: &mut RecvStream) -> Result<StreamType> {
-        let mut header = vec![0u8; 8]; // Enough for StreamType enum
+        // Read the length of the serialized StreamType first
+        let mut len_bytes = [0u8; 4];
+        stream.read_exact(&mut len_bytes).await.map_err(|e| {
+            FileshareError::Network(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                format!("Failed to read stream header length: {}", e)
+            ))
+        })?;
+        
+        let len = u32::from_be_bytes(len_bytes) as usize;
+        
+        // Validate header length (should be small)
+        if len > 100 {
+            error!("Stream header too large: {} bytes", len);
+            return Err(FileshareError::Transfer(format!("Stream header too large: {} bytes", len)));
+        }
+        
+        // Read the actual header data
+        let mut header = vec![0u8; len];
         stream.read_exact(&mut header).await.map_err(|e| {
             FileshareError::Network(std::io::Error::new(
                 std::io::ErrorKind::UnexpectedEof,
-                format!("Failed to read stream header: {}", e)
+                format!("Failed to read stream header data: {}", e)
             ))
         })?;
         
         let stream_type: StreamType = bincode::deserialize(&header)?;
+        debug!("Read stream header: {:?} ({} bytes)", stream_type, len);
         Ok(stream_type)
     }
     
