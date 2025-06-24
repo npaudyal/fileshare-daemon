@@ -647,6 +647,10 @@ impl PeerManager {
                     device_name, device_id, version
                 );
 
+                // Debug: Log current peers before lookup
+                info!("🔍 Looking for existing peer with device_id: {}", device_id);
+                info!("🔍 Current peers: {:?}", self.peers.keys().collect::<Vec<_>>());
+                
                 // Check if this is from an existing peer (outgoing connection) or new peer (incoming connection)
                 if let Some(peer) = self.peers.get_mut(device_id) {
                     // This is from a known peer (likely incoming response to our outgoing connection)
