@@ -37,7 +37,7 @@ pub struct Peer {
     pub reconnection_attempts: u32,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum ConnectionStatus {
     Disconnected,
     Connecting,
@@ -638,39 +638,108 @@ impl PeerManager {
                     device_name, device_id, version
                 );
 
-                // Update the peer ID if this was an incoming connection
-                if let Some(peer) = self.peers.get_mut(&peer_id) {
-                    // If this is a temporary connection from incoming, update with real device ID
-                    if peer.device_info.id != *device_id {
-                        info!("📝 Updating peer ID from {} to {}", peer_id, device_id);
-                        // We would need to move the peer entry, but for now just update the device_info
-                        peer.device_info.id = *device_id;
-                    }
+                // Check if this is from an existing peer (outgoing connection) or new peer (incoming connection)
+                if let Some(peer) = self.peers.get_mut(device_id) {
+                    // This is from a known peer (likely incoming response to our outgoing connection)
+                    info!("✅ Handshake from known peer {}: {}", device_id, device_name);
                     peer.device_info.name = device_name.clone();
                     peer.connection_status = ConnectionStatus::Authenticated;
                     peer.ping_failures = 0;
                     peer.reconnection_attempts = 0;
+                    
+                    // Update stream manager mapping to use real device ID
+                    if peer_id != *device_id {
+                        if let Some(stream_manager) = self.stream_managers.remove(&peer_id) {
+                            info!("📝 Moving stream manager from temporary ID {} to real ID {}", peer_id, device_id);
+                            self.stream_managers.insert(*device_id, stream_manager);
+                        }
+                    }
                 } else {
-                    // This might be an incoming connection we don't know about yet
-                    warn!("Received handshake from unknown peer {}, adding to peer list", device_id);
+                    // This is a new incoming connection - create peer entry
+                    info!("🆕 Creating new peer entry for incoming connection: {} ({})", device_name, device_id);
+                    
+                    // Create device info from handshake (we don't have discovery info for incoming connections)
+                    let device_info = DeviceInfo {
+                        id: *device_id,
+                        name: device_name.clone(),
+                        addr: "0.0.0.0:0".parse().unwrap(), // Will be updated when needed
+                        last_seen: std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap()
+                            .as_secs(),
+                        version: version.clone(),
+                    };
+                    
+                    let peer = Peer {
+                        device_info,
+                        connection_status: ConnectionStatus::Authenticated,
+                        last_seen: Instant::now(),
+                        last_ping: None,
+                        ping_failures: 0,
+                        reconnection_attempts: 0,
+                    };
+                    
+                    self.peers.insert(*device_id, peer);
+                    
+                    // Move stream manager to use real device ID
+                    if let Some(stream_manager) = self.stream_managers.remove(&peer_id) {
+                        info!("📝 Moving stream manager from temporary ID {} to real ID {}", peer_id, device_id);
+                        self.stream_managers.insert(*device_id, stream_manager);
+                    }
                 }
 
-                // Send handshake response
+                // Send handshake response to the real device ID
                 let response = Message::new(MessageType::HandshakeResponse {
                     accepted: true,
                     reason: None,
                 });
 
-                self.send_message_to_peer(peer_id, response).await?;
+                // Use real device ID for response
+                let target_peer_id = if self.stream_managers.contains_key(device_id) {
+                    *device_id
+                } else {
+                    peer_id // Fallback to original peer_id if stream manager wasn't moved
+                };
+
+                if let Some(stream_manager) = self.stream_managers.get(&target_peer_id) {
+                    stream_manager.send_control_message(response).await?;
+                    info!("✅ Sent handshake response to peer {}", target_peer_id);
+                } else {
+                    error!("❌ No stream manager found for peer {} after handshake", target_peer_id);
+                }
             }
 
             MessageType::HandshakeResponse { accepted, reason } => {
                 if *accepted {
                     info!("✅ Handshake accepted by peer {}", peer_id);
+                    
+                    // Find the peer by peer_id (could be temporary or real ID)
+                    let mut found_peer = false;
+                    
+                    // First try to find by the peer_id directly
                     if let Some(peer) = self.peers.get_mut(&peer_id) {
                         peer.connection_status = ConnectionStatus::Authenticated;
                         peer.ping_failures = 0;
                         peer.reconnection_attempts = 0;
+                        found_peer = true;
+                        info!("🔒 Peer {} authenticated via direct ID", peer_id);
+                    } else {
+                        // If not found, this might be a response where we need to find by stream manager
+                        // Look through all peers to find one that matches this connection
+                        for (real_peer_id, peer) in self.peers.iter_mut() {
+                            if self.stream_managers.contains_key(real_peer_id) && peer.connection_status == ConnectionStatus::Connected {
+                                peer.connection_status = ConnectionStatus::Authenticated;
+                                peer.ping_failures = 0;
+                                peer.reconnection_attempts = 0;
+                                found_peer = true;
+                                info!("🔒 Peer {} authenticated via connection mapping", real_peer_id);
+                                break;
+                            }
+                        }
+                    }
+                    
+                    if !found_peer {
+                        warn!("⚠️ Could not find peer {} to authenticate", peer_id);
                     }
                 } else {
                     warn!(
