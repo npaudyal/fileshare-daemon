@@ -365,17 +365,33 @@ impl FileshareDaemon {
             );
 
             // Broadcast clipboard update to healthy peers
-            let healthy_peer_ids = {
+            let (healthy_peer_ids, peer_status_debug) = {
                 let pm = peer_manager.read().await;
-                pm.get_connected_peers()
+                let all_peers: Vec<_> = pm.peers.values().collect();
+                let connected_peers = pm.get_connected_peers();
+                let healthy_peer_ids: Vec<_> = connected_peers
                     .iter()
                     .filter(|peer| pm.is_peer_healthy(peer.device_info.id))
                     .map(|peer| peer.device_info.id)
-                    .collect::<Vec<_>>()
+                    .collect();
+                
+                let debug_info = format!(
+                    "Total peers: {}, Connected: {}, Healthy: {}",
+                    all_peers.len(),
+                    connected_peers.len(),
+                    healthy_peer_ids.len()
+                );
+                
+                // Log individual peer statuses
+                for peer in all_peers.iter() {
+                    info!("🔍 Peer {}: {:?}", peer.device_info.name, peer.connection_status);
+                }
+                
+                (healthy_peer_ids, debug_info)
             };
 
             let peer_count = healthy_peer_ids.len();
-            info!("📡 Broadcasting to {} healthy peers via QUIC", peer_count);
+            info!("📡 Broadcasting to {} healthy peers via QUIC ({})", peer_count, peer_status_debug);
 
             // Send messages to each healthy peer
             for peer_id in healthy_peer_ids {

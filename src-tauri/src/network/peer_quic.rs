@@ -235,12 +235,28 @@ impl PeerManager {
     pub async fn on_device_discovered(&mut self, device_info: DeviceInfo) -> Result<()> {
         // Check if peer already exists
         if let Some(existing_peer) = self.peers.get_mut(&device_info.id) {
-            existing_peer.device_info = device_info;
+            existing_peer.device_info = device_info.clone();
             existing_peer.last_seen = Instant::now();
-            debug!(
-                "Updated existing peer: {} ({})",
-                existing_peer.device_info.name, existing_peer.device_info.id
+            info!(
+                "🔄 Updated existing peer: {} - Current status: {:?}",
+                existing_peer.device_info.name, existing_peer.connection_status
             );
+            
+            // Check if we need to attempt connection for existing peer
+            if matches!(existing_peer.connection_status, ConnectionStatus::Disconnected | ConnectionStatus::Error(_)) {
+                if self.should_connect_to_peer(&device_info) {
+                    info!("🔗 Attempting QUIC connection to existing peer: {}", device_info.name);
+                    if let Err(e) = self.connect_to_peer(device_info.id).await {
+                        error!("❌ Failed to connect to existing peer {}: {}", device_info.name, e);
+                    }
+                } else {
+                    info!("⏭️ Skipping connection to existing peer {} (require_pairing: {})", 
+                          device_info.name, self.settings.security.require_pairing);
+                }
+            } else {
+                info!("ℹ️ Existing peer {} already has status {:?}, not attempting connection", 
+                      device_info.name, existing_peer.connection_status);
+            }
             return Ok(());
         }
 

@@ -278,10 +278,11 @@ impl DiscoveryService {
         // Notify peer manager
         {
             let mut pm = peer_manager.write().await;
-            if let Err(e) = pm.on_device_discovered(device_info).await {
+            info!("🔄 Notifying peer manager about device: {}", device_info.name);
+            if let Err(e) = pm.on_device_discovered(device_info.clone()).await {
                 error!("❌ Failed to notify peer manager about discovered device: {}", e);
             } else {
-                info!("✅ Successfully notified peer manager about device discovery");
+                info!("✅ Successfully notified peer manager about device discovery: {}", device_info.name);
             }
         }
 
