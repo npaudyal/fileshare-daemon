@@ -703,18 +703,33 @@ impl PeerManager {
                     reason: None,
                 });
 
-                // Use real device ID for response
-                let target_peer_id = if self.stream_managers.contains_key(device_id) {
-                    *device_id
-                } else {
-                    peer_id // Fallback to original peer_id if stream manager wasn't moved
-                };
-
-                if let Some(stream_manager) = self.stream_managers.get(&target_peer_id) {
-                    stream_manager.send_control_message(response).await?;
-                    info!("✅ Sent handshake response to peer {}", target_peer_id);
-                } else {
-                    error!("❌ No stream manager found for peer {} after handshake", target_peer_id);
+                // Send handshake response - try real device ID first, then temporary peer_id
+                let mut response_sent = false;
+                
+                // First try the real device ID (if stream manager was moved)
+                if let Some(stream_manager) = self.stream_managers.get(device_id) {
+                    if let Err(e) = stream_manager.send_control_message(response.clone()).await {
+                        warn!("Failed to send handshake response via real ID {}: {}", device_id, e);
+                    } else {
+                        info!("✅ Sent handshake response to peer {} (real ID)", device_id);
+                        response_sent = true;
+                    }
+                }
+                
+                // If that failed, try the temporary peer_id
+                if !response_sent {
+                    if let Some(stream_manager) = self.stream_managers.get(&peer_id) {
+                        if let Err(e) = stream_manager.send_control_message(response).await {
+                            error!("Failed to send handshake response via temporary ID {}: {}", peer_id, e);
+                        } else {
+                            info!("✅ Sent handshake response to peer {} (temporary ID)", peer_id);
+                            response_sent = true;
+                        }
+                    }
+                }
+                
+                if !response_sent {
+                    error!("❌ No stream manager found for peer {} (real) or {} (temp) after handshake", device_id, peer_id);
                 }
             }
 
