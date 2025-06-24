@@ -127,35 +127,9 @@ impl StreamManager {
         
         match stream_type {
             StreamType::FileTransfer => {
-                // Handle file chunk stream
-                loop {
-                    match QuicProtocol::read_chunk_direct(&mut recv).await {
-                        Ok((transfer_id, chunk_index, data, is_last)) => {
-                            // Convert to Message and forward
-                            let chunk = crate::network::protocol::TransferChunk {
-                                index: chunk_index,
-                                data,
-                                is_last,
-                                compressed: false,
-                                checksum: None,
-                            };
-                            
-                            let message = Message::new(crate::network::protocol::MessageType::FileChunk {
-                                transfer_id,
-                                chunk,
-                            });
-                            
-                            let peer_id = self.connection.get_peer_id();
-                            if let Err(e) = self.control_tx.send((peer_id, message)) {
-                                error!("Failed to forward chunk message: {}", e);
-                                break;
-                            }
-                        }
-                        Err(e) => {
-                            debug!("File transfer stream ended: {}", e);
-                            break;
-                        }
-                    }
+                // BLAZING FAST: Handle direct file stream and write to disk immediately
+                if let Err(e) = self.handle_blazing_fast_stream(recv).await {
+                    error!("Failed to handle blazing fast stream: {}", e);
                 }
             }
             _ => {
@@ -326,6 +300,85 @@ impl StreamManager {
     // Check if connection is still alive
     pub fn is_alive(&self) -> bool {
         !self.connection.is_closed()
+    }
+    
+    // BLAZING FAST: Handle incoming file stream and write directly to disk
+    async fn handle_blazing_fast_stream(&self, mut recv: RecvStream) -> Result<()> {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        
+        // Read file info (minimal overhead)
+        let mut len_bytes = [0u8; 4];
+        recv.read_exact(&mut len_bytes).await
+            .map_err(|e| crate::FileshareError::Transfer(format!("Read error: {}", e)))?;
+        let info_len = u32::from_be_bytes(len_bytes) as usize;
+        
+        let mut info_bytes = vec![0u8; info_len];
+        recv.read_exact(&mut info_bytes).await
+            .map_err(|e| crate::FileshareError::Transfer(format!("Read error: {}", e)))?;
+        let file_info = String::from_utf8(info_bytes)
+            .map_err(|e| crate::FileshareError::Transfer(format!("Invalid UTF8: {}", e)))?;
+        
+        // Parse file info: "filename|filesize|target_path"
+        let parts: Vec<&str> = file_info.split('|').collect();
+        if parts.len() != 3 {
+            return Err(crate::FileshareError::Transfer("Invalid file info".to_string()));
+        }
+        
+        let filename = parts[0];
+        let file_size: u64 = parts[1].parse()
+            .map_err(|_| crate::FileshareError::Transfer("Invalid file size".to_string()))?;
+        let target_path = parts[2];
+        
+        info!("🚀 BLAZING RECEIVE: {} ({:.1} MB) -> {}", 
+              filename, file_size as f64 / (1024.0 * 1024.0), target_path);
+        
+        // Create target file
+        let target_file_path = std::path::PathBuf::from(target_path);
+        if let Some(parent) = target_file_path.parent() {
+            tokio::fs::create_dir_all(parent).await
+                .map_err(|e| crate::FileshareError::FileOperation(format!("Failed to create dir: {}", e)))?;
+        }
+        
+        let mut file = tokio::fs::File::create(&target_file_path).await
+            .map_err(|e| crate::FileshareError::FileOperation(format!("Failed to create file: {}", e)))?;
+        
+        // Read and write data as fast as possible
+        let start_time = std::time::Instant::now();
+        let mut bytes_received = 0u64;
+        let mut buffer = vec![0u8; 2 * 1024 * 1024]; // 2MB buffer for maximum speed
+        
+        loop {
+            match recv.read(&mut buffer).await {
+                Ok(Some(0)) | Ok(None) => break, // Stream ended
+                Ok(Some(n)) => {
+                    file.write_all(&buffer[0..n]).await
+                        .map_err(|e| crate::FileshareError::FileOperation(format!("Failed to write: {}", e)))?;
+                    bytes_received += n as u64;
+                    
+                    if bytes_received % (50 * 1024 * 1024) == 0 { // Log every 50MB
+                        let progress = (bytes_received as f64 / file_size as f64) * 100.0;
+                        info!("📊 BLAZING RECEIVE: {:.1}% complete ({:.1}MB)", 
+                              progress, bytes_received as f64 / (1024.0 * 1024.0));
+                    }
+                }
+                Err(e) => {
+                    error!("Stream read error: {}", e);
+                    break;
+                }
+            }
+        }
+        
+        file.flush().await
+            .map_err(|e| crate::FileshareError::FileOperation(format!("Failed to flush: {}", e)))?;
+        
+        let duration = start_time.elapsed();
+        let speed_mbps = (bytes_received as f64 * 8.0) / (duration.as_secs_f64() * 1_000_000.0);
+        
+        info!("🎉 BLAZING RECEIVE COMPLETE: {} ({:.1} MB in {:.2}s, {:.1} Mbps)", 
+              filename, bytes_received as f64 / (1024.0 * 1024.0), 
+              duration.as_secs_f64(), speed_mbps);
+        
+        Ok(())
     }
     
     // Close all streams and the connection

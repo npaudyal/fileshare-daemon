@@ -32,14 +32,7 @@ lazy_static::lazy_static! {
     static ref INCOMING_STREAM_MANAGERS: Mutex<HashMap<Uuid, Arc<StreamManager>>> = Mutex::new(HashMap::new());
 }
 
-// Simple file receiver for direct QUIC transfers
-struct SimpleFileReceiver {
-    metadata: FileMetadata,
-    file_path: PathBuf,
-    writer: Option<tokio::fs::File>,
-    bytes_received: u64,
-    chunks_received: Vec<bool>,
-}
+// Removed SimpleFileReceiver - using direct QUIC streams for blazing speed
 
 #[derive(Debug, Clone)]
 pub struct Peer {
@@ -85,8 +78,7 @@ pub struct PeerManager {
     parallel_transfer_manager: Arc<ParallelTransferManager>,
     // Mapping from temporary connection IDs to real device IDs
     temp_to_real_id_map: HashMap<Uuid, Uuid>,
-    // Simple file receivers for incoming transfers
-    active_receivers: Arc<RwLock<HashMap<Uuid, SimpleFileReceiver>>>,
+    // Removed active_receivers - using direct QUIC streams
 }
 
 impl PeerManager {
@@ -118,7 +110,6 @@ impl PeerManager {
             stream_managers: HashMap::new(),
             parallel_transfer_manager,
             temp_to_real_id_map: HashMap::new(),
-            active_receivers: Arc::new(RwLock::new(HashMap::new())),
         };
 
         // Set up the message sender for file transfers
@@ -654,50 +645,7 @@ impl PeerManager {
                 clipboard.clear().await;
             }
 
-            MessageType::FileOffer {
-                transfer_id,
-                metadata,
-            } => {
-                info!(
-                    "✅ Processing incoming FileOffer from {}: {} ({} bytes)",
-                    peer_id, metadata.name, metadata.size
-                );
-
-                // Create a simple file receiver
-                let save_dir = self.get_default_save_dir();
-                let file_path = save_dir.join(&metadata.name);
-                
-                let receiver = SimpleFileReceiver {
-                    metadata: metadata.clone(),
-                    file_path: file_path.clone(),
-                    writer: None,
-                    bytes_received: 0,
-                    chunks_received: vec![false; metadata.total_chunks as usize],
-                };
-                
-                // Store the receiver
-                {
-                    let mut receivers = self.active_receivers.write().await;
-                    receivers.insert(*transfer_id, receiver);
-                }
-                
-                // Send acceptance
-                let response = Message::new(MessageType::FileOfferResponse {
-                    transfer_id: *transfer_id,
-                    accepted: true,
-                    reason: None,
-                });
-
-                self.send_message_to_peer(peer_id, response).await?;
-                
-                info!("✅ Accepted FileOffer {} from peer {}, will save to {:?}", 
-                      transfer_id, peer_id, file_path);
-            }
-
-            MessageType::FileChunk { transfer_id, chunk } => {
-                // Handle chunk directly with simple receiver
-                self.handle_chunk_direct(*transfer_id, chunk.clone()).await?;
-            }
+            // REMOVED: FileOffer/FileChunk handling - we use direct QUIC streams now for maximum speed
 
             MessageType::TransferComplete {
                 transfer_id,
@@ -921,66 +869,28 @@ impl PeerManager {
                     return Ok(());
                 }
 
-                // SIMPLIFIED: Start QUIC file transfer directly without going through FileTransferManager
+                // ULTRA-FAST: Direct QUIC streaming without FileOffer/FileTransferManager overhead
                 let stream_manager_opt = self.stream_managers.get(&resolved_peer_id).cloned();
                 
                 if let Some(stream_manager) = stream_manager_opt {
-                    let transfer_id = Uuid::new_v4();
                     let source_path_clone = source_path.clone();
+                    let target_path_clone = target_path.clone();
                     
-                    // Get file metadata
-                    let file_size = match tokio::fs::metadata(&source_path).await {
-                        Ok(metadata) => metadata.len(),
-                        Err(e) => {
-                            error!("Failed to get file metadata: {}", e);
-                            return Ok(());
-                        }
-                    };
+                    info!("🚀 Starting ULTRA-FAST QUIC transfer: {} -> {}", file_path, target_path);
                     
-                    let chunk_size = crate::service::streaming::calculate_adaptive_chunk_size(file_size);
-                    let metadata = match FileMetadata::from_path_with_chunk_size(&source_path, chunk_size) {
-                        Ok(metadata) => metadata.with_target_dir(Some(target_path.clone())),
-                        Err(e) => {
-                            error!("Failed to create file metadata: {}", e);
-                            return Ok(());
-                        }
-                    };
-                    
-                    // Send FileOffer first
-                    let offer = Message::new(MessageType::FileOffer {
-                        transfer_id,
-                        metadata: metadata.clone(),
-                    });
-                    
-                    if let Err(e) = stream_manager.send_control_message(offer).await {
-                        error!("Failed to send file offer: {}", e);
-                        return Ok(());
-                    }
-                    
-                    info!("📤 Sent FileOffer for transfer {} to peer {}", transfer_id, resolved_peer_id);
-                    
-                    // Start the QUIC transfer directly
+                    // Start blazing fast transfer immediately
                     tokio::spawn(async move {
-                        // Wait a bit for offer acceptance
-                        tokio::time::sleep(Duration::from_millis(100)).await;
-                        
-                        let quic_transfer = crate::quic::QuicFileTransfer::new(
+                        if let Err(e) = Self::blazing_fast_transfer(
                             stream_manager,
+                            source_path_clone,
+                            target_path_clone,
                             resolved_peer_id,
-                            transfer_id,
-                        );
-                        
-                        match quic_transfer.send_file_parallel(source_path_clone, metadata).await {
-                            Ok(()) => {
-                                info!("✅ QUIC file transfer {} completed successfully", transfer_id);
-                            }
-                            Err(e) => {
-                                error!("❌ QUIC file transfer {} failed: {}", transfer_id, e);
-                            }
+                        ).await {
+                            error!("❌ Fast transfer failed: {}", e);
                         }
                     });
                     
-                    info!("✅ File transfer initiated for request {}: {} -> {}", request_id, file_path, target_path);
+                    info!("✅ BLAZING fast transfer initiated: {} -> {}", file_path, target_path);
                 } else {
                     error!("❌ No stream manager found for peer {}", resolved_peer_id);
                 }
@@ -1016,109 +926,122 @@ impl PeerManager {
         Ok(())
     }
     
-    fn get_default_save_dir(&self) -> PathBuf {
-        if let Some(ref temp_dir) = self.settings.transfer.temp_dir {
-            temp_dir.clone()
+    // BLAZING FAST direct file transfer using QUIC streams
+    async fn blazing_fast_transfer(
+        stream_manager: Arc<StreamManager>,
+        source_path: PathBuf,
+        target_path: String,
+        peer_id: Uuid,
+    ) -> Result<()> {
+        let start_time = std::time::Instant::now();
+        
+        // Get file info
+        let file_size = tokio::fs::metadata(&source_path).await?.len();
+        let filename = source_path.file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("unknown")
+            .to_string();
+            
+        info!("🚀 BLAZING TRANSFER: {} ({:.1} MB) -> peer {}", 
+              filename, file_size as f64 / (1024.0 * 1024.0), peer_id);
+        
+        // Open multiple parallel streams for maximum speed
+        let num_streams = 16; // MAXIMUM parallelism
+        let mut streams = stream_manager.open_file_transfer_streams(num_streams).await?;
+        
+        // Read file in large chunks for maximum throughput
+        let chunk_size = 2 * 1024 * 1024; // 2MB chunks for maximum speed
+        
+        let total_chunks = (file_size + chunk_size as u64 - 1) / chunk_size as u64;
+        let chunks_per_stream = (total_chunks + num_streams as u64 - 1) / num_streams as u64;
+        
+        info!("📊 Using {} streams, {} chunks of {}MB each", 
+              num_streams, total_chunks, chunk_size / (1024 * 1024));
+        
+        // Send file info first (minimal overhead)
+        let file_info = format!("{}|{}|{}", filename, file_size, target_path);
+        if let Some(stream) = streams.get_mut(0) {
+            use tokio::io::AsyncWriteExt;
+            let info_bytes = file_info.as_bytes();
+            stream.write_all(&(info_bytes.len() as u32).to_be_bytes()).await
+                .map_err(|e| FileshareError::Transfer(format!("Failed to write: {}", e)))?;
+            stream.write_all(info_bytes).await
+                .map_err(|e| FileshareError::Transfer(format!("Failed to write: {}", e)))?;
+        }
+        
+        // Read entire file into memory for maximum speed (if reasonable size)
+        let file_data = if file_size < 1024 * 1024 * 1024 { // < 1GB
+            tokio::fs::read(&source_path).await?
         } else {
-            directories::UserDirs::new()
-                .and_then(|dirs| dirs.download_dir().map(|d| d.to_path_buf()))
-                .unwrap_or_else(|| {
-                    directories::UserDirs::new()
-                        .and_then(|dirs| dirs.document_dir().map(|d| d.to_path_buf()))
-                        .unwrap_or_else(|| PathBuf::from("."))
-                })
-        }
-    }
-    
-    async fn handle_chunk_direct(&self, transfer_id: Uuid, chunk: TransferChunk) -> Result<()> {
-        // Check if we need to initialize the file writer
-        let file_path = {
-            let mut receivers = self.active_receivers.write().await;
-            if let Some(receiver) = receivers.get_mut(&transfer_id) {
-                if receiver.writer.is_none() {
-                    Some(receiver.file_path.clone())
-                } else {
-                    None
-                }
-            } else {
-                warn!("Received chunk for unknown transfer: {}", transfer_id);
-                return Ok(());
-            }
+            // For very large files, use streaming
+            return Self::blazing_streaming_transfer(stream_manager, source_path, target_path, peer_id).await;
         };
         
-        // Initialize file writer if needed (outside the lock)
-        if let Some(file_path) = file_path {
-            // Create parent directories if needed
-            if let Some(parent) = file_path.parent() {
-                tokio::fs::create_dir_all(parent).await.map_err(|e| {
-                    FileshareError::FileOperation(format!("Failed to create directory: {}", e))
-                })?;
-            }
-            
-            let file = tokio::fs::File::create(&file_path).await.map_err(|e| {
-                FileshareError::FileOperation(format!("Failed to create file: {}", e))
-            })?;
-            
-            let mut receivers = self.active_receivers.write().await;
-            if let Some(receiver) = receivers.get_mut(&transfer_id) {
-                receiver.writer = Some(file);
-            }
-        }
+        info!("📖 File loaded into memory, starting parallel transmission...");
         
-        // Process the chunk
-        let should_remove = {
-            let mut receivers = self.active_receivers.write().await;
-            if let Some(receiver) = receivers.get_mut(&transfer_id) {
-                // Mark chunk as received
-                if chunk.index < receiver.chunks_received.len() as u64 {
-                    receiver.chunks_received[chunk.index as usize] = true;
-                    receiver.bytes_received += chunk.data.len() as u64;
-                    
-                    // Write chunk to file (simplified - just append for now)
-                    if let Some(ref mut writer) = receiver.writer {
-                        use tokio::io::AsyncWriteExt;
-                        writer.write_all(&chunk.data).await.map_err(|e| {
-                            FileshareError::FileOperation(format!("Failed to write chunk: {}", e))
-                        })?;
-                    }
-                    
-                    // Check if transfer is complete
-                    let all_received = receiver.chunks_received.iter().all(|&received| received);
-                    let should_complete = all_received || chunk.is_last;
-                    
-                    if should_complete {
-                        info!("✅ File transfer {} completed: {:?}", transfer_id, receiver.file_path);
-                        
-                        // Flush and close file
-                        if let Some(ref mut writer) = receiver.writer {
-                            use tokio::io::AsyncWriteExt;
-                            writer.flush().await.map_err(|e| {
-                                FileshareError::FileOperation(format!("Failed to flush file: {}", e))
-                            })?;
-                        }
-                    }
-                    
-                    if chunk.index % 50 == 0 || chunk.is_last {
-                        let progress = (receiver.bytes_received as f64 / receiver.metadata.size as f64) * 100.0;
-                        info!("📊 Transfer {}: {:.1}% complete ({} bytes)", 
-                              transfer_id, progress, receiver.bytes_received);
-                    }
-                    
-                    should_complete
+        // Split data across streams and send in parallel
+        let mut tasks = Vec::new();
+        for (stream_idx, mut stream) in streams.into_iter().enumerate() {
+            let start_chunk = stream_idx as u64 * chunks_per_stream;
+            let end_chunk = ((stream_idx + 1) as u64 * chunks_per_stream).min(total_chunks);
+            
+            if start_chunk >= total_chunks { break; }
+            
+            let stream_data = {
+                let start_byte = (start_chunk * chunk_size as u64) as usize;
+                let end_byte = ((end_chunk * chunk_size as u64) as usize).min(file_data.len());
+                file_data[start_byte..end_byte].to_vec()
+            };
+            
+            let task = tokio::spawn(async move {
+                use tokio::io::AsyncWriteExt;
+                
+                if let Err(e) = stream.write_all(&stream_data).await {
+                    error!("Stream {} write failed: {}", stream_idx, e);
                 } else {
-                    false
+                    info!("✅ Stream {} sent {} bytes", stream_idx, stream_data.len());
                 }
-            } else {
-                false
-            }
-        };
-        
-        // Remove completed receiver (outside the processing lock)
-        if should_remove {
-            let mut receivers = self.active_receivers.write().await;
-            receivers.remove(&transfer_id);
+                
+                let _ = stream.finish();
+            });
+            
+            tasks.push(task);
         }
+        
+        // Wait for all streams to complete
+        for task in tasks {
+            let _ = task.await;
+        }
+        
+        let duration = start_time.elapsed();
+        let speed_mbps = (file_size as f64 * 8.0) / (duration.as_secs_f64() * 1_000_000.0);
+        
+        info!("🎉 BLAZING TRANSFER COMPLETE: {:.1} MB in {:.2}s ({:.1} Mbps)", 
+              file_size as f64 / (1024.0 * 1024.0), duration.as_secs_f64(), speed_mbps);
         
         Ok(())
+    }
+    
+    // For very large files that don't fit in memory
+    async fn blazing_streaming_transfer(
+        stream_manager: Arc<StreamManager>,
+        source_path: PathBuf,
+        target_path: String,
+        peer_id: Uuid,
+    ) -> Result<()> {
+        info!("🌊 BLAZING STREAMING for large file: {:?}", source_path);
+        
+        // Use QuicFileTransfer for streaming very large files
+        let transfer_id = Uuid::new_v4();
+        let quic_transfer = crate::quic::QuicFileTransfer::new(stream_manager, peer_id, transfer_id);
+        
+        // Create minimal metadata
+        let file_size = tokio::fs::metadata(&source_path).await?.len();
+        let chunk_size = 4 * 1024 * 1024; // 4MB chunks for large files
+        
+        let metadata = FileMetadata::from_path_with_chunk_size(&source_path, chunk_size)?
+            .with_target_dir(Some(target_path));
+        
+        quic_transfer.send_file_parallel(source_path, metadata).await
     }
 }
