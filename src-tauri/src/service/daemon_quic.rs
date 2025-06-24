@@ -59,6 +59,11 @@ impl FileshareDaemon {
         let pm = self.peer_manager.read().await;
         pm.get_all_discovered_devices().await
     }
+    
+    // Getter for settings (for UI access)
+    pub fn get_settings(&self) -> &Arc<Settings> {
+        &self.settings
+    }
 
     // Enhanced daemon startup with health monitoring
     pub async fn start_background_services(mut self: Arc<Self>) -> Result<()> {

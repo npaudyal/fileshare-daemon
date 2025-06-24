@@ -161,7 +161,8 @@ impl DiscoveryService {
     async fn broadcast_presence(settings: &Settings) -> Result<()> {
         use tokio::net::UdpSocket;
 
-        debug!("Broadcasting presence...");
+        debug!("🔊 Broadcasting presence for device {} on port {}...", 
+               settings.device.name, settings.network.port);
 
         // Create broadcast socket
         let socket = UdpSocket::bind("0.0.0.0:0")
@@ -264,7 +265,7 @@ impl DiscoveryService {
         };
 
         info!(
-            "🎯 Discovered device: {} ({}) at {}",
+            "🎯 Discovered device: {} ({}) at {} - attempting QUIC connection",
             device_info.name, device_info.id, device_info.addr
         );
 
@@ -278,7 +279,9 @@ impl DiscoveryService {
         {
             let mut pm = peer_manager.write().await;
             if let Err(e) = pm.on_device_discovered(device_info).await {
-                warn!("Failed to notify peer manager: {}", e);
+                error!("❌ Failed to notify peer manager about discovered device: {}", e);
+            } else {
+                info!("✅ Successfully notified peer manager about device discovery");
             }
         }
 

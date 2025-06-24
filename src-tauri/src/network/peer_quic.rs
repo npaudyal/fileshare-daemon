@@ -61,7 +61,7 @@ pub struct ConnectionStats {
 
 pub struct PeerManager {
     settings: Arc<Settings>,
-    peers: HashMap<Uuid, Peer>,
+    pub peers: HashMap<Uuid, Peer>,
     pub file_transfer: Arc<RwLock<FileTransferManager>>,
     pub message_tx: mpsc::UnboundedSender<(Uuid, Message)>,
     pub message_rx: mpsc::UnboundedReceiver<(Uuid, Message)>,
@@ -254,12 +254,18 @@ impl PeerManager {
             reconnection_attempts: 0,
         };
 
-        info!("Adding new peer: {} ({})", device_info.name, device_info.id);
+        info!("✅ Adding new peer: {} ({}) at {}", device_info.name, device_info.id, device_info.addr);
         self.peers.insert(device_info.id, peer);
 
         // Attempt to connect
         if self.should_connect_to_peer(&device_info) {
-            self.connect_to_peer(device_info.id).await?;
+            info!("🔗 Attempting QUIC connection to peer: {}", device_info.name);
+            if let Err(e) = self.connect_to_peer(device_info.id).await {
+                error!("❌ Failed to connect to peer {}: {}", device_info.name, e);
+            }
+        } else {
+            info!("⏭️ Skipping connection to peer {} (pairing required: {})", 
+                  device_info.name, self.settings.security.require_pairing);
         }
 
         Ok(())
@@ -293,11 +299,11 @@ impl PeerManager {
         peer.connection_status = ConnectionStatus::Connecting;
         let addr = peer.device_info.addr;
 
-        info!("Connecting to peer {} at {} via QUIC", peer_id, addr);
+        info!("🚀 Connecting to peer {} at {} via QUIC", peer_id, addr);
 
         match self.quic_manager.connect_to_peer(addr, peer_id).await {
             Ok(connection) => {
-                info!("Successfully connected to peer {} via QUIC", peer_id);
+                info!("✅ Successfully established QUIC connection to peer {} at {}", peer_id, addr);
                 peer.connection_status = ConnectionStatus::Connected;
                 peer.last_seen = Instant::now();
 
@@ -347,8 +353,12 @@ impl PeerManager {
                 }
             }
             Err(e) => {
-                warn!("Failed to connect to peer {}: {}", peer_id, e);
+                error!("❌ Failed to establish QUIC connection to peer {}: {}", peer_id, e);
                 peer.connection_status = ConnectionStatus::Error(e.to_string());
+                peer.reconnection_attempts += 1;
+                
+                // Don't return error immediately - let discovery continue working
+                warn!("⚠️ Will retry connection to peer {} later", peer_id);
             }
         }
 

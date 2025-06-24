@@ -270,6 +270,57 @@ async fn test_connection_health(state: tauri::State<'_, AppState>) -> Result<Str
 }
 
 #[tauri::command]
+async fn test_discovery_status(state: tauri::State<'_, AppState>) -> Result<String, String> {
+    info!("🔍 Testing discovery system status");
+
+    if let Some(daemon_ref) = state.daemon_ref.lock().await.as_ref() {
+        let discovered_devices = daemon_ref.get_discovered_devices().await;
+        let pm = daemon_ref.peer_manager.read().await;
+        let peers: Vec<_> = pm.peers.values().collect();
+        
+        let settings = daemon_ref.get_settings();
+        let mut result = format!(
+            "🔍 Discovery Status:\n\
+            Device: {} ({})\n\
+            QUIC Port: {}\n\
+            Discovery Port: {}\n\
+            Discovered Devices: {}\n\
+            Active Peers: {}\n\n",
+            settings.device.name,
+            settings.device.id,
+            settings.network.port,
+            settings.network.discovery_port,
+            discovered_devices.len(),
+            peers.len()
+        );
+
+        if !discovered_devices.is_empty() {
+            result.push_str("📱 Discovered Devices:\n");
+            for device in discovered_devices.iter().take(5) {
+                result.push_str(&format!(
+                    "  • {} ({}) at {}\n",
+                    device.name, device.id, device.addr
+                ));
+            }
+        }
+
+        if !peers.is_empty() {
+            result.push_str("\n🔗 Peer Connections:\n");
+            for peer in peers.iter().take(5) {
+                result.push_str(&format!(
+                    "  • {} - {:?}\n",
+                    peer.device_info.name, peer.connection_status
+                ));
+            }
+        }
+
+        Ok(result)
+    } else {
+        Err("Daemon not ready".to_string())
+    }
+}
+
+#[tauri::command]
 async fn get_network_metrics(_state: tauri::State<'_, AppState>) -> Result<NetworkMetrics, String> {
     // Mock data - implement real metrics collection
     Ok(NetworkMetrics {
@@ -1072,6 +1123,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             pair_device_enhanced,
             test_file_transfer,
             test_connection_health,
+            test_discovery_status,
             export_settings,
             import_settings,
             test_hotkey_system,
