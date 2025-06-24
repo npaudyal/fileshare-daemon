@@ -307,29 +307,64 @@ struct ParallelReceiver {
 
 impl OptimizedReceiver {
     pub async fn handle_incoming_transfer(mut recv_stream: quinn::RecvStream) -> Result<()> {
-        // Try to read header length first
+        // Try to read header length first - but be more careful about detecting data streams
         let mut len_bytes = [0u8; 4];
+        
+        // Peek at the first 4 bytes to see if they look like a header length
         match recv_stream.read_exact(&mut len_bytes).await {
             Ok(_) => {
                 let header_len = u32::from_be_bytes(len_bytes) as usize;
                 
-                // Read header
-                let mut header_bytes = vec![0u8; header_len];
-                recv_stream.read_exact(&mut header_bytes).await
-                    .map_err(|e| FileshareError::Transfer(format!("Failed to read header: {}", e)))?;
-                let header = String::from_utf8(header_bytes)
-                    .map_err(|e| FileshareError::Transfer(format!("Invalid UTF8 in header: {}", e)))?;
-                
-                let parts: Vec<&str> = header.split('|').collect();
-                match parts[0] {
-                    "FILEINFO" => Self::receive_single_stream(recv_stream, &parts).await,
-                    "PARALLEL_CONTROL" => Self::receive_parallel_control(recv_stream, &parts).await,
-                    _ => Err(FileshareError::Transfer("Invalid transfer header".to_string())),
+                // Sanity check: header length should be reasonable (10-1000 bytes)
+                // If it's too large or too small, this is likely chunk data, not a header
+                if header_len < 10 || header_len > 1000 {
+                    debug!("Detected parallel data stream: header_len={} looks like chunk data", header_len);
+                    // This is likely a chunk ID (u64), treat as parallel data stream
+                    // We need to read the remaining 4 bytes to complete the chunk header
+                    let mut remaining_bytes = [0u8; 4];
+                    recv_stream.read_exact(&mut remaining_bytes).await
+                        .map_err(|e| FileshareError::Transfer(format!("Failed to read chunk size: {}", e)))?;
+                    
+                    // Reconstruct the full chunk header: [chunk_id: u64][size: u32]
+                    let chunk_id = u64::from_be_bytes([len_bytes[0], len_bytes[1], len_bytes[2], len_bytes[3], 
+                                                     remaining_bytes[0], remaining_bytes[1], remaining_bytes[2], remaining_bytes[3]]);
+                    
+                    // Read the size field
+                    let mut size_bytes = [0u8; 4];
+                    recv_stream.read_exact(&mut size_bytes).await
+                        .map_err(|e| FileshareError::Transfer(format!("Failed to read chunk size: {}", e)))?;
+                    let chunk_size = u32::from_be_bytes(size_bytes) as usize;
+                    
+                    // Read chunk data
+                    let mut chunk_data = vec![0u8; chunk_size];
+                    recv_stream.read_exact(&mut chunk_data).await
+                        .map_err(|e| FileshareError::Transfer(format!("Failed to read chunk data: {}", e)))?;
+                    
+                    // Process this first chunk and then continue with the stream
+                    Self::process_received_chunk(chunk_id, chunk_data).await?;
+                    
+                    // Continue reading more chunks from this stream
+                    Self::receive_parallel_data_stream(recv_stream).await
+                } else {
+                    // Normal header, read it
+                    let mut header_bytes = vec![0u8; header_len];
+                    recv_stream.read_exact(&mut header_bytes).await
+                        .map_err(|e| FileshareError::Transfer(format!("Failed to read header: {}", e)))?;
+                    let header = String::from_utf8(header_bytes)
+                        .map_err(|e| FileshareError::Transfer(format!("Invalid UTF8 in header: {}", e)))?;
+                    
+                    let parts: Vec<&str> = header.split('|').collect();
+                    match parts[0] {
+                        "FILEINFO" => Self::receive_single_stream(recv_stream, &parts).await,
+                        "PARALLEL_CONTROL" => Self::receive_parallel_control(recv_stream, &parts).await,
+                        _ => Err(FileshareError::Transfer("Invalid transfer header".to_string())),
+                    }
                 }
             },
             Err(_) => {
-                // This is a parallel data stream - read chunks with sequence numbers
-                Self::receive_parallel_data_stream(recv_stream).await
+                // Stream finished immediately, nothing to process
+                debug!("Stream finished immediately with no data");
+                Ok(())
             }
         }
     }
