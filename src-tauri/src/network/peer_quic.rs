@@ -647,35 +647,25 @@ impl PeerManager {
                     device_name, device_id, version
                 );
 
-                // Debug: Log current peers before lookup
-                info!("🔍 Looking for existing peer with device_id: {}", device_id);
-                info!("🔍 Current peers: {:?}", self.peers.keys().collect::<Vec<_>>());
+                // Always create or update peer entry for incoming handshakes
+                // This handles the race condition where handshake arrives before discovery
                 
-                // Check if this is from an existing peer (outgoing connection) or new peer (incoming connection)
                 if let Some(peer) = self.peers.get_mut(device_id) {
-                    // This is from a known peer (likely incoming response to our outgoing connection)
-                    info!("✅ Handshake from known peer {}: {}", device_id, device_name);
+                    // Update existing peer (from discovery or previous handshake)
+                    info!("✅ Updating existing peer {}: {}", device_id, device_name);
                     peer.device_info.name = device_name.clone();
                     peer.connection_status = ConnectionStatus::Authenticated;
                     peer.ping_failures = 0;
                     peer.reconnection_attempts = 0;
-                    
-                    // Update stream manager mapping to use real device ID
-                    if peer_id != *device_id {
-                        if let Some(stream_manager) = self.stream_managers.remove(&peer_id) {
-                            info!("📝 Moving stream manager from temporary ID {} to real ID {}", peer_id, device_id);
-                            self.stream_managers.insert(*device_id, stream_manager);
-                        }
-                    }
                 } else {
-                    // This is a new incoming connection - create peer entry
-                    info!("🆕 Creating new peer entry for incoming connection: {} ({})", device_name, device_id);
+                    // Create new peer entry for incoming connection
+                    // This is normal for incoming connections that arrive before discovery
+                    info!("🆕 Creating peer entry for incoming handshake: {} ({})", device_name, device_id);
                     
-                    // Create device info from handshake (we don't have discovery info for incoming connections)
                     let device_info = DeviceInfo {
                         id: *device_id,
                         name: device_name.clone(),
-                        addr: "0.0.0.0:0".parse().unwrap(), // Will be updated when needed
+                        addr: "0.0.0.0:0".parse().unwrap(), // Will be updated by discovery later
                         last_seen: std::time::SystemTime::now()
                             .duration_since(std::time::UNIX_EPOCH)
                             .unwrap()
@@ -693,8 +683,10 @@ impl PeerManager {
                     };
                     
                     self.peers.insert(*device_id, peer);
-                    
-                    // Move stream manager to use real device ID
+                }
+                
+                // Always move stream manager from temporary ID to real device ID
+                if peer_id != *device_id {
                     if let Some(stream_manager) = self.stream_managers.remove(&peer_id) {
                         info!("📝 Moving stream manager from temporary ID {} to real ID {}", peer_id, device_id);
                         self.stream_managers.insert(*device_id, stream_manager);
