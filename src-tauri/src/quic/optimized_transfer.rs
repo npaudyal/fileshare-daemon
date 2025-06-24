@@ -6,7 +6,7 @@ use std::sync::Arc;
 use std::time::Instant;
 use tokio::io::{AsyncReadExt, AsyncWriteExt, AsyncSeekExt};
 use tokio::sync::Mutex;
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
 // Optimized constants for maximum performance
@@ -37,8 +37,12 @@ impl OptimizedTransfer {
         info!("🚀 Starting optimized transfer: {} ({:.1} MB)", 
               filename, file_size as f64 / (1024.0 * 1024.0));
         
-        // Temporarily use single stream for all transfers to fix immediate issue
-        let result = Self::single_stream_transfer(stream_manager, source_path, target_path, filename, file_size).await;
+        // Choose transfer method based on file size for true parallelism
+        let result = if file_size <= SMALL_FILE_THRESHOLD {
+            Self::single_stream_transfer(stream_manager, source_path, target_path, filename, file_size).await
+        } else {
+            Self::parallel_stream_transfer(stream_manager, source_path, target_path, filename, file_size).await
+        };
         
         match result {
             Ok(()) => {
@@ -105,7 +109,7 @@ impl OptimizedTransfer {
         Ok(())
     }
     
-    /// Parallel stream transfer for large files - maximum parallelism and throughput
+    /// Parallel stream transfer for large files - true parallelism with proper coordination
     async fn parallel_stream_transfer(
         stream_manager: Arc<StreamManager>,
         source_path: PathBuf,
@@ -118,44 +122,42 @@ impl OptimizedTransfer {
         let total_chunks = (file_size + chunk_size - 1) / chunk_size;
         let stream_count = std::cmp::min(MAX_PARALLEL_STREAMS, total_chunks as usize);
         
-        info!("📊 Using {} parallel streams for large file ({:.1} MB, {} chunks of {:.1} MB)", 
+        info!("🚀 Using {} parallel streams for large file ({:.1} MB, {} chunks of {:.1} MB)", 
               stream_count, 
               file_size as f64 / (1024.0 * 1024.0), 
               total_chunks,
               chunk_size as f64 / (1024.0 * 1024.0));
         
-        // Open multiple streams
-        let mut streams = stream_manager.open_file_transfer_streams(stream_count).await?;
+        // Step 1: Send control message with transfer metadata
+        let control_stream = stream_manager.open_file_transfer_streams(1).await?
+            .into_iter().next()
+            .ok_or_else(|| FileshareError::Transfer("Failed to create control stream".to_string()))?;
+            
+        Self::send_parallel_control_message(control_stream, &filename, file_size, &target_path, chunk_size, total_chunks).await?;
         
-        // Send file info on first stream only
-        {
-            let first_stream = &mut streams[0];
-            let header = format!("PARALLEL|{}|{}|{}|{}|{}", filename, file_size, target_path, chunk_size, total_chunks);
-            let header_bytes = header.as_bytes();
-            first_stream.write_all(&(header_bytes.len() as u32).to_be_bytes()).await
-                .map_err(|e| FileshareError::Transfer(format!("Failed to write parallel header length: {}", e)))?;
-            first_stream.write_all(header_bytes).await
-                .map_err(|e| FileshareError::Transfer(format!("Failed to write parallel header: {}", e)))?;
-        }
+        // Step 2: Open data streams and distribute chunks
+        let data_streams = stream_manager.open_file_transfer_streams(stream_count).await?;
         
-        // Distribute chunks across streams
+        // Step 3: Launch parallel chunk senders
         let mut handles = Vec::new();
         let file_path = Arc::new(source_path);
         
-        for (stream_idx, mut stream) in streams.into_iter().enumerate() {
+        for (stream_idx, mut stream) in data_streams.into_iter().enumerate() {
             let file_path = file_path.clone();
             let chunks_per_stream = (total_chunks + stream_count as u64 - 1) / stream_count as u64;
             let start_chunk = stream_idx as u64 * chunks_per_stream;
             let end_chunk = std::cmp::min(start_chunk + chunks_per_stream, total_chunks);
             
             if start_chunk >= total_chunks {
-                stream.finish()
-            .map_err(|e| FileshareError::Transfer(format!("Failed to finish stream: {}", e)))?;
+                // Close unused streams
+                if let Err(e) = stream.finish() {
+                    warn!("Failed to close unused stream {}: {}", stream_idx, e);
+                }
                 continue;
             }
             
             let handle = tokio::spawn(async move {
-                Self::send_chunks_range(
+                Self::send_parallel_chunks(
                     stream,
                     file_path,
                     start_chunk,
@@ -169,20 +171,56 @@ impl OptimizedTransfer {
             handles.push(handle);
         }
         
-        // Wait for all streams to complete
+        // Step 4: Wait for all streams to complete
+        let mut completed = 0;
         for (idx, handle) in handles.into_iter().enumerate() {
             match handle.await {
-                Ok(Ok(())) => debug!("Stream {} completed successfully", idx),
-                Ok(Err(e)) => return Err(e),
-                Err(e) => return Err(FileshareError::Transfer(format!("Stream {} panicked: {}", idx, e))),
+                Ok(Ok(())) => {
+                    completed += 1;
+                    debug!("✅ Stream {} completed successfully ({}/{})", idx, completed, stream_count);
+                },
+                Ok(Err(e)) => {
+                    error!("❌ Stream {} failed: {}", idx, e);
+                    return Err(e);
+                },
+                Err(e) => {
+                    error!("❌ Stream {} panicked: {}", idx, e);
+                    return Err(FileshareError::Transfer(format!("Stream {} panicked: {}", idx, e)));
+                }
             }
         }
         
+        info!("🎉 All {} parallel streams completed successfully", completed);
         Ok(())
     }
     
-    /// Send a range of chunks on a single stream (simplified - no chunk headers)
-    async fn send_chunks_range(
+    /// Send control message for parallel transfer coordination
+    async fn send_parallel_control_message(
+        mut control_stream: quinn::SendStream,
+        filename: &str,
+        file_size: u64,
+        target_path: &str,
+        chunk_size: u64,
+        total_chunks: u64,
+    ) -> Result<()> {
+        let header = format!("PARALLEL_CONTROL|{}|{}|{}|{}|{}", filename, file_size, target_path, chunk_size, total_chunks);
+        let header_bytes = header.as_bytes();
+        
+        // Send header length and header
+        control_stream.write_all(&(header_bytes.len() as u32).to_be_bytes()).await
+            .map_err(|e| FileshareError::Transfer(format!("Failed to write control header length: {}", e)))?;
+        control_stream.write_all(header_bytes).await
+            .map_err(|e| FileshareError::Transfer(format!("Failed to write control header: {}", e)))?;
+        
+        control_stream.finish()
+            .map_err(|e| FileshareError::Transfer(format!("Failed to finish control stream: {}", e)))?;
+            
+        info!("✅ Parallel control message sent: {} chunks", total_chunks);
+        Ok(())
+    }
+    
+    /// Send chunks with proper sequence numbers for parallel assembly
+    async fn send_parallel_chunks(
         mut stream: quinn::SendStream,
         file_path: Arc<PathBuf>,
         start_chunk: u64,
@@ -194,6 +232,8 @@ impl OptimizedTransfer {
         let mut file = tokio::fs::File::open(file_path.as_ref()).await?;
         let mut buffer = vec![0u8; chunk_size as usize];
         
+        debug!("📤 Stream {} starting: chunks {}-{}", stream_idx, start_chunk, end_chunk - 1);
+        
         for chunk_idx in start_chunk..end_chunk {
             // Seek to chunk position
             let chunk_offset = chunk_idx * chunk_size;
@@ -204,37 +244,44 @@ impl OptimizedTransfer {
             let remaining_bytes = file_size.saturating_sub(chunk_offset);
             let bytes_to_read = std::cmp::min(chunk_size, remaining_bytes) as usize;
             
-            // Read chunk
+            // Read chunk data
             let mut total_read = 0;
             while total_read < bytes_to_read {
                 match file.read(&mut buffer[total_read..bytes_to_read]).await {
-                    Ok(0) => break, // Unexpected EOF
+                    Ok(0) => break, // EOF
                     Ok(n) => total_read += n,
                     Err(e) => return Err(FileshareError::FileOperation(format!("Read error: {}", e))),
                 }
             }
             
-            // Send chunk data directly (no headers - order handled by stream ID)
+            // Send chunk with sequence number: [chunk_id: u64][size: u32][data: bytes]
+            stream.write_all(&chunk_idx.to_be_bytes()).await
+                .map_err(|e| FileshareError::Transfer(format!("Failed to write chunk ID: {}", e)))?;
+            stream.write_all(&(total_read as u32).to_be_bytes()).await
+                .map_err(|e| FileshareError::Transfer(format!("Failed to write chunk size: {}", e)))?;
             stream.write_all(&buffer[..total_read]).await
                 .map_err(|e| FileshareError::Transfer(format!("Failed to write chunk data: {}", e)))?;
             
             if chunk_idx % 10 == 0 {
-                debug!("Stream {}: Sent chunk {}/{}", stream_idx, chunk_idx - start_chunk + 1, end_chunk - start_chunk);
+                debug!("📦 Stream {}: Sent chunk {} ({} bytes)", stream_idx, chunk_idx, total_read);
             }
         }
         
         stream.finish()
             .map_err(|e| FileshareError::Transfer(format!("Failed to finish stream: {}", e)))?;
+            
+        debug!("✅ Stream {} completed: sent {} chunks", stream_idx, end_chunk - start_chunk);
         Ok(())
     }
     
     /// Calculate optimal chunk size based on file size
     fn calculate_optimal_chunk_size(file_size: u64) -> u64 {
         match file_size {
-            0..=100_000_000 => 2 * 1024 * 1024,           // <= 100MB: 2MB chunks
-            100_000_001..=1_000_000_000 => 4 * 1024 * 1024,  // 100MB-1GB: 4MB chunks
-            1_000_000_001..=10_000_000_000 => 8 * 1024 * 1024,  // 1GB-10GB: 8MB chunks
-            _ => 16 * 1024 * 1024,                         // > 10GB: 16MB chunks
+            0..=50_000_000 => 1 * 1024 * 1024,             // <= 50MB: 1MB chunks
+            50_000_001..=200_000_000 => 2 * 1024 * 1024,   // 50MB-200MB: 2MB chunks
+            200_000_001..=1_000_000_000 => 4 * 1024 * 1024,  // 200MB-1GB: 4MB chunks
+            1_000_000_001..=5_000_000_000 => 8 * 1024 * 1024,  // 1GB-5GB: 8MB chunks
+            _ => 16 * 1024 * 1024,                         // > 5GB: 16MB chunks
         }
     }
 }
@@ -242,10 +289,10 @@ impl OptimizedTransfer {
 /// Receiver side - handles both single and parallel transfers
 pub struct OptimizedReceiver;
 
-static PARALLEL_TRANSFERS: std::sync::OnceLock<Arc<Mutex<HashMap<String, ParallelTransfer>>>> = std::sync::OnceLock::new();
+static PARALLEL_TRANSFERS: std::sync::OnceLock<Arc<Mutex<HashMap<String, ParallelReceiver>>>> = std::sync::OnceLock::new();
 
 #[derive(Debug)]
-struct ParallelTransfer {
+struct ParallelReceiver {
     filename: String,
     file_size: u64,
     target_path: PathBuf,
@@ -253,12 +300,14 @@ struct ParallelTransfer {
     total_chunks: u64,
     received_chunks: u64,
     file: Option<tokio::fs::File>,
-    chunks_received: std::collections::HashSet<u64>,
+    chunk_buffer: HashMap<u64, Vec<u8>>, // chunk_id -> data
+    next_chunk_to_write: u64,
+    completed: bool,
 }
 
 impl OptimizedReceiver {
     pub async fn handle_incoming_transfer(mut recv_stream: quinn::RecvStream) -> Result<()> {
-        // Try to read header - if it fails, this might be a parallel chunk stream
+        // Try to read header length first
         let mut len_bytes = [0u8; 4];
         match recv_stream.read_exact(&mut len_bytes).await {
             Ok(_) => {
@@ -274,13 +323,13 @@ impl OptimizedReceiver {
                 let parts: Vec<&str> = header.split('|').collect();
                 match parts[0] {
                     "FILEINFO" => Self::receive_single_stream(recv_stream, &parts).await,
-                    "PARALLEL" => Self::receive_parallel_header(recv_stream, &parts).await,
+                    "PARALLEL_CONTROL" => Self::receive_parallel_control(recv_stream, &parts).await,
                     _ => Err(FileshareError::Transfer("Invalid transfer header".to_string())),
                 }
             },
             Err(_) => {
-                // This is likely a parallel chunk stream - handle as raw data
-                Self::receive_parallel_chunk(recv_stream).await
+                // This is a parallel data stream - read chunks with sequence numbers
+                Self::receive_parallel_data_stream(recv_stream).await
             }
         }
     }
@@ -331,9 +380,9 @@ impl OptimizedReceiver {
         Ok(())
     }
     
-    async fn receive_parallel_header(mut recv_stream: quinn::RecvStream, parts: &[&str]) -> Result<()> {
+    async fn receive_parallel_control(_recv_stream: quinn::RecvStream, parts: &[&str]) -> Result<()> {
         if parts.len() != 6 {
-            return Err(FileshareError::Transfer("Invalid parallel header".to_string()));
+            return Err(FileshareError::Transfer("Invalid parallel control header".to_string()));
         }
         
         let filename = parts[1].to_string();
@@ -345,17 +394,20 @@ impl OptimizedReceiver {
         let total_chunks: u64 = parts[5].parse()
             .map_err(|e| FileshareError::Transfer(format!("Invalid total chunks: {}", e)))?;
         
-        info!("📥 Parallel transfer header: {} ({:.1} MB, {} chunks)", 
-              filename, file_size as f64 / (1024.0 * 1024.0), total_chunks);
+        info!("🎛️ Parallel transfer control: {} ({:.1} MB, {} chunks of {:.1} MB)", 
+              filename, 
+              file_size as f64 / (1024.0 * 1024.0), 
+              total_chunks,
+              chunk_size as f64 / (1024.0 * 1024.0));
         
-        // Create target file
+        // Create target file and directory
         if let Some(parent) = target_path.parent() {
             tokio::fs::create_dir_all(parent).await?;
         }
         let file = tokio::fs::File::create(&target_path).await?;
         
-        // Initialize parallel transfer tracking
-        let transfer = ParallelTransfer {
+        // Initialize parallel receiver
+        let receiver = ParallelReceiver {
             filename: filename.clone(),
             file_size,
             target_path: target_path.clone(),
@@ -363,70 +415,101 @@ impl OptimizedReceiver {
             total_chunks,
             received_chunks: 0,
             file: Some(file),
-            chunks_received: std::collections::HashSet::new(),
+            chunk_buffer: HashMap::new(),
+            next_chunk_to_write: 0,
+            completed: false,
         };
         
         let transfers = PARALLEL_TRANSFERS.get_or_init(|| Arc::new(Mutex::new(HashMap::new())));
         {
             let mut transfers_lock = transfers.lock().await;
-            transfers_lock.insert(filename.clone(), transfer);
+            transfers_lock.insert(filename.clone(), receiver);
         }
         
-        // Continue reading remaining data from this stream (it's also a chunk stream)
-        Self::receive_parallel_chunk_with_key(recv_stream, filename).await
+        info!("✅ Parallel receiver initialized for: {}", filename);
+        Ok(())
     }
     
-    async fn receive_parallel_chunk(recv_stream: quinn::RecvStream) -> Result<()> {
-        // For chunk streams without filename, try to find the active transfer
-        let transfers = PARALLEL_TRANSFERS.get_or_init(|| Arc::new(Mutex::new(HashMap::new())));
-        let filename = {
-            let transfers_lock = transfers.lock().await;
-            transfers_lock.keys().next().cloned()
-        };
+    async fn receive_parallel_data_stream(mut recv_stream: quinn::RecvStream) -> Result<()> {
+        debug!("📥 Starting parallel data stream reception");
         
-        if let Some(filename) = filename {
-            Self::receive_parallel_chunk_with_key(recv_stream, filename).await
-        } else {
-            Err(FileshareError::Transfer("No active parallel transfer found".to_string()))
-        }
-    }
-    
-    async fn receive_parallel_chunk_with_key(mut recv_stream: quinn::RecvStream, filename: String) -> Result<()> {
-        let mut buffer = vec![0u8; 8 * 1024 * 1024]; // 8MB buffer
-        let mut total_received = 0;
-        
-        // Read all data from this stream
         loop {
-            match recv_stream.read(&mut buffer).await {
-                Ok(Some(0)) | Ok(None) => break,
-                Ok(Some(n)) => {
-                    total_received += n;
+            // Read chunk header: [chunk_id: u64][size: u32]
+            let mut chunk_header = [0u8; 12]; // 8 + 4 bytes
+            match recv_stream.read_exact(&mut chunk_header).await {
+                Ok(_) => {
+                    let chunk_id = u64::from_be_bytes(chunk_header[0..8].try_into().unwrap());
+                    let chunk_size = u32::from_be_bytes(chunk_header[8..12].try_into().unwrap()) as usize;
                     
-                    // Write to file (simplified - just append for now)
-                    let transfers = PARALLEL_TRANSFERS.get_or_init(|| Arc::new(Mutex::new(HashMap::new())));
-                    let mut transfers_lock = transfers.lock().await;
+                    // Read chunk data
+                    let mut chunk_data = vec![0u8; chunk_size];
+                    recv_stream.read_exact(&mut chunk_data).await
+                        .map_err(|e| FileshareError::Transfer(format!("Failed to read chunk data: {}", e)))?;
                     
-                    if let Some(transfer) = transfers_lock.get_mut(&filename) {
-                        if let Some(ref mut file) = transfer.file {
-                            file.write_all(&buffer[..n]).await
-                                .map_err(|e| FileshareError::FileOperation(format!("Failed to write: {}", e)))?;
-                        }
-                        
-                        transfer.received_chunks += 1;
-                        if transfer.received_chunks >= transfer.total_chunks {
-                            info!("✅ Parallel transfer complete: {} ({} bytes)", filename, total_received);
-                            if let Some(ref mut file) = transfer.file {
-                                file.flush().await
-                                    .map_err(|e| FileshareError::FileOperation(format!("Failed to flush: {}", e)))?;
-                            }
-                        }
-                    }
+                    // Process the chunk
+                    Self::process_received_chunk(chunk_id, chunk_data).await?;
                 },
-                Err(e) => return Err(FileshareError::Transfer(format!("Receive error: {}", e))),
+                Err(e) => {
+                    // Stream finished or error
+                    debug!("📥 Data stream finished: {}", e);
+                    break;
+                }
             }
         }
         
-        debug!("Parallel chunk stream complete: {} bytes", total_received);
+        debug!("✅ Parallel data stream reception completed");
+        Ok(())
+    }
+    
+    async fn process_received_chunk(chunk_id: u64, chunk_data: Vec<u8>) -> Result<()> {
+        let transfers = PARALLEL_TRANSFERS.get_or_init(|| Arc::new(Mutex::new(HashMap::new())));
+        let mut transfers_lock = transfers.lock().await;
+        
+        // Find the active transfer (assuming one active transfer for now)
+        let filename = transfers_lock.keys().next().cloned()
+            .ok_or_else(|| FileshareError::Transfer("No active parallel transfer".to_string()))?;
+        
+        let receiver = transfers_lock.get_mut(&filename)
+            .ok_or_else(|| FileshareError::Transfer("Transfer not found".to_string()))?;
+        
+        if receiver.completed {
+            return Ok(());
+        }
+        
+        debug!("📦 Received chunk {} ({} bytes)", chunk_id, chunk_data.len());
+        
+        // Store chunk in buffer
+        receiver.chunk_buffer.insert(chunk_id, chunk_data);
+        receiver.received_chunks += 1;
+        
+        // Write chunks in order
+        while let Some(chunk_data) = receiver.chunk_buffer.remove(&receiver.next_chunk_to_write) {
+            if let Some(ref mut file) = receiver.file {
+                file.write_all(&chunk_data).await
+                    .map_err(|e| FileshareError::FileOperation(format!("Failed to write chunk: {}", e)))?;
+            }
+            receiver.next_chunk_to_write += 1;
+            
+            if receiver.next_chunk_to_write % 50 == 0 {
+                let progress = (receiver.next_chunk_to_write as f64 / receiver.total_chunks as f64) * 100.0;
+                info!("📊 Progress: {:.1}% ({}/{})", progress, receiver.next_chunk_to_write, receiver.total_chunks);
+            }
+        }
+        
+        // Check if transfer is complete
+        if receiver.next_chunk_to_write >= receiver.total_chunks {
+            if let Some(ref mut file) = receiver.file {
+                file.flush().await
+                    .map_err(|e| FileshareError::FileOperation(format!("Failed to flush file: {}", e)))?;
+            }
+            receiver.completed = true;
+            
+            info!("🎉 Parallel transfer completed: {} ({:.1} MB, {} chunks)", 
+                  filename, 
+                  receiver.file_size as f64 / (1024.0 * 1024.0),
+                  receiver.total_chunks);
+        }
+        
         Ok(())
     }
 }
