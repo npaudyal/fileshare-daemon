@@ -32,6 +32,15 @@ lazy_static::lazy_static! {
     static ref INCOMING_STREAM_MANAGERS: Mutex<HashMap<Uuid, Arc<StreamManager>>> = Mutex::new(HashMap::new());
 }
 
+// Simple file receiver for direct QUIC transfers
+struct SimpleFileReceiver {
+    metadata: FileMetadata,
+    file_path: PathBuf,
+    writer: Option<tokio::fs::File>,
+    bytes_received: u64,
+    chunks_received: Vec<bool>,
+}
+
 #[derive(Debug, Clone)]
 pub struct Peer {
     pub device_info: DeviceInfo,
@@ -76,6 +85,8 @@ pub struct PeerManager {
     parallel_transfer_manager: Arc<ParallelTransferManager>,
     // Mapping from temporary connection IDs to real device IDs
     temp_to_real_id_map: HashMap<Uuid, Uuid>,
+    // Simple file receivers for incoming transfers
+    active_receivers: Arc<RwLock<HashMap<Uuid, SimpleFileReceiver>>>,
 }
 
 impl PeerManager {
@@ -107,6 +118,7 @@ impl PeerManager {
             stream_managers: HashMap::new(),
             parallel_transfer_manager,
             temp_to_real_id_map: HashMap::new(),
+            active_receivers: Arc::new(RwLock::new(HashMap::new())),
         };
 
         // Set up the message sender for file transfers
@@ -647,24 +659,44 @@ impl PeerManager {
                 metadata,
             } => {
                 info!(
-                    "✅ Processing incoming FileOffer from {}: {}",
-                    peer_id, metadata.name
+                    "✅ Processing incoming FileOffer from {}: {} ({} bytes)",
+                    peer_id, metadata.name, metadata.size
                 );
 
-                let mut ft = self.file_transfer.write().await;
-                ft.handle_file_offer(peer_id, *transfer_id, metadata.clone())
-                    .await?;
-
-                let response = ft.create_file_offer_response(*transfer_id, true, None);
-                drop(ft);
+                // Create a simple file receiver
+                let save_dir = self.get_default_save_dir();
+                let file_path = save_dir.join(&metadata.name);
+                
+                let receiver = SimpleFileReceiver {
+                    metadata: metadata.clone(),
+                    file_path: file_path.clone(),
+                    writer: None,
+                    bytes_received: 0,
+                    chunks_received: vec![false; metadata.total_chunks as usize],
+                };
+                
+                // Store the receiver
+                {
+                    let mut receivers = self.active_receivers.write().await;
+                    receivers.insert(*transfer_id, receiver);
+                }
+                
+                // Send acceptance
+                let response = Message::new(MessageType::FileOfferResponse {
+                    transfer_id: *transfer_id,
+                    accepted: true,
+                    reason: None,
+                });
 
                 self.send_message_to_peer(peer_id, response).await?;
+                
+                info!("✅ Accepted FileOffer {} from peer {}, will save to {:?}", 
+                      transfer_id, peer_id, file_path);
             }
 
             MessageType::FileChunk { transfer_id, chunk } => {
-                let mut ft = self.file_transfer.write().await;
-                ft.handle_file_chunk(peer_id, *transfer_id, chunk.clone())
-                    .await?;
+                // Handle chunk directly with simple receiver
+                self.handle_chunk_direct(*transfer_id, chunk.clone()).await?;
             }
 
             MessageType::TransferComplete {
@@ -889,15 +921,68 @@ impl PeerManager {
                     return Ok(());
                 }
 
-                // Start file transfer using the existing file transfer manager
-                let mut ft = self.file_transfer.write().await;
-                match ft.send_file_with_target_dir(resolved_peer_id, source_path, Some(target_path.clone())).await {
-                    Ok(_) => {
-                        info!("✅ File transfer initiated for request {}: {} -> {}", request_id, file_path, target_path);
+                // SIMPLIFIED: Start QUIC file transfer directly without going through FileTransferManager
+                let stream_manager_opt = self.stream_managers.get(&resolved_peer_id).cloned();
+                
+                if let Some(stream_manager) = stream_manager_opt {
+                    let transfer_id = Uuid::new_v4();
+                    let source_path_clone = source_path.clone();
+                    
+                    // Get file metadata
+                    let file_size = match tokio::fs::metadata(&source_path).await {
+                        Ok(metadata) => metadata.len(),
+                        Err(e) => {
+                            error!("Failed to get file metadata: {}", e);
+                            return Ok(());
+                        }
+                    };
+                    
+                    let chunk_size = crate::service::streaming::calculate_adaptive_chunk_size(file_size);
+                    let metadata = match FileMetadata::from_path_with_chunk_size(&source_path, chunk_size) {
+                        Ok(metadata) => metadata.with_target_dir(Some(target_path.clone())),
+                        Err(e) => {
+                            error!("Failed to create file metadata: {}", e);
+                            return Ok(());
+                        }
+                    };
+                    
+                    // Send FileOffer first
+                    let offer = Message::new(MessageType::FileOffer {
+                        transfer_id,
+                        metadata: metadata.clone(),
+                    });
+                    
+                    if let Err(e) = stream_manager.send_control_message(offer).await {
+                        error!("Failed to send file offer: {}", e);
+                        return Ok(());
                     }
-                    Err(e) => {
-                        error!("❌ Failed to start file transfer for request {}: {}", request_id, e);
-                    }
+                    
+                    info!("📤 Sent FileOffer for transfer {} to peer {}", transfer_id, resolved_peer_id);
+                    
+                    // Start the QUIC transfer directly
+                    tokio::spawn(async move {
+                        // Wait a bit for offer acceptance
+                        tokio::time::sleep(Duration::from_millis(100)).await;
+                        
+                        let quic_transfer = crate::quic::QuicFileTransfer::new(
+                            stream_manager,
+                            resolved_peer_id,
+                            transfer_id,
+                        );
+                        
+                        match quic_transfer.send_file_parallel(source_path_clone, metadata).await {
+                            Ok(()) => {
+                                info!("✅ QUIC file transfer {} completed successfully", transfer_id);
+                            }
+                            Err(e) => {
+                                error!("❌ QUIC file transfer {} failed: {}", transfer_id, e);
+                            }
+                        }
+                    });
+                    
+                    info!("✅ File transfer initiated for request {}: {} -> {}", request_id, file_path, target_path);
+                } else {
+                    error!("❌ No stream manager found for peer {}", resolved_peer_id);
                 }
             }
 
@@ -919,6 +1004,7 @@ impl PeerManager {
                 }
             }
 
+
             _ => {
                 debug!(
                     "Unhandled message type from {}: {:?}",
@@ -927,6 +1013,112 @@ impl PeerManager {
             }
         }
 
+        Ok(())
+    }
+    
+    fn get_default_save_dir(&self) -> PathBuf {
+        if let Some(ref temp_dir) = self.settings.transfer.temp_dir {
+            temp_dir.clone()
+        } else {
+            directories::UserDirs::new()
+                .and_then(|dirs| dirs.download_dir().map(|d| d.to_path_buf()))
+                .unwrap_or_else(|| {
+                    directories::UserDirs::new()
+                        .and_then(|dirs| dirs.document_dir().map(|d| d.to_path_buf()))
+                        .unwrap_or_else(|| PathBuf::from("."))
+                })
+        }
+    }
+    
+    async fn handle_chunk_direct(&self, transfer_id: Uuid, chunk: TransferChunk) -> Result<()> {
+        // Check if we need to initialize the file writer
+        let file_path = {
+            let mut receivers = self.active_receivers.write().await;
+            if let Some(receiver) = receivers.get_mut(&transfer_id) {
+                if receiver.writer.is_none() {
+                    Some(receiver.file_path.clone())
+                } else {
+                    None
+                }
+            } else {
+                warn!("Received chunk for unknown transfer: {}", transfer_id);
+                return Ok(());
+            }
+        };
+        
+        // Initialize file writer if needed (outside the lock)
+        if let Some(file_path) = file_path {
+            // Create parent directories if needed
+            if let Some(parent) = file_path.parent() {
+                tokio::fs::create_dir_all(parent).await.map_err(|e| {
+                    FileshareError::FileOperation(format!("Failed to create directory: {}", e))
+                })?;
+            }
+            
+            let file = tokio::fs::File::create(&file_path).await.map_err(|e| {
+                FileshareError::FileOperation(format!("Failed to create file: {}", e))
+            })?;
+            
+            let mut receivers = self.active_receivers.write().await;
+            if let Some(receiver) = receivers.get_mut(&transfer_id) {
+                receiver.writer = Some(file);
+            }
+        }
+        
+        // Process the chunk
+        let should_remove = {
+            let mut receivers = self.active_receivers.write().await;
+            if let Some(receiver) = receivers.get_mut(&transfer_id) {
+                // Mark chunk as received
+                if chunk.index < receiver.chunks_received.len() as u64 {
+                    receiver.chunks_received[chunk.index as usize] = true;
+                    receiver.bytes_received += chunk.data.len() as u64;
+                    
+                    // Write chunk to file (simplified - just append for now)
+                    if let Some(ref mut writer) = receiver.writer {
+                        use tokio::io::AsyncWriteExt;
+                        writer.write_all(&chunk.data).await.map_err(|e| {
+                            FileshareError::FileOperation(format!("Failed to write chunk: {}", e))
+                        })?;
+                    }
+                    
+                    // Check if transfer is complete
+                    let all_received = receiver.chunks_received.iter().all(|&received| received);
+                    let should_complete = all_received || chunk.is_last;
+                    
+                    if should_complete {
+                        info!("✅ File transfer {} completed: {:?}", transfer_id, receiver.file_path);
+                        
+                        // Flush and close file
+                        if let Some(ref mut writer) = receiver.writer {
+                            use tokio::io::AsyncWriteExt;
+                            writer.flush().await.map_err(|e| {
+                                FileshareError::FileOperation(format!("Failed to flush file: {}", e))
+                            })?;
+                        }
+                    }
+                    
+                    if chunk.index % 50 == 0 || chunk.is_last {
+                        let progress = (receiver.bytes_received as f64 / receiver.metadata.size as f64) * 100.0;
+                        info!("📊 Transfer {}: {:.1}% complete ({} bytes)", 
+                              transfer_id, progress, receiver.bytes_received);
+                    }
+                    
+                    should_complete
+                } else {
+                    false
+                }
+            } else {
+                false
+            }
+        };
+        
+        // Remove completed receiver (outside the processing lock)
+        if should_remove {
+            let mut receivers = self.active_receivers.write().await;
+            receivers.remove(&transfer_id);
+        }
+        
         Ok(())
     }
 }

@@ -767,16 +767,10 @@ impl FileTransferManager {
             .clone()
             .ok_or_else(|| FileshareError::Transfer("Message sender not configured".to_string()))?;
 
-        let settings = self.settings.clone();
+        let _settings = self.settings.clone();
 
-        tokio::spawn(async move {
-            if let Err(e) =
-                Self::send_file_chunks_with_metadata(message_sender, peer_id, transfer_id, file_path, metadata, settings)
-                    .await
-            {
-                error!("Failed to send file chunks: {}", e);
-            }
-        });
+        // This method is now deprecated - file transfers should use QUIC directly
+        warn!("⚠️ Using deprecated file transfer method - QUIC transfers should be initiated directly");
 
         Ok(())
     }

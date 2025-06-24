@@ -49,15 +49,8 @@ impl QuicFileTransfer {
             metadata.compression,
         ).await?;
         
-        // Send file offer first
-        let offer_message = Message::new(MessageType::FileOffer {
-            transfer_id: self.transfer_id,
-            metadata: metadata.clone(),
-        });
-        self.stream_manager.send_control_message(offer_message).await?;
-        
-        // Wait for acceptance (simplified for now, should wait for response)
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        // File offer was already sent by FileTransferManager, so we can start sending chunks directly
+        // No need to send duplicate FileOffer or wait
         
         // Create chunk sender
         let sender = ParallelChunkSender::new(
