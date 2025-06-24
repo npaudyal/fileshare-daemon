@@ -47,13 +47,14 @@ lz4 = "1.24"
 sysinfo = "0.30"
 # Network optimization
 socket2 = "0.5"
-# QUIC support
+# QUIC support - using ring crypto backend for Windows compatibility
 quinn = "0.11"
-rustls = "0.23"
+rustls = { version = "0.23", default-features = false, features = ["ring"] }
 rustls-pki-types = "1.0"
 rustls-pemfile = "2.0"
 rcgen = "0.13"
 futures = "0.3"
+ring = "0.17"
 
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.52", features = [
