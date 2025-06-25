@@ -227,11 +227,8 @@ fn create_transport_config() -> quinn::TransportConfig {
     // Disable pacing for LAN transfers (send as fast as possible)
     transport_config.enable_segmentation_offload(true);
 
-    // Set congestion controller to BBR with custom config
-    let mut bbr_config = quinn::congestion::BbrConfig::default();
     transport_config
-        .congestion_controller_factory(Arc::new(quinn::congestion::BbrConfig::default()));
-    transport_config.congestion_controller_factory(Arc::new(bbr_config));
+        .congestion_controller_factory(Arc::new(quinn::congestion::CubicConfig::default()));
 
     info!("🚀 Created optimized transport config for LAN transfers");
 
