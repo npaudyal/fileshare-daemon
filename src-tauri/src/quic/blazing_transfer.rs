@@ -319,6 +319,16 @@ impl BlazingTransfer {
         let mut buffer = vec![0u8; chunk_size as usize];
         let mut sent_count = 0;
         
+        // Send filename first to identify this transfer
+        let filename = file_path.file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("unknown");
+        let filename_bytes = filename.as_bytes();
+        stream.write_all(&(filename_bytes.len() as u32).to_be_bytes()).await?;
+        stream.write_all(filename_bytes).await?;
+        
+        debug!("📤 Stream {} sending chunks for file: {}", stream_idx, filename);
+        
         loop {
             // Get next chunk from shared receiver
             let chunk_idx = {
@@ -656,11 +666,101 @@ impl BlazingReceiver {
         mut recv_stream: quinn::RecvStream,
         first_bytes: [u8; 4],
     ) -> Result<()> {
+        // Check if this looks like a filename length (reasonable size)
+        let potential_filename_len = u32::from_be_bytes(first_bytes) as usize;
+        
+        if potential_filename_len > 0 && potential_filename_len < 1000 {
+            // This looks like a filename header from new protocol
+            let mut filename_bytes = vec![0u8; potential_filename_len];
+            match recv_stream.read_exact(&mut filename_bytes).await {
+                Ok(_) => {
+                    // Successfully read filename
+                    let filename = String::from_utf8(filename_bytes)?;
+                    
+                    // Wait a bit if transfer state isn't ready yet
+                    let mut retries = 0;
+                    let state = loop {
+                        if let Some(state) = ACTIVE_TRANSFERS.get(&filename) {
+                            break state.clone();
+                        }
+                        
+                        retries += 1;
+                        if retries > 10 {
+                            return Err(FileshareError::Transfer(format!("Transfer not found after retries: {}", filename)));
+                        }
+                        
+                        // Wait a bit for the transfer state to be initialized
+                        tokio::time::sleep(Duration::from_millis(100)).await;
+                    };
+                    
+                    debug!("📥 Processing data stream for file: {}", filename);
+                    
+                    // Now process all chunks for this transfer
+                    loop {
+                        let mut chunk_header = [0u8; 12]; // chunk_id (8) + size (4)
+                        match recv_stream.read_exact(&mut chunk_header).await {
+                            Ok(_) => {},
+                            Err(_) => {
+                                debug!("Stream ended for file: {}", filename);
+                                break;
+                            }
+                        }
+                        
+                        let chunk_id = u64::from_be_bytes(chunk_header[0..8].try_into().unwrap());
+                        let chunk_size = u32::from_be_bytes(chunk_header[8..12].try_into().unwrap()) as usize;
+                        
+                        // Validate chunk size
+                        if chunk_size > 100 * 1024 * 1024 { // 100MB max
+                            error!("Chunk too large: {} bytes", chunk_size);
+                            return Err(FileshareError::Transfer(format!("Chunk too large: {} bytes", chunk_size)));
+                        }
+                        
+                        let mut chunk_data = vec![0u8; chunk_size];
+                        recv_stream.read_exact(&mut chunk_data).await?;
+                        
+                        // Send to writer
+                        state.chunk_writer.send((chunk_id, chunk_data)).await?;
+                        
+                        let received = state.received_chunks.fetch_add(1, Ordering::Relaxed) + 1;
+                        
+                        if received % 10 == 0 || received == state.total_chunks {
+                            let progress = (received as f64 / state.total_chunks as f64) * 100.0;
+                            debug!("📊 Stream progress for {}: {:.1}% ({}/{})", 
+                                   filename, progress, received, state.total_chunks);
+                        }
+                        
+                        if received == state.total_chunks {
+                            state.completed.store(true, Ordering::Relaxed);
+                            info!("🎉 All chunks received for: {}", state.filename);
+                        }
+                    }
+                }
+                Err(e) => {
+                    // Failed to read filename, fall back to old protocol
+                    error!("Failed to read filename, using fallback: {}", e);
+                    return Self::process_data_stream_legacy(recv_stream, first_bytes).await;
+                }
+            }
+        } else {
+            // This doesn't look like a filename length, use legacy protocol
+            return Self::process_data_stream_legacy(recv_stream, first_bytes).await;
+        }
+        
+        Ok(())
+    }
+    
+    // Legacy fallback for old protocol (without filename header)
+    async fn process_data_stream_legacy(
+        mut recv_stream: quinn::RecvStream,
+        first_bytes: [u8; 4],
+    ) -> Result<()> {
+        // The first_bytes are actually the first 4 bytes of chunk_id
         let mut id_bytes = [0u8; 8];
         id_bytes[..4].copy_from_slice(&first_bytes);
         recv_stream.read_exact(&mut id_bytes[4..]).await?;
         let first_chunk_id = u64::from_be_bytes(id_bytes);
         
+        // Find any active transfer (old behavior)
         let transfer_key = ACTIVE_TRANSFERS.iter()
             .find(|entry| !entry.value().completed.load(Ordering::Relaxed))
             .map(|entry| entry.key().clone())
@@ -669,6 +769,8 @@ impl BlazingReceiver {
         let state = ACTIVE_TRANSFERS.get(&transfer_key)
             .ok_or_else(|| FileshareError::Transfer("Transfer not found".to_string()))?
             .clone();
+        
+        warn!("Using legacy protocol for transfer: {}", state.filename);
         
         // Process first chunk
         let mut size_bytes = [0u8; 4];
