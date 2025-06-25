@@ -205,14 +205,14 @@ impl QuicConnectionManager {
 fn create_transport_config() -> quinn::TransportConfig {
     let mut transport_config = quinn::TransportConfig::default();
 
-    // Maximum stream limits
-    transport_config.max_concurrent_bidi_streams(VarInt::from_u32(1000));
-    transport_config.max_concurrent_uni_streams(VarInt::from_u32(1000));
+    // Maximum stream limits - increased for blazing fast transfers
+    transport_config.max_concurrent_bidi_streams(VarInt::from_u32(2000));
+    transport_config.max_concurrent_uni_streams(VarInt::from_u32(2000));
 
-    // Large flow control windows for high throughput
-    transport_config.stream_receive_window(VarInt::from_u32(100 * 1024 * 1024)); // 100MB per stream
-    transport_config.receive_window(VarInt::from_u32(1024 * 1024 * 1024)); // 1GB connection window
-    transport_config.send_window(1024 * 1024 * 1024); // 1GB send window
+    // Massive flow control windows for maximum throughput
+    transport_config.stream_receive_window(VarInt::from_u32(256 * 1024 * 1024)); // 256MB per stream
+    transport_config.receive_window(VarInt::from_u32(2u32.saturating_mul(1024 * 1024 * 1024))); // 2GB connection window
+    transport_config.send_window(2u64.saturating_mul(1024 * 1024 * 1024)); // 2GB send window
 
     // Aggressive timeouts for LAN
     transport_config.max_idle_timeout(Some(IdleTimeout::from(VarInt::from_u32(60_000)))); // 60 seconds

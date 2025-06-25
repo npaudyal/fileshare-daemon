@@ -15,9 +15,9 @@ use std::os::unix::fs::OpenOptionsExt;
 
 // Optimized constants for maximum blazing performance
 const SMALL_FILE_THRESHOLD: u64 = 10 * 1024 * 1024; // 10MB
-const OPTIMAL_CHUNK_SIZE: u64 = 8 * 1024 * 1024; // 8MB for better parallelism
-const MAX_PARALLEL_STREAMS: usize = 32; // Optimal for most networks
-const WRITE_CONCURRENCY: usize = 64; // High concurrent disk writes
+const OPTIMAL_CHUNK_SIZE: u64 = 16 * 1024 * 1024; // 16MB for better throughput
+const MAX_PARALLEL_STREAMS: usize = 64; // Maximum concurrent streams
+const WRITE_CONCURRENCY: usize = 128; // Very high concurrent disk writes
 
 pub struct BlazingTransfer;
 
@@ -81,6 +81,9 @@ impl BlazingTransfer {
             .into_iter().next()
             .ok_or_else(|| FileshareError::Transfer("Failed to create stream".to_string()))?;
         
+        // Send magic byte to identify control stream
+        stream.write_all(&[0xFF]).await?;
+        
         let header = format!("BLAZING_SINGLE|{}|{}|{}", filename, file_size, target_path);
         let header_bytes = header.as_bytes();
         stream.write_all(&(header_bytes.len() as u32).to_be_bytes()).await?;
@@ -128,10 +131,7 @@ impl BlazingTransfer {
         
         info!("✅ Control message sent for {} chunks", total_chunks);
         
-        // Small delay to ensure control message is processed first
-        tokio::time::sleep(Duration::from_millis(50)).await;
-        
-        // Create ALL streams immediately - no progressive launch
+        // Create ALL streams immediately - no delay needed with proper protocol
         let streams = stream_manager.open_file_transfer_streams(optimal_streams).await?;
         
         // Create progress tracking
@@ -203,6 +203,9 @@ impl BlazingTransfer {
         let mut file = tokio::fs::File::open(&file_path).await?;
         let mut buffer = vec![0u8; chunk_size as usize];
         
+        // Send magic byte to identify data stream
+        stream.write_all(&[0xFE]).await?;
+        
         // Send filename first to identify this transfer
         let filename = file_path.file_name()
             .and_then(|n| n.to_str())
@@ -247,6 +250,9 @@ impl BlazingTransfer {
         chunk_size: u64,
         total_chunks: u64,
     ) -> Result<()> {
+        // Send a magic byte to identify control stream
+        stream.write_all(&[0xFF]).await?;
+        
         let header = format!("BLAZING_PARALLEL|{}|{}|{}|{}|{}", 
                            filename, file_size, target_path, chunk_size, total_chunks);
         let header_bytes = header.as_bytes();
@@ -337,52 +343,154 @@ lazy_static::lazy_static! {
 
 impl BlazingReceiver {
     pub async fn handle_incoming_transfer(mut recv_stream: quinn::RecvStream) -> Result<()> {
+        // Read magic byte first
+        let mut magic_byte = [0u8; 1];
+        recv_stream.read_exact(&mut magic_byte).await?;
+        
+        match magic_byte[0] {
+            0xFF => {
+                // Control stream
+                debug!("📥 Detected control stream (magic: 0xFF)");
+                Self::handle_control_stream(recv_stream).await
+            },
+            0xFE => {
+                // Data stream with filename
+                debug!("📥 Detected data stream (magic: 0xFE)");
+                Self::handle_data_stream_with_filename(recv_stream).await
+            },
+            _ => {
+                // Legacy format - prepend the magic byte back
+                debug!("📥 Legacy stream format detected");
+                Self::handle_legacy_stream(recv_stream, magic_byte[0]).await
+            }
+        }
+    }
+    
+    async fn handle_control_stream(mut recv_stream: quinn::RecvStream) -> Result<()> {
         let mut len_bytes = [0u8; 4];
         recv_stream.read_exact(&mut len_bytes).await?;
+        let header_len = u32::from_be_bytes(len_bytes) as usize;
+        
+        let mut header_bytes = vec![0u8; header_len];
+        recv_stream.read_exact(&mut header_bytes).await?;
+        
+        if let Ok(header) = String::from_utf8(header_bytes) {
+            debug!("📥 Control header: {}", header);
+            let parts: Vec<&str> = header.split('|').collect();
+            
+            match parts.get(0) {
+                Some(&"BLAZING_SINGLE") => {
+                    Self::receive_single_stream(recv_stream, &parts).await
+                },
+                Some(&"BLAZING_PARALLEL") => {
+                    Self::receive_parallel_control(recv_stream, &parts).await
+                },
+                _ => {
+                    Err(FileshareError::Transfer("Unknown control message type".to_string()))
+                }
+            }
+        } else {
+            Err(FileshareError::Transfer("Invalid control header encoding".to_string()))
+        }
+    }
+    
+    async fn handle_data_stream_with_filename(mut recv_stream: quinn::RecvStream) -> Result<()> {
+        // Read filename length
+        let mut len_bytes = [0u8; 4];
+        recv_stream.read_exact(&mut len_bytes).await?;
+        let filename_len = u32::from_be_bytes(len_bytes) as usize;
+        
+        // Read filename
+        let mut filename_bytes = vec![0u8; filename_len];
+        recv_stream.read_exact(&mut filename_bytes).await?;
+        let filename = String::from_utf8(filename_bytes)
+            .map_err(|_| FileshareError::Transfer("Invalid filename encoding".to_string()))?;
+        
+        debug!("📥 Data stream for file: {}", filename);
+        
+        // Wait for transfer state
+        let start_time = Instant::now();
+        let state = loop {
+            if let Some(state) = ACTIVE_TRANSFERS.get(&filename) {
+                break state.clone();
+            }
+            
+            if start_time.elapsed() > Duration::from_secs(5) {
+                return Err(FileshareError::Transfer(format!("Transfer state not found for: {}", filename)));
+            }
+            
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        };
+        
+        // Process chunks
+        loop {
+            let mut chunk_header = [0u8; 12]; // chunk_id (8) + size (4)
+            match recv_stream.read_exact(&mut chunk_header).await {
+                Ok(_) => {},
+                Err(_) => break,
+            }
+            
+            let chunk_id = u64::from_be_bytes(chunk_header[0..8].try_into().unwrap());
+            let chunk_size = u32::from_be_bytes(chunk_header[8..12].try_into().unwrap()) as usize;
+            
+            if chunk_size > 100 * 1024 * 1024 {
+                return Err(FileshareError::Transfer(format!("Chunk too large: {} bytes", chunk_size)));
+            }
+            
+            let mut chunk_data = vec![0u8; chunk_size];
+            recv_stream.read_exact(&mut chunk_data).await?;
+            
+            state.chunk_writer.send((chunk_id, chunk_data)).await?;
+            
+            let received = state.received_chunks.fetch_add(1, Ordering::Relaxed) + 1;
+            
+            if received % 10 == 0 || received == state.total_chunks {
+                let progress = (received as f64 / state.total_chunks as f64) * 100.0;
+                debug!("📊 Progress: {:.1}% ({}/{})", progress, received, state.total_chunks);
+            }
+            
+            if received == state.total_chunks {
+                state.completed.store(true, Ordering::Relaxed);
+                info!("🎉 All chunks received for: {}", state.filename);
+            }
+        }
+        
+        Ok(())
+    }
+    
+    async fn handle_legacy_stream(mut recv_stream: quinn::RecvStream, first_byte: u8) -> Result<()> {
+        // For legacy streams, the first byte is part of a 4-byte length field
+        let mut len_bytes = [0u8; 4];
+        len_bytes[0] = first_byte;
+        recv_stream.read_exact(&mut len_bytes[1..]).await?;
         let first_len = u32::from_be_bytes(len_bytes) as usize;
         
-        debug!("📥 Received stream with first length: {}", first_len);
+        debug!("📥 Legacy stream with first length: {}", first_len);
         
-        // Try to read as control message header first
+        // Try to parse as control message
         if first_len >= 10 && first_len <= 1000 {
             let mut header_bytes = vec![0u8; first_len];
             match recv_stream.read_exact(&mut header_bytes).await {
                 Ok(_) => {
                     if let Ok(header) = String::from_utf8(header_bytes) {
-                        debug!("📥 Potential control header: {}", header);
                         let parts: Vec<&str> = header.split('|').collect();
-                        
                         match parts.get(0) {
                             Some(&"BLAZING_SINGLE") => {
-                                debug!("📥 Processing as BLAZING_SINGLE control message");
                                 return Self::receive_single_stream(recv_stream, &parts).await;
                             },
                             Some(&"BLAZING_PARALLEL") => {
-                                debug!("📥 Processing as BLAZING_PARALLEL control message");
                                 return Self::receive_parallel_control(recv_stream, &parts).await;
                             },
-                            _ => {
-                                debug!("📥 Not a control message, treating as data stream");
-                                // Not a control message, fall through to data stream handling
-                            }
+                            _ => {}
                         }
-                    } else {
-                        debug!("📥 Failed to parse as UTF-8, treating as data stream");
                     }
                 }
-                Err(e) => {
-                    debug!("📥 Failed to read header bytes: {}, treating as data stream", e);
-                    // Not a control message, fall through to data stream handling
-                }
+                Err(_) => {}
             }
-        } else {
-            debug!("📥 Length {} not in control range, treating as data stream", first_len);
         }
         
-        // This is a data stream - the first_len is actually chunk data, not filename length
-        let first_bytes = (first_len as u32).to_be_bytes();
-        debug!("📥 Processing as legacy data stream (first 4 bytes: {:?})", first_bytes);
-        Self::process_data_stream_legacy_direct(recv_stream, first_bytes).await
+        // Fall back to legacy data stream processing
+        Self::process_data_stream_legacy_direct(recv_stream, len_bytes).await
     }
     
     async fn receive_single_stream(
@@ -487,9 +595,6 @@ impl BlazingReceiver {
         ACTIVE_TRANSFERS.insert(filename.clone(), state.clone());
         info!("✅ Transfer state created for: {}", filename);
         
-        // Small delay to ensure transfer state is fully registered
-        tokio::time::sleep(Duration::from_millis(10)).await;
-        
         // Now spawn writer task
         let target_path_clone = target_path.clone();
         let filename_clone = filename.clone();
@@ -546,12 +651,96 @@ impl BlazingReceiver {
         Ok(())
     }
     
+    async fn process_chunks_with_state(
+        mut recv_stream: quinn::RecvStream,
+        state: Arc<TransferState>,
+    ) -> Result<()> {
+        // Process chunks
+        loop {
+            let mut chunk_header = [0u8; 12]; // chunk_id (8) + size (4)
+            match recv_stream.read_exact(&mut chunk_header).await {
+                Ok(_) => {},
+                Err(_) => break,
+            }
+            
+            let chunk_id = u64::from_be_bytes(chunk_header[0..8].try_into().unwrap());
+            let chunk_size = u32::from_be_bytes(chunk_header[8..12].try_into().unwrap()) as usize;
+            
+            if chunk_size > 100 * 1024 * 1024 {
+                return Err(FileshareError::Transfer(format!("Chunk too large: {} bytes", chunk_size)));
+            }
+            
+            let mut chunk_data = vec![0u8; chunk_size];
+            recv_stream.read_exact(&mut chunk_data).await?;
+            
+            state.chunk_writer.send((chunk_id, chunk_data)).await?;
+            
+            let received = state.received_chunks.fetch_add(1, Ordering::Relaxed) + 1;
+            
+            if received % 10 == 0 || received == state.total_chunks {
+                let progress = (received as f64 / state.total_chunks as f64) * 100.0;
+                debug!("📊 Progress: {:.1}% ({}/{})", progress, received, state.total_chunks);
+            }
+            
+            if received == state.total_chunks {
+                state.completed.store(true, Ordering::Relaxed);
+                info!("🎉 All chunks received for: {}", state.filename);
+            }
+        }
+        
+        Ok(())
+    }
+    
     async fn process_data_stream_legacy_direct(
         mut recv_stream: quinn::RecvStream,
         first_bytes: [u8; 4],
     ) -> Result<()> {
         debug!("📥 Processing legacy data stream with first bytes: {:?}", first_bytes);
         
+        // First bytes are filename length in legacy format
+        let filename_len = u32::from_be_bytes(first_bytes) as usize;
+        
+        if filename_len == 0 || filename_len > 255 {
+            // This might actually be chunk data, not filename
+            return Self::process_chunk_data_direct(recv_stream, first_bytes).await;
+        }
+        
+        // Try to read filename
+        let mut filename_bytes = vec![0u8; filename_len];
+        match recv_stream.read_exact(&mut filename_bytes).await {
+            Ok(_) => {
+                if let Ok(filename) = String::from_utf8(filename_bytes) {
+                    debug!("📥 Legacy stream for file: {}", filename);
+                    
+                    // Wait for transfer state
+                    let start_time = Instant::now();
+                    let state = loop {
+                        if let Some(state) = ACTIVE_TRANSFERS.get(&filename) {
+                            break state.clone();
+                        }
+                        
+                        if start_time.elapsed() > Duration::from_secs(5) {
+                            return Err(FileshareError::Transfer(format!("Transfer state not found for: {}", filename)));
+                        }
+                        
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    };
+                    
+                    // Process chunks with filename header
+                    return Self::process_chunks_with_state(recv_stream, state).await;
+                }
+            }
+            Err(_) => {}
+        }
+        
+        // Fall back to direct chunk processing
+        Self::process_chunk_data_direct(recv_stream, first_bytes).await
+    }
+    
+    async fn process_chunk_data_direct(
+        mut recv_stream: quinn::RecvStream,
+        first_bytes: [u8; 4],
+    ) -> Result<()> {
         // Wait for an active transfer to be available
         let start_time = Instant::now();
         let (transfer_key, state) = loop {
@@ -564,7 +753,7 @@ impl BlazingReceiver {
                 return Err(FileshareError::Transfer("No active transfer found within timeout".to_string()));
             }
             
-            tokio::time::sleep(Duration::from_millis(50)).await;
+            tokio::time::sleep(Duration::from_millis(10)).await;
         };
         
         debug!("📥 Found active transfer: {}", transfer_key);
@@ -645,7 +834,7 @@ impl BlazingReceiver {
                 return Err(FileshareError::Transfer(format!("Transfer state not found for: {}", filename)));
             }
             
-            tokio::time::sleep(Duration::from_millis(50)).await;
+            tokio::time::sleep(Duration::from_millis(10)).await;
         };
         
         // Process chunks
@@ -721,7 +910,7 @@ impl BlazingReceiver {
                 return Err(FileshareError::Transfer(format!("Transfer state not found for: {}", filename)));
             }
             
-            tokio::time::sleep(Duration::from_millis(50)).await;
+            tokio::time::sleep(Duration::from_millis(10)).await;
         };
         
         // Process chunks
@@ -777,7 +966,7 @@ impl BlazingReceiver {
                 return Err(FileshareError::Transfer("No active transfer found within timeout".to_string()));
             }
             
-            tokio::time::sleep(Duration::from_millis(50)).await;
+            tokio::time::sleep(Duration::from_millis(10)).await;
         };
         
         debug!("📥 Processing legacy data stream for transfer: {}", transfer_key);
