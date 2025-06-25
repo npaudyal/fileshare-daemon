@@ -205,12 +205,11 @@ impl QuicConnectionManager {
 fn create_transport_config() -> quinn::TransportConfig {
     let mut transport_config = quinn::TransportConfig::default();
 
-    // Aggressive settings for LAN transfers
+    // Maximum stream limits
     transport_config.max_concurrent_bidi_streams(VarInt::from_u32(1000));
     transport_config.max_concurrent_uni_streams(VarInt::from_u32(1000));
 
     // Large flow control windows for high throughput
-    transport_config.initial_window(100 * 1024 * 1024); // 100MB initial window
     transport_config.stream_receive_window(VarInt::from_u32(100 * 1024 * 1024)); // 100MB per stream
     transport_config.receive_window(VarInt::from_u32(1024 * 1024 * 1024)); // 1GB connection window
     transport_config.send_window(1024 * 1024 * 1024); // 1GB send window
@@ -218,17 +217,21 @@ fn create_transport_config() -> quinn::TransportConfig {
     // Aggressive timeouts for LAN
     transport_config.max_idle_timeout(Some(IdleTimeout::from(VarInt::from_u32(60_000)))); // 60 seconds
 
-    // Disable congestion control for LAN (use max throughput)
-    transport_config.initial_rtt(std::time::Duration::from_micros(250)); // Assume LAN RTT
-    transport_config
-        .congestion_controller_factory(Arc::new(quinn::congestion::BbrConfig::default()));
+    // Set initial RTT estimate for LAN
+    transport_config.initial_rtt(std::time::Duration::from_micros(250)); // 250μs for LAN
 
-    // Enable GSO for better performance
-    transport_config.enable_segmentation_offload(true);
-
-    // Datagram settings
+    // Datagram settings for maximum buffer
     transport_config.datagram_receive_buffer_size(Some(100 * 1024 * 1024)); // 100MB
     transport_config.datagram_send_buffer_size(100 * 1024 * 1024); // 100MB
+
+    // Disable pacing for LAN transfers (send as fast as possible)
+    transport_config.enable_segmentation_offload(true);
+
+    // Set congestion controller to BBR with custom config
+    let mut bbr_config = quinn::congestion::BbrConfig::default();
+    transport_config
+        .congestion_controller_factory(Arc::new(quinn::congestion::BbrConfig::default()));
+    transport_config.congestion_controller_factory(Arc::new(bbr_config));
 
     info!("🚀 Created optimized transport config for LAN transfers");
 
