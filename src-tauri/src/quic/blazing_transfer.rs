@@ -18,29 +18,10 @@ const WRITE_CONCURRENCY: usize = 32; // More concurrent writes for speed
 pub struct BlazingTransfer;
 
 impl BlazingTransfer {
-    /// 🚀 BLAZING FAST bandwidth probe - auto-tune for maximum speed
-    async fn probe_bandwidth(stream_manager: Arc<StreamManager>) -> Result<u64> {
-        let probe_data = vec![0u8; 2 * 1024 * 1024]; // 2MB probe for accurate measurement
-        let start = Instant::now();
-        
-        info!("⚡ Probing bandwidth for optimal stream configuration...");
-        
-        // Send probe data on a single stream
-        let mut stream = stream_manager.open_file_transfer_streams(1).await?
-            .into_iter().next()
-            .ok_or_else(|| FileshareError::Transfer("Failed to create probe stream".to_string()))?;
-        
-        stream.write_all(&probe_data).await
-            .map_err(|e| FileshareError::Transfer(format!("Probe failed: {}", e)))?;
-        stream.finish()
-            .map_err(|e| FileshareError::Transfer(format!("Failed to finish probe: {}", e)))?;
-        
-        let duration = start.elapsed();
-        let bandwidth_bps = (probe_data.len() as f64 * 8.0 / duration.as_secs_f64()) as u64;
-        let bandwidth_mbps = bandwidth_bps as f64 / 1_000_000.0;
-        
-        info!("🚀 Bandwidth probe complete: {:.1} Mbps", bandwidth_mbps);
-        Ok(bandwidth_bps)
+    /// 🚀 BLAZING FAST transfer - skip bandwidth probe for maximum speed
+    async fn skip_probe_for_speed() -> u64 {
+        // Skip bandwidth probing to eliminate ALL delays - assume gigabit speed
+        1_000_000_000 // 1Gbps default for LAN transfers
     }
     
     /// Transfer file with maximum performance
@@ -136,8 +117,8 @@ impl BlazingTransfer {
         filename: String,
         file_size: u64,
     ) -> Result<()> {
-        // 🚀 AUTO-TUNE parameters based on bandwidth probe for MAXIMUM speed
-        let _bandwidth = Self::probe_bandwidth(stream_manager.clone()).await.unwrap_or(1_000_000_000); // Default to 1Gbps
+        // ⚡ SKIP bandwidth probe for INSTANT start - assume maximum LAN speed
+        let _bandwidth = Self::skip_probe_for_speed().await;
         
         // 🔥 Calculate OPTIMAL parameters for maximum speed
         let chunk_size = Self::calculate_adaptive_chunk_size(file_size, 0);
@@ -157,6 +138,9 @@ impl BlazingTransfer {
         // 🔥 Create shared state for blazing progress tracking
         let bytes_sent = Arc::new(AtomicU64::new(0));
         let start_time = Instant::now();
+        
+        // ⚡ DELAY control stream slightly to ensure receiver setup
+        tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
         
         // ⚡ INSTANT ALL STREAMS - NO PROGRESSIVE OPENING, NO DELAYS
         info!("⚡ Opening ALL {} streams INSTANTLY for maximum parallel throughput!", stream_count);
@@ -197,23 +181,21 @@ impl BlazingTransfer {
             handles.push(handle);
         }
         
-        // 🚀 BLAZING FAST progress monitoring - less overhead, more speed
+        // ⚡ MINIMAL progress monitoring - maximum performance, minimal overhead
         let monitor_handle = tokio::spawn(async move {
             let mut last_bytes = 0u64;
-            let mut report_count = 0;
             loop {
-                tokio::time::sleep(tokio::time::Duration::from_millis(500)).await; // 2x faster reporting
+                tokio::time::sleep(tokio::time::Duration::from_secs(2)).await; // Less frequent monitoring
                 let current_bytes = bytes_sent.load(Ordering::Relaxed);
                 let elapsed = start_time.elapsed().as_secs_f64();
-                let speed_mbps = ((current_bytes - last_bytes) as f64 * 8.0) / 500_000.0; // Adjust for 500ms interval
+                let speed_mbps = ((current_bytes - last_bytes) as f64 * 8.0) / 2_000_000.0; // Adjust for 2s interval
                 let progress = (current_bytes as f64 / file_size as f64) * 100.0;
                 
-                if current_bytes < file_size && report_count % 2 == 0 { // Report every second but calculate every 500ms
+                if current_bytes < file_size {
                     info!("🚀 BLAZING Progress: {:.1}% - Speed: {:.1} Mbps", progress, speed_mbps);
                 }
                 
                 last_bytes = current_bytes;
-                report_count += 1;
                 if current_bytes >= file_size {
                     break;
                 }
@@ -305,22 +287,13 @@ impl BlazingTransfer {
         Ok(())
     }
     
-    /// 🚀 ADAPTIVE chunk sizing for BLAZING FAST performance - eliminates slow start
-    fn calculate_adaptive_chunk_size(file_size: u64, stream_idx: usize) -> u64 {
-        let base_size = match file_size {
-            0..=50_000_000 => 4 * 1024 * 1024,            // <= 50MB: 4MB chunks
-            50_000_001..=200_000_000 => 8 * 1024 * 1024,   // 50-200MB: 8MB chunks
-            200_000_001..=1_000_000_000 => 16 * 1024 * 1024, // 200MB-1GB: 16MB chunks
-            _ => 32 * 1024 * 1024,                         // > 1GB: 32MB chunks
-        };
-        
-        // ⚡ ELIMINATE slow start - first streams get smaller chunks for instant throughput
-        if stream_idx < 4 {
-            base_size / 2  // First 4 streams use smaller chunks to establish flow immediately
-        } else if stream_idx < 8 {
-            (base_size * 3) / 4  // Next 4 streams use 75% size
-        } else {
-            base_size  // Rest use full size chunks
+    /// 🚀 OPTIMAL chunk sizing for INSTANT maximum throughput
+    fn calculate_adaptive_chunk_size(file_size: u64, _stream_idx: usize) -> u64 {
+        // ⚡ Use OPTIMAL fixed chunk size for maximum speed - no adaptive complexity
+        match file_size {
+            0..=100_000_000 => 4 * 1024 * 1024,            // <= 100MB: 4MB chunks
+            100_000_001..=500_000_000 => 8 * 1024 * 1024,   // 100-500MB: 8MB chunks
+            _ => 8 * 1024 * 1024,                           // > 500MB: 8MB chunks (optimal for most cases)
         }
     }
 }
@@ -465,27 +438,33 @@ impl BlazingReceiver {
         Ok(())
     }
     
-    /// Process data stream with parallel writes
+    /// 🚀 ULTRA FAST data stream processing with smart retry
     async fn process_data_stream(
         mut recv_stream: quinn::RecvStream,
         first_bytes: [u8; 4],
     ) -> Result<()> {
+        // ⚡ WAIT for active transfer with timeout (max 5 seconds)
+        let mut retries = 0;
+        let state = loop {
+            if let Some(entry) = ACTIVE_TRANSFERS.iter()
+                .find(|entry| !entry.value().completed.load(Ordering::Relaxed)) {
+                break entry.value().clone();
+            }
+            
+            retries += 1;
+            if retries > 50 { // 5 seconds max wait (50 * 100ms)
+                return Err(FileshareError::Transfer("No active transfer found after 5 seconds".to_string()));
+            }
+            
+            tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+        };
+        
         // Read rest of chunk ID
         let mut id_bytes = [0u8; 8];
         id_bytes[..4].copy_from_slice(&first_bytes);
         recv_stream.read_exact(&mut id_bytes[4..]).await
             .map_err(|e| FileshareError::Transfer(format!("Failed to read chunk ID: {}", e)))?;
         let first_chunk_id = u64::from_be_bytes(id_bytes);
-        
-        // Find active transfer
-        let transfer_key = ACTIVE_TRANSFERS.iter()
-            .find(|entry| !entry.value().completed.load(Ordering::Relaxed))
-            .map(|entry| entry.key().clone())
-            .ok_or_else(|| FileshareError::Transfer("No active transfer".to_string()))?;
-        
-        let state = ACTIVE_TRANSFERS.get(&transfer_key)
-            .ok_or_else(|| FileshareError::Transfer("Transfer not found".to_string()))?
-            .clone();
         
         // Process first chunk
         let mut size_bytes = [0u8; 4];
@@ -500,7 +479,7 @@ impl BlazingReceiver {
         // Write first chunk in parallel
         Self::write_chunk_parallel(state.clone(), first_chunk_id, chunk_data).await?;
         
-        // Process remaining chunks
+        // 🚀 BLAZING FAST remaining chunks processing
         loop {
             // Read chunk header
             let mut chunk_header = [0u8; 12]; // chunk_id (8) + size (4)
@@ -561,8 +540,8 @@ impl BlazingReceiver {
             // ⚡ FAST progress update
             let received = state_clone.received_chunks.fetch_add(1, Ordering::Relaxed) + 1;
             
-            // 🚀 Less frequent progress reports for maximum speed (every 20 chunks or completion)
-            if received % 20 == 0 || received == state_clone.total_chunks {
+            // ⚡ MINIMAL progress reports for maximum speed (every 30 chunks or completion)
+            if received % 30 == 0 || received == state_clone.total_chunks {
                 let progress = (received as f64 / state_clone.total_chunks as f64) * 100.0;
                 let elapsed = state_clone.start_time.elapsed().as_secs_f64();
                 let speed_mbps = (received as f64 * state_clone.chunk_size as f64 * 8.0) / (elapsed * 1_000_000.0);
