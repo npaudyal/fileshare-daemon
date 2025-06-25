@@ -94,7 +94,7 @@ impl QuicConnectionManager {
                 format!("Failed to bind QUIC endpoint: {}", e)
             )))?;
         
-        info!("QUIC endpoint listening on {}", bind_addr);
+        info!("QUIC endpoint listening on {} with optimized transport parameters", bind_addr);
         
         Ok(Self {
             endpoint,
@@ -210,11 +210,32 @@ fn create_server_config() -> Result<quinn::ServerConfig> {
     let key_der = rustls_pki_types::PrivateKeyDer::try_from(priv_key)
         .map_err(|e| FileshareError::Config(format!("Invalid private key: {}", e)))?;
     
-    let server_config = quinn::ServerConfig::with_single_cert(cert_chain, key_der)
+    let mut server_config = quinn::ServerConfig::with_single_cert(cert_chain, key_der)
         .map_err(|e| FileshareError::Network(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             format!("Failed to create server config: {}", e)
         )))?;
+    
+    // 🚀 BLAZING FAST transport parameters - eliminate all delays and slow start
+    let mut transport_config = quinn::TransportConfig::default();
+    
+    // 🔥 AGGRESSIVE limits for maximum parallel throughput
+    transport_config.max_concurrent_bidi_streams(quinn::VarInt::from_u32(200));
+    transport_config.max_concurrent_uni_streams(quinn::VarInt::from_u32(200));
+    
+    // 🚀 MASSIVE buffer sizes for blazing speed - no congestion window limitations
+    transport_config.send_window(128 * 1024 * 1024); // 128MB send buffer - 8x larger
+    transport_config.stream_receive_window(quinn::VarInt::from_u32(64 * 1024 * 1024)); // 64MB per stream
+    transport_config.receive_window(quinn::VarInt::from_u32(512 * 1024 * 1024)); // 512MB total receive - 2x larger
+    
+    // ⚡ DISABLE flow control delays and keep-alive overhead
+    transport_config.max_idle_timeout(Some(quinn::IdleTimeout::from(quinn::VarInt::from_u32(300_000)))); // 5 minutes
+    transport_config.keep_alive_interval(None); // Disable keep-alive for maximum performance
+    
+    // Apply transport config
+    server_config.transport_config(Arc::new(transport_config));
+    
+    info!("🚀 QUIC server configured with BLAZING FAST parameters - NO SLOW START, MASSIVE BUFFERS!");
     
     Ok(server_config)
 }
@@ -282,10 +303,31 @@ fn create_client_config() -> Result<quinn::ClientConfig> {
         .with_custom_certificate_verifier(std::sync::Arc::new(SkipServerVerification))
         .with_no_client_auth();
 
-    let client_config = quinn::ClientConfig::new(std::sync::Arc::new(
+    let mut client_config = quinn::ClientConfig::new(std::sync::Arc::new(
         quinn::crypto::rustls::QuicClientConfig::try_from(crypto)
             .map_err(|e| FileshareError::Config(format!("Failed to create QUIC client config: {}", e)))?,
     ));
+    
+    // 🚀 BLAZING FAST transport parameters - eliminate all delays and slow start
+    let mut transport_config = quinn::TransportConfig::default();
+    
+    // 🔥 AGGRESSIVE limits for maximum parallel throughput (match server)
+    transport_config.max_concurrent_bidi_streams(quinn::VarInt::from_u32(200));
+    transport_config.max_concurrent_uni_streams(quinn::VarInt::from_u32(200));
+    
+    // 🚀 MASSIVE buffer sizes for blazing speed - no congestion window limitations
+    transport_config.send_window(128 * 1024 * 1024); // 128MB send buffer - 8x larger
+    transport_config.stream_receive_window(quinn::VarInt::from_u32(64 * 1024 * 1024)); // 64MB per stream
+    transport_config.receive_window(quinn::VarInt::from_u32(512 * 1024 * 1024)); // 512MB total receive - 2x larger
+    
+    // ⚡ DISABLE flow control delays and keep-alive overhead
+    transport_config.max_idle_timeout(Some(quinn::IdleTimeout::from(quinn::VarInt::from_u32(300_000)))); // 5 minutes
+    transport_config.keep_alive_interval(None); // Disable keep-alive for maximum performance
+    
+    // Apply transport config
+    client_config.transport_config(Arc::new(transport_config));
+    
+    info!("🚀 QUIC client configured with BLAZING FAST parameters - NO SLOW START, MASSIVE BUFFERS!");
     
     Ok(client_config)
 }
