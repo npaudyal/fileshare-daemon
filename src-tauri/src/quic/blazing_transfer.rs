@@ -126,6 +126,11 @@ impl BlazingTransfer {
             control_stream, &filename, file_size, &target_path, chunk_size, total_chunks
         ).await?;
         
+        info!("✅ Control message sent for {} chunks", total_chunks);
+        
+        // Small delay to ensure control message is processed first
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        
         // Create ALL streams immediately - no progressive launch
         let streams = stream_manager.open_file_transfer_streams(optimal_streams).await?;
         
@@ -477,9 +482,12 @@ impl BlazingReceiver {
             chunk_writer: chunk_tx,
         });
         
-        // Insert into ACTIVE_TRANSFERS immediately
+        // Insert into ACTIVE_TRANSFERS immediately - this must happen BEFORE spawning tasks
         ACTIVE_TRANSFERS.insert(filename.clone(), state.clone());
         info!("✅ Transfer state created for: {}", filename);
+        
+        // Small delay to ensure transfer state is fully registered
+        tokio::time::sleep(Duration::from_millis(10)).await;
         
         // Now spawn writer task
         let target_path_clone = target_path.clone();
@@ -543,14 +551,23 @@ impl BlazingReceiver {
     ) -> Result<()> {
         // Read filename
         if filename_len == 0 || filename_len > 255 {
-            return Err(FileshareError::Transfer("Invalid filename length".to_string()));
+            debug!("📥 Invalid filename length: {}, treating as legacy data stream", filename_len);
+            return Err(FileshareError::Transfer(format!("Invalid filename length: {}", filename_len)));
         }
         
         let mut filename_bytes = vec![0u8; filename_len];
         recv_stream.read_exact(&mut filename_bytes).await?;
         
-        let filename = String::from_utf8(filename_bytes)
-            .map_err(|_| FileshareError::Transfer("Invalid filename encoding".to_string()))?;
+        // Debug raw bytes
+        debug!("📥 Raw filename bytes: {:?}", &filename_bytes[..std::cmp::min(20, filename_bytes.len())]);
+        
+        let filename = match String::from_utf8(filename_bytes.clone()) {
+            Ok(name) => name,
+            Err(_) => {
+                debug!("📥 Failed to decode filename from {} bytes: {:?}", filename_len, &filename_bytes[..std::cmp::min(10, filename_bytes.len())]);
+                return Err(FileshareError::Transfer("Invalid filename encoding".to_string()));
+            }
+        };
         
         debug!("📥 Processing data stream for file: {}", filename);
         
