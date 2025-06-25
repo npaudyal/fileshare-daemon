@@ -81,9 +81,6 @@ impl BlazingTransfer {
             .into_iter().next()
             .ok_or_else(|| FileshareError::Transfer("Failed to create stream".to_string()))?;
         
-        // Send magic byte to identify control stream
-        stream.write_all(&[0xFF]).await?;
-        
         let header = format!("BLAZING_SINGLE|{}|{}|{}", filename, file_size, target_path);
         let header_bytes = header.as_bytes();
         stream.write_all(&(header_bytes.len() as u32).to_be_bytes()).await?;
@@ -203,9 +200,6 @@ impl BlazingTransfer {
         let mut file = tokio::fs::File::open(&file_path).await?;
         let mut buffer = vec![0u8; chunk_size as usize];
         
-        // Send magic byte to identify data stream
-        stream.write_all(&[0xFE]).await?;
-        
         // Send filename first to identify this transfer
         let filename = file_path.file_name()
             .and_then(|n| n.to_str())
@@ -250,9 +244,6 @@ impl BlazingTransfer {
         chunk_size: u64,
         total_chunks: u64,
     ) -> Result<()> {
-        // Send a magic byte to identify control stream
-        stream.write_all(&[0xFF]).await?;
-        
         let header = format!("BLAZING_PARALLEL|{}|{}|{}|{}|{}", 
                            filename, file_size, target_path, chunk_size, total_chunks);
         let header_bytes = header.as_bytes();
@@ -343,75 +334,74 @@ lazy_static::lazy_static! {
 
 impl BlazingReceiver {
     pub async fn handle_incoming_transfer(mut recv_stream: quinn::RecvStream) -> Result<()> {
-        // Read magic byte first
-        let mut magic_byte = [0u8; 1];
-        recv_stream.read_exact(&mut magic_byte).await?;
-        
-        match magic_byte[0] {
-            0xFF => {
-                // Control stream
-                debug!("📥 Detected control stream (magic: 0xFF)");
-                Self::handle_control_stream(recv_stream).await
-            },
-            0xFE => {
-                // Data stream with filename
-                debug!("📥 Detected data stream (magic: 0xFE)");
-                Self::handle_data_stream_with_filename(recv_stream).await
-            },
-            _ => {
-                // Legacy format - prepend the magic byte back
-                debug!("📥 Legacy stream format detected");
-                Self::handle_legacy_stream(recv_stream, magic_byte[0]).await
-            }
-        }
-    }
-    
-    async fn handle_control_stream(mut recv_stream: quinn::RecvStream) -> Result<()> {
+        // Read first length field
         let mut len_bytes = [0u8; 4];
         recv_stream.read_exact(&mut len_bytes).await?;
-        let header_len = u32::from_be_bytes(len_bytes) as usize;
+        let first_len = u32::from_be_bytes(len_bytes) as usize;
         
-        let mut header_bytes = vec![0u8; header_len];
-        recv_stream.read_exact(&mut header_bytes).await?;
+        debug!("📥 Received stream with first length: {}", first_len);
         
-        if let Ok(header) = String::from_utf8(header_bytes) {
-            debug!("📥 Control header: {}", header);
-            let parts: Vec<&str> = header.split('|').collect();
-            
-            match parts.get(0) {
-                Some(&"BLAZING_SINGLE") => {
-                    Self::receive_single_stream(recv_stream, &parts).await
-                },
-                Some(&"BLAZING_PARALLEL") => {
-                    Self::receive_parallel_control(recv_stream, &parts).await
-                },
-                _ => {
-                    Err(FileshareError::Transfer("Unknown control message type".to_string()))
+        // Check if this is a control message (BLAZING_SINGLE or BLAZING_PARALLEL)
+        if first_len >= 10 && first_len <= 1000 {
+            let mut header_bytes = vec![0u8; first_len];
+            match recv_stream.read_exact(&mut header_bytes).await {
+                Ok(_) => {
+                    if let Ok(header) = String::from_utf8(header_bytes.clone()) {
+                        debug!("📥 Potential control header: {}", header);
+                        let parts: Vec<&str> = header.split('|').collect();
+                        
+                        match parts.get(0) {
+                            Some(&"BLAZING_SINGLE") => {
+                                debug!("📥 Processing BLAZING_SINGLE control message");
+                                return Self::receive_single_stream(recv_stream, &parts).await;
+                            },
+                            Some(&"BLAZING_PARALLEL") => {
+                                debug!("📥 Processing BLAZING_PARALLEL control message");
+                                return Self::receive_parallel_control(recv_stream, &parts).await;
+                            },
+                            _ => {
+                                // Not a control message, must be a filename
+                                if let Ok(filename) = String::from_utf8(header_bytes) {
+                                    debug!("📥 Data stream for file: {}", filename);
+                                    return Self::handle_data_stream_with_filename(recv_stream, &filename).await;
+                                }
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    debug!("📥 Failed to read header: {}", e);
+                    return Err(FileshareError::Transfer(format!("Failed to read stream header: {}", e)));
                 }
             }
-        } else {
-            Err(FileshareError::Transfer("Invalid control header encoding".to_string()))
+        } else if first_len > 0 && first_len < 256 {
+            // This looks like a filename length
+            let mut filename_bytes = vec![0u8; first_len];
+            match recv_stream.read_exact(&mut filename_bytes).await {
+                Ok(_) => {
+                    if let Ok(filename) = String::from_utf8(filename_bytes) {
+                        debug!("📥 Data stream for file: {}", filename);
+                        return Self::handle_data_stream_with_filename(recv_stream, &filename).await;
+                    }
+                }
+                Err(_) => {}
+            }
         }
+        
+        // Fallback: no active transfer found
+        Err(FileshareError::Transfer("Invalid stream format or no active transfer".to_string()))
     }
     
-    async fn handle_data_stream_with_filename(mut recv_stream: quinn::RecvStream) -> Result<()> {
-        // Read filename length
-        let mut len_bytes = [0u8; 4];
-        recv_stream.read_exact(&mut len_bytes).await?;
-        let filename_len = u32::from_be_bytes(len_bytes) as usize;
-        
-        // Read filename
-        let mut filename_bytes = vec![0u8; filename_len];
-        recv_stream.read_exact(&mut filename_bytes).await?;
-        let filename = String::from_utf8(filename_bytes)
-            .map_err(|_| FileshareError::Transfer("Invalid filename encoding".to_string()))?;
-        
-        debug!("📥 Data stream for file: {}", filename);
+    async fn handle_data_stream_with_filename(
+        mut recv_stream: quinn::RecvStream,
+        filename: &str,
+    ) -> Result<()> {
+        debug!("📥 Processing data stream for file: {}", filename);
         
         // Wait for transfer state
         let start_time = Instant::now();
         let state = loop {
-            if let Some(state) = ACTIVE_TRANSFERS.get(&filename) {
+            if let Some(state) = ACTIVE_TRANSFERS.get(filename) {
                 break state.clone();
             }
             
@@ -456,41 +446,6 @@ impl BlazingReceiver {
         }
         
         Ok(())
-    }
-    
-    async fn handle_legacy_stream(mut recv_stream: quinn::RecvStream, first_byte: u8) -> Result<()> {
-        // For legacy streams, the first byte is part of a 4-byte length field
-        let mut len_bytes = [0u8; 4];
-        len_bytes[0] = first_byte;
-        recv_stream.read_exact(&mut len_bytes[1..]).await?;
-        let first_len = u32::from_be_bytes(len_bytes) as usize;
-        
-        debug!("📥 Legacy stream with first length: {}", first_len);
-        
-        // Try to parse as control message
-        if first_len >= 10 && first_len <= 1000 {
-            let mut header_bytes = vec![0u8; first_len];
-            match recv_stream.read_exact(&mut header_bytes).await {
-                Ok(_) => {
-                    if let Ok(header) = String::from_utf8(header_bytes) {
-                        let parts: Vec<&str> = header.split('|').collect();
-                        match parts.get(0) {
-                            Some(&"BLAZING_SINGLE") => {
-                                return Self::receive_single_stream(recv_stream, &parts).await;
-                            },
-                            Some(&"BLAZING_PARALLEL") => {
-                                return Self::receive_parallel_control(recv_stream, &parts).await;
-                            },
-                            _ => {}
-                        }
-                    }
-                }
-                Err(_) => {}
-            }
-        }
-        
-        // Fall back to legacy data stream processing
-        Self::process_data_stream_legacy_direct(recv_stream, len_bytes).await
     }
     
     async fn receive_single_stream(
@@ -647,372 +602,6 @@ impl BlazingReceiver {
                 }
             }
         });
-        
-        Ok(())
-    }
-    
-    async fn process_chunks_with_state(
-        mut recv_stream: quinn::RecvStream,
-        state: Arc<TransferState>,
-    ) -> Result<()> {
-        // Process chunks
-        loop {
-            let mut chunk_header = [0u8; 12]; // chunk_id (8) + size (4)
-            match recv_stream.read_exact(&mut chunk_header).await {
-                Ok(_) => {},
-                Err(_) => break,
-            }
-            
-            let chunk_id = u64::from_be_bytes(chunk_header[0..8].try_into().unwrap());
-            let chunk_size = u32::from_be_bytes(chunk_header[8..12].try_into().unwrap()) as usize;
-            
-            if chunk_size > 100 * 1024 * 1024 {
-                return Err(FileshareError::Transfer(format!("Chunk too large: {} bytes", chunk_size)));
-            }
-            
-            let mut chunk_data = vec![0u8; chunk_size];
-            recv_stream.read_exact(&mut chunk_data).await?;
-            
-            state.chunk_writer.send((chunk_id, chunk_data)).await?;
-            
-            let received = state.received_chunks.fetch_add(1, Ordering::Relaxed) + 1;
-            
-            if received % 10 == 0 || received == state.total_chunks {
-                let progress = (received as f64 / state.total_chunks as f64) * 100.0;
-                debug!("📊 Progress: {:.1}% ({}/{})", progress, received, state.total_chunks);
-            }
-            
-            if received == state.total_chunks {
-                state.completed.store(true, Ordering::Relaxed);
-                info!("🎉 All chunks received for: {}", state.filename);
-            }
-        }
-        
-        Ok(())
-    }
-    
-    async fn process_data_stream_legacy_direct(
-        mut recv_stream: quinn::RecvStream,
-        first_bytes: [u8; 4],
-    ) -> Result<()> {
-        debug!("📥 Processing legacy data stream with first bytes: {:?}", first_bytes);
-        
-        // First bytes are filename length in legacy format
-        let filename_len = u32::from_be_bytes(first_bytes) as usize;
-        
-        if filename_len == 0 || filename_len > 255 {
-            // This might actually be chunk data, not filename
-            return Self::process_chunk_data_direct(recv_stream, first_bytes).await;
-        }
-        
-        // Try to read filename
-        let mut filename_bytes = vec![0u8; filename_len];
-        match recv_stream.read_exact(&mut filename_bytes).await {
-            Ok(_) => {
-                if let Ok(filename) = String::from_utf8(filename_bytes) {
-                    debug!("📥 Legacy stream for file: {}", filename);
-                    
-                    // Wait for transfer state
-                    let start_time = Instant::now();
-                    let state = loop {
-                        if let Some(state) = ACTIVE_TRANSFERS.get(&filename) {
-                            break state.clone();
-                        }
-                        
-                        if start_time.elapsed() > Duration::from_secs(5) {
-                            return Err(FileshareError::Transfer(format!("Transfer state not found for: {}", filename)));
-                        }
-                        
-                        tokio::time::sleep(Duration::from_millis(10)).await;
-                    };
-                    
-                    // Process chunks with filename header
-                    return Self::process_chunks_with_state(recv_stream, state).await;
-                }
-            }
-            Err(_) => {}
-        }
-        
-        // Fall back to direct chunk processing
-        Self::process_chunk_data_direct(recv_stream, first_bytes).await
-    }
-    
-    async fn process_chunk_data_direct(
-        mut recv_stream: quinn::RecvStream,
-        first_bytes: [u8; 4],
-    ) -> Result<()> {
-        // Wait for an active transfer to be available
-        let start_time = Instant::now();
-        let (transfer_key, state) = loop {
-            if let Some(entry) = ACTIVE_TRANSFERS.iter()
-                .find(|entry| !entry.value().completed.load(Ordering::Relaxed)) {
-                break (entry.key().clone(), entry.value().clone());
-            }
-            
-            if start_time.elapsed() > Duration::from_secs(10) {
-                return Err(FileshareError::Transfer("No active transfer found within timeout".to_string()));
-            }
-            
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        };
-        
-        debug!("📥 Found active transfer: {}", transfer_key);
-        
-        // The first_bytes are the first 4 bytes of chunk_id
-        let mut id_bytes = [0u8; 8];
-        id_bytes[..4].copy_from_slice(&first_bytes);
-        recv_stream.read_exact(&mut id_bytes[4..]).await?;
-        let chunk_id = u64::from_be_bytes(id_bytes);
-        
-        debug!("📥 Processing chunk {} for transfer: {}", chunk_id, transfer_key);
-        
-        // Read chunk size
-        let mut size_bytes = [0u8; 4];
-        recv_stream.read_exact(&mut size_bytes).await?;
-        let chunk_size = u32::from_be_bytes(size_bytes) as usize;
-        
-        if chunk_size > 100 * 1024 * 1024 {
-            return Err(FileshareError::Transfer(format!("Chunk too large: {} bytes", chunk_size)));
-        }
-        
-        // Read chunk data
-        let mut chunk_data = vec![0u8; chunk_size];
-        recv_stream.read_exact(&mut chunk_data).await?;
-        
-        // Send to writer
-        state.chunk_writer.send((chunk_id, chunk_data)).await?;
-        
-        let received = state.received_chunks.fetch_add(1, Ordering::Relaxed) + 1;
-        
-        if received % 10 == 0 || received == state.total_chunks {
-            let progress = (received as f64 / state.total_chunks as f64) * 100.0;
-            debug!("📊 Progress: {:.1}% ({}/{})", progress, received, state.total_chunks);
-        }
-        
-        if received == state.total_chunks {
-            state.completed.store(true, Ordering::Relaxed);
-            info!("🎉 All chunks received for: {}", state.filename);
-        }
-        
-        Ok(())
-    }
-    
-    async fn process_data_stream_with_filename_direct(
-        mut recv_stream: quinn::RecvStream,
-        filename_len: usize,
-    ) -> Result<()> {
-        // Read filename
-        if filename_len == 0 || filename_len > 255 {
-            debug!("📥 Invalid filename length: {}, treating as legacy data stream", filename_len);
-            return Err(FileshareError::Transfer(format!("Invalid filename length: {}", filename_len)));
-        }
-        
-        let mut filename_bytes = vec![0u8; filename_len];
-        recv_stream.read_exact(&mut filename_bytes).await?;
-        
-        // Debug raw bytes
-        debug!("📥 Raw filename bytes: {:?}", &filename_bytes[..std::cmp::min(20, filename_bytes.len())]);
-        
-        let filename = match String::from_utf8(filename_bytes.clone()) {
-            Ok(name) => name,
-            Err(_) => {
-                debug!("📥 Failed to decode filename from {} bytes: {:?}", filename_len, &filename_bytes[..std::cmp::min(10, filename_bytes.len())]);
-                return Err(FileshareError::Transfer("Invalid filename encoding".to_string()));
-            }
-        };
-        
-        debug!("📥 Processing data stream for file: {}", filename);
-        
-        // Wait for transfer state to be ready (with timeout)
-        let start_time = Instant::now();
-        let state = loop {
-            if let Some(state) = ACTIVE_TRANSFERS.get(&filename) {
-                break state.clone();
-            }
-            
-            if start_time.elapsed() > Duration::from_secs(10) {
-                return Err(FileshareError::Transfer(format!("Transfer state not found for: {}", filename)));
-            }
-            
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        };
-        
-        // Process chunks
-        loop {
-            let mut chunk_header = [0u8; 12]; // chunk_id (8) + size (4)
-            match recv_stream.read_exact(&mut chunk_header).await {
-                Ok(_) => {},
-                Err(_) => break,
-            }
-            
-            let chunk_id = u64::from_be_bytes(chunk_header[0..8].try_into().unwrap());
-            let chunk_size = u32::from_be_bytes(chunk_header[8..12].try_into().unwrap()) as usize;
-            
-            if chunk_size > 100 * 1024 * 1024 {
-                return Err(FileshareError::Transfer(format!("Chunk too large: {} bytes", chunk_size)));
-            }
-            
-            let mut chunk_data = vec![0u8; chunk_size];
-            recv_stream.read_exact(&mut chunk_data).await?;
-            
-            state.chunk_writer.send((chunk_id, chunk_data)).await?;
-            
-            let received = state.received_chunks.fetch_add(1, Ordering::Relaxed) + 1;
-            
-            if received % 10 == 0 || received == state.total_chunks {
-                let progress = (received as f64 / state.total_chunks as f64) * 100.0;
-                debug!("📊 Progress: {:.1}% ({}/{})", progress, received, state.total_chunks);
-            }
-        }
-        
-        Ok(())
-    }
-    
-    async fn process_data_stream(
-        mut recv_stream: quinn::RecvStream,
-        first_bytes: [u8; 4],
-    ) -> Result<()> {
-        // Check if this is a filename header (new protocol)
-        let potential_filename_len = u32::from_be_bytes(first_bytes) as usize;
-        
-        if potential_filename_len > 0 && potential_filename_len < 256 {
-            // Try to read as filename
-            let mut filename_bytes = vec![0u8; potential_filename_len];
-            match recv_stream.read_exact(&mut filename_bytes).await {
-                Ok(_) => {
-                    if let Ok(filename) = String::from_utf8(filename_bytes) {
-                        // New protocol with filename header
-                        return Self::process_data_stream_with_filename(recv_stream, &filename).await;
-                    }
-                }
-                Err(_) => {}
-            }
-        }
-        
-        // Legacy protocol - first_bytes are part of chunk_id
-        Self::process_data_stream_legacy(recv_stream, first_bytes).await
-    }
-    
-    async fn process_data_stream_with_filename(
-        mut recv_stream: quinn::RecvStream,
-        filename: &str,
-    ) -> Result<()> {
-        debug!("📥 Processing data stream for file: {}", filename);
-        
-        // Wait for transfer state to be ready (with timeout)
-        let start_time = Instant::now();
-        let state = loop {
-            if let Some(state) = ACTIVE_TRANSFERS.get(filename) {
-                break state.clone();
-            }
-            
-            if start_time.elapsed() > Duration::from_secs(5) {
-                return Err(FileshareError::Transfer(format!("Transfer state not found for: {}", filename)));
-            }
-            
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        };
-        
-        // Process chunks
-        loop {
-            let mut chunk_header = [0u8; 12]; // chunk_id (8) + size (4)
-            match recv_stream.read_exact(&mut chunk_header).await {
-                Ok(_) => {},
-                Err(_) => break,
-            }
-            
-            let chunk_id = u64::from_be_bytes(chunk_header[0..8].try_into().unwrap());
-            let chunk_size = u32::from_be_bytes(chunk_header[8..12].try_into().unwrap()) as usize;
-            
-            if chunk_size > 100 * 1024 * 1024 {
-                return Err(FileshareError::Transfer(format!("Chunk too large: {} bytes", chunk_size)));
-            }
-            
-            let mut chunk_data = vec![0u8; chunk_size];
-            recv_stream.read_exact(&mut chunk_data).await?;
-            
-            state.chunk_writer.send((chunk_id, chunk_data)).await?;
-            
-            let received = state.received_chunks.fetch_add(1, Ordering::Relaxed) + 1;
-            
-            if received % 10 == 0 || received == state.total_chunks {
-                let progress = (received as f64 / state.total_chunks as f64) * 100.0;
-                debug!("📊 Progress: {:.1}% ({}/{})", progress, received, state.total_chunks);
-            }
-        }
-        
-        Ok(())
-    }
-    
-    async fn process_data_stream_legacy(
-        mut recv_stream: quinn::RecvStream,
-        first_bytes: [u8; 4],
-    ) -> Result<()> {
-        // The first_bytes are the first 4 bytes of chunk_id
-        let mut id_bytes = [0u8; 8];
-        id_bytes[..4].copy_from_slice(&first_bytes);
-        recv_stream.read_exact(&mut id_bytes[4..]).await?;
-        let first_chunk_id = u64::from_be_bytes(id_bytes);
-        
-        // Wait for an active transfer to be available
-        let start_time = Instant::now();
-        let (transfer_key, state) = loop {
-            if let Some(entry) = ACTIVE_TRANSFERS.iter()
-                .find(|entry| !entry.value().completed.load(Ordering::Relaxed)) {
-                break (entry.key().clone(), entry.value().clone());
-            }
-            
-            if start_time.elapsed() > Duration::from_secs(5) {
-                return Err(FileshareError::Transfer("No active transfer found within timeout".to_string()));
-            }
-            
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        };
-        
-        debug!("📥 Processing legacy data stream for transfer: {}", transfer_key);
-        
-        // Process first chunk
-        let mut size_bytes = [0u8; 4];
-        recv_stream.read_exact(&mut size_bytes).await?;
-        let chunk_size = u32::from_be_bytes(size_bytes) as usize;
-        
-        if chunk_size > 100 * 1024 * 1024 {
-            return Err(FileshareError::Transfer(format!("Chunk too large: {} bytes", chunk_size)));
-        }
-        
-        let mut chunk_data = vec![0u8; chunk_size];
-        recv_stream.read_exact(&mut chunk_data).await?;
-        
-        state.chunk_writer.send((first_chunk_id, chunk_data)).await?;
-        state.received_chunks.fetch_add(1, Ordering::Relaxed);
-        
-        // Process remaining chunks
-        loop {
-            let mut chunk_header = [0u8; 12];
-            match recv_stream.read_exact(&mut chunk_header).await {
-                Ok(_) => {},
-                Err(_) => break,
-            }
-            
-            let chunk_id = u64::from_be_bytes(chunk_header[0..8].try_into().unwrap());
-            let chunk_size = u32::from_be_bytes(chunk_header[8..12].try_into().unwrap()) as usize;
-            
-            if chunk_size > 100 * 1024 * 1024 {
-                return Err(FileshareError::Transfer(format!("Chunk too large: {} bytes", chunk_size)));
-            }
-            
-            let mut chunk_data = vec![0u8; chunk_size];
-            recv_stream.read_exact(&mut chunk_data).await?;
-            
-            state.chunk_writer.send((chunk_id, chunk_data)).await?;
-            
-            let received = state.received_chunks.fetch_add(1, Ordering::Relaxed) + 1;
-            
-            if received == state.total_chunks {
-                state.completed.store(true, Ordering::Relaxed);
-                info!("🎉 All chunks received for: {}", state.filename);
-            }
-        }
         
         Ok(())
     }
