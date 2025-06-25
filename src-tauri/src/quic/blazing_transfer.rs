@@ -15,7 +15,7 @@ use std::fs::OpenOptions;
 // Optimized constants for maximum performance
 const SMALL_FILE_THRESHOLD: u64 = 10 * 1024 * 1024; // 10MB
 const OPTIMAL_CHUNK_SIZE: u64 = 16 * 1024 * 1024; // 16MB default for blazing speed
-const MAX_PARALLEL_STREAMS: usize = 64; // More streams for better parallelism
+const MAX_PARALLEL_STREAMS: usize = 16; // Optimal streams for better chunk distribution
 const MAX_MEMORY_BUFFER: usize = 256 * 1024 * 1024; // 256MB max memory usage
 const WRITE_CONCURRENCY: usize = 32; // Concurrent disk writes
 
@@ -118,7 +118,9 @@ impl BlazingTransfer {
         // Calculate optimal parameters with better distribution
         let chunk_size = Self::calculate_optimal_chunk_size(file_size);
         let total_chunks = (file_size + chunk_size - 1) / chunk_size;
-        let stream_count = std::cmp::min(MAX_PARALLEL_STREAMS, total_chunks as usize).max(1);
+        // Ensure we have at least 2-3 chunks per stream for good parallelism
+        let ideal_stream_count = std::cmp::min(MAX_PARALLEL_STREAMS, (total_chunks / 2).max(1) as usize);
+        let stream_count = std::cmp::min(ideal_stream_count, total_chunks as usize).max(1);
         
         info!("🚀 BLAZING parallel transfer: {} streams, {} chunks of {:.1} MB each", 
               stream_count, total_chunks, chunk_size as f64 / (1024.0 * 1024.0));
@@ -271,13 +273,15 @@ impl BlazingTransfer {
         Ok(())
     }
     
-    /// Calculate optimal chunk size for maximum throughput
+    /// Calculate optimal chunk size for maximum parallelism and throughput
     fn calculate_optimal_chunk_size(file_size: u64) -> u64 {
+        // Use smaller chunks to ensure multiple chunks per stream for better parallelism
         match file_size {
-            0..=100_000_000 => 8 * 1024 * 1024,           // <= 100MB: 8MB chunks
-            100_000_001..=500_000_000 => 16 * 1024 * 1024,  // 100-500MB: 16MB chunks
-            500_000_001..=2_000_000_000 => 32 * 1024 * 1024, // 500MB-2GB: 32MB chunks
-            _ => 64 * 1024 * 1024,                        // > 2GB: 64MB chunks
+            0..=50_000_000 => 2 * 1024 * 1024,             // <= 50MB: 2MB chunks
+            50_000_001..=200_000_000 => 4 * 1024 * 1024,   // 50-200MB: 4MB chunks  
+            200_000_001..=500_000_000 => 8 * 1024 * 1024,  // 200-500MB: 8MB chunks
+            500_000_001..=1_000_000_000 => 16 * 1024 * 1024, // 500MB-1GB: 16MB chunks
+            _ => 32 * 1024 * 1024,                          // > 1GB: 32MB chunks
         }
     }
 }
