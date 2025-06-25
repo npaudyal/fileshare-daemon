@@ -334,32 +334,49 @@ impl BlazingReceiver {
     pub async fn handle_incoming_transfer(mut recv_stream: quinn::RecvStream) -> Result<()> {
         let mut len_bytes = [0u8; 4];
         recv_stream.read_exact(&mut len_bytes).await?;
-        let header_len = u32::from_be_bytes(len_bytes) as usize;
+        let first_len = u32::from_be_bytes(len_bytes) as usize;
         
-        // If header_len looks like chunk data (too large or too small), this is a data stream
-        if header_len < 10 || header_len > 1000 {
-            return Self::process_data_stream(recv_stream, len_bytes).await;
+        debug!("📥 Received stream with first length: {}", first_len);
+        
+        // Try to read as control message header first
+        if first_len >= 10 && first_len <= 1000 {
+            let mut header_bytes = vec![0u8; first_len];
+            match recv_stream.read_exact(&mut header_bytes).await {
+                Ok(_) => {
+                    if let Ok(header) = String::from_utf8(header_bytes) {
+                        debug!("📥 Potential control header: {}", header);
+                        let parts: Vec<&str> = header.split('|').collect();
+                        
+                        match parts.get(0) {
+                            Some(&"BLAZING_SINGLE") => {
+                                debug!("📥 Processing as BLAZING_SINGLE control message");
+                                return Self::receive_single_stream(recv_stream, &parts).await;
+                            },
+                            Some(&"BLAZING_PARALLEL") => {
+                                debug!("📥 Processing as BLAZING_PARALLEL control message");
+                                return Self::receive_parallel_control(recv_stream, &parts).await;
+                            },
+                            _ => {
+                                debug!("📥 Not a control message, treating as data stream");
+                                // Not a control message, fall through to data stream handling
+                            }
+                        }
+                    } else {
+                        debug!("📥 Failed to parse as UTF-8, treating as data stream");
+                    }
+                }
+                Err(e) => {
+                    debug!("📥 Failed to read header bytes: {}, treating as data stream", e);
+                    // Not a control message, fall through to data stream handling
+                }
+            }
+        } else {
+            debug!("📥 Length {} not in control range, treating as data stream", first_len);
         }
         
-        let mut header_bytes = vec![0u8; header_len];
-        recv_stream.read_exact(&mut header_bytes).await?;
-        
-        // Check for probe
-        if header_len >= 6 && &header_bytes[..6] == b"PROBE|" {
-            // Just consume the probe data
-            let mut buffer = vec![0u8; 8192];
-            while recv_stream.read(&mut buffer).await?.is_some() {}
-            return Ok(());
-        }
-        
-        let header = String::from_utf8(header_bytes)?;
-        let parts: Vec<&str> = header.split('|').collect();
-        
-        match parts[0] {
-            "BLAZING_SINGLE" => Self::receive_single_stream(recv_stream, &parts).await,
-            "BLAZING_PARALLEL" => Self::receive_parallel_control(recv_stream, &parts).await,
-            _ => Err(FileshareError::Transfer("Invalid header".to_string())),
-        }
+        // This is a data stream with filename header
+        debug!("📥 Processing as data stream with filename length: {}", first_len);
+        Self::process_data_stream_with_filename_direct(recv_stream, first_len).await
     }
     
     async fn receive_single_stream(
@@ -516,6 +533,68 @@ impl BlazingReceiver {
                 }
             }
         });
+        
+        Ok(())
+    }
+    
+    async fn process_data_stream_with_filename_direct(
+        mut recv_stream: quinn::RecvStream,
+        filename_len: usize,
+    ) -> Result<()> {
+        // Read filename
+        if filename_len == 0 || filename_len > 255 {
+            return Err(FileshareError::Transfer("Invalid filename length".to_string()));
+        }
+        
+        let mut filename_bytes = vec![0u8; filename_len];
+        recv_stream.read_exact(&mut filename_bytes).await?;
+        
+        let filename = String::from_utf8(filename_bytes)
+            .map_err(|_| FileshareError::Transfer("Invalid filename encoding".to_string()))?;
+        
+        debug!("📥 Processing data stream for file: {}", filename);
+        
+        // Wait for transfer state to be ready (with timeout)
+        let start_time = Instant::now();
+        let state = loop {
+            if let Some(state) = ACTIVE_TRANSFERS.get(&filename) {
+                break state.clone();
+            }
+            
+            if start_time.elapsed() > Duration::from_secs(10) {
+                return Err(FileshareError::Transfer(format!("Transfer state not found for: {}", filename)));
+            }
+            
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        };
+        
+        // Process chunks
+        loop {
+            let mut chunk_header = [0u8; 12]; // chunk_id (8) + size (4)
+            match recv_stream.read_exact(&mut chunk_header).await {
+                Ok(_) => {},
+                Err(_) => break,
+            }
+            
+            let chunk_id = u64::from_be_bytes(chunk_header[0..8].try_into().unwrap());
+            let chunk_size = u32::from_be_bytes(chunk_header[8..12].try_into().unwrap()) as usize;
+            
+            if chunk_size > 100 * 1024 * 1024 {
+                return Err(FileshareError::Transfer(format!("Chunk too large: {} bytes", chunk_size)));
+            }
+            
+            let mut chunk_data = vec![0u8; chunk_size];
+            recv_stream.read_exact(&mut chunk_data).await?;
+            
+            state.chunk_writer.send((chunk_id, chunk_data)).await?;
+            
+            let received = state.received_chunks.fetch_add(1, Ordering::Relaxed) + 1;
+            
+            if received % 10 == 0 || received == state.total_chunks {
+                let progress = (received as f64 / state.total_chunks as f64) * 100.0;
+                debug!("📊 Progress: {:.1}% ({}/{})", progress, received, state.total_chunks);
+            }
+        }
         
         Ok(())
     }
