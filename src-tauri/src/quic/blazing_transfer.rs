@@ -241,6 +241,7 @@ impl BlazingTransfer {
                         chunk_rx,
                         chunk_size,
                         file_size,
+                        total_chunks,  // Add this parameter
                         bytes_sent,
                         chunks_sent,
                     ).await;
@@ -283,6 +284,7 @@ impl BlazingTransfer {
                             chunk_rx,
                             chunk_size,
                             file_size,
+                            total_chunks,  // Add this parameter
                             bytes_sent,
                             chunks_sent,
                         ).await;
@@ -312,6 +314,7 @@ impl BlazingTransfer {
         chunk_rx: Arc<tokio::sync::Mutex<mpsc::Receiver<u64>>>,
         chunk_size: u64,
         file_size: u64,
+        total_chunks: u64,  // Add this parameter
         bytes_sent: Arc<AtomicU64>,
         chunks_sent: Arc<AtomicU64>,
     ) -> Result<()> {
@@ -322,8 +325,11 @@ impl BlazingTransfer {
         // Send filename first to identify this transfer
         let filename = file_path.file_name()
             .and_then(|n| n.to_str())
-            .unwrap_or("unknown");
+            .unwrap_or("unknown")
+            .to_string();
         let filename_bytes = filename.as_bytes();
+        
+        // Send filename length and filename
         stream.write_all(&(filename_bytes.len() as u32).to_be_bytes()).await?;
         stream.write_all(filename_bytes).await?;
         
@@ -355,13 +361,16 @@ impl BlazingTransfer {
             bytes_sent.fetch_add(bytes_to_read as u64, Ordering::Relaxed);
             chunks_sent.fetch_add(1, Ordering::Relaxed);
             sent_count += 1;
+            
+            if sent_count % 10 == 0 || chunks_sent.load(Ordering::Relaxed) == total_chunks {
+                debug!("📦 Stream {} progress: sent {} chunks", stream_idx, sent_count);
+            }
         }
         
         stream.finish()?;
         debug!("✅ Stream {} completed: sent {} chunks", stream_idx, sent_count);
         Ok(())
     }
-    
     async fn send_control_message(
         mut stream: quinn::SendStream,
         filename: &str,
