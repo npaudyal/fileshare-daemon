@@ -1,19 +1,17 @@
-use crate::network::protocol::Message;
 use crate::quic::connection::QuicConnection;
 use crate::quic::protocol::{QuicProtocol, StreamType};
+use crate::network::protocol::Message;
 use crate::{FileshareError, Result};
-use futures;
 use quinn::{RecvStream, SendStream};
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Duration;
-use tokio::sync::broadcast;
 use tokio::sync::{mpsc, RwLock, Semaphore};
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
+use futures;
 
-const MAX_CONCURRENT_STREAMS: usize = 128; // Increased for blazing fast transfers
-const STREAM_POOL_SIZE: usize = 16; // Larger pool for instant stream allocation
+const MAX_CONCURRENT_STREAMS: usize = 16; // Maximum concurrent streams per connection
+const STREAM_POOL_SIZE: usize = 8; // Pre-allocated stream pool size
 
 pub struct StreamManager {
     connection: QuicConnection,
@@ -30,10 +28,7 @@ struct StreamHandle {
 }
 
 impl StreamManager {
-    pub fn new(
-        connection: QuicConnection,
-        control_tx: mpsc::UnboundedSender<(Uuid, Message)>,
-    ) -> Self {
+    pub fn new(connection: QuicConnection, control_tx: mpsc::UnboundedSender<(Uuid, Message)>) -> Self {
         Self {
             connection,
             active_streams: Arc::new(RwLock::new(HashMap::new())),
@@ -41,16 +36,12 @@ impl StreamManager {
             control_tx,
         }
     }
-
-    pub fn get_rtt(&self) -> Duration {
-        self.connection.rtt()
-    }
-
+    
     // Start listening for incoming streams
     pub async fn start_stream_listener(self: Arc<Self>) {
         let connection1 = self.connection.clone();
         let connection2 = self.connection.clone();
-
+        
         // Handle incoming bidirectional streams
         let bi_self = self.clone();
         tokio::spawn(async move {
@@ -59,8 +50,7 @@ impl StreamManager {
                     Ok((send, recv)) => {
                         let stream_self = bi_self.clone();
                         tokio::spawn(async move {
-                            if let Err(e) = stream_self.handle_incoming_bi_stream(send, recv).await
-                            {
+                            if let Err(e) = stream_self.handle_incoming_bi_stream(send, recv).await {
                                 error!("Error handling incoming bi stream: {}", e);
                             }
                         });
@@ -72,7 +62,7 @@ impl StreamManager {
                 }
             }
         });
-
+        
         // Handle incoming unidirectional streams
         let uni_self = self.clone();
         tokio::spawn(async move {
@@ -94,17 +84,13 @@ impl StreamManager {
             }
         });
     }
-
-    async fn handle_incoming_bi_stream(
-        &self,
-        send: SendStream,
-        mut recv: RecvStream,
-    ) -> Result<()> {
+    
+    async fn handle_incoming_bi_stream(&self, send: SendStream, mut recv: RecvStream) -> Result<()> {
         // Read stream type header
         let stream_type = QuicProtocol::read_stream_header(&mut recv).await?;
-
+        
         debug!("Received incoming bi stream of type: {:?}", stream_type);
-
+        
         match stream_type {
             StreamType::Control => {
                 // Handle control messages
@@ -129,16 +115,16 @@ impl StreamManager {
                 warn!("Unexpected bidirectional stream type: {:?}", stream_type);
             }
         }
-
+        
         Ok(())
     }
-
+    
     async fn handle_incoming_uni_stream(&self, mut recv: RecvStream) -> Result<()> {
         // Read stream type header
         let stream_type = QuicProtocol::read_stream_header(&mut recv).await?;
-
+        
         debug!("Received incoming uni stream of type: {:?}", stream_type);
-
+        
         match stream_type {
             StreamType::FileTransfer => {
                 // Use blazing receiver for maximum performance
@@ -150,45 +136,44 @@ impl StreamManager {
                 warn!("Unexpected unidirectional stream type: {:?}", stream_type);
             }
         }
-
+        
         Ok(())
     }
-
+    
     // Open a control stream for bidirectional communication
     pub async fn open_control_stream(&self) -> Result<()> {
         let _permit = self.stream_semaphore.acquire().await.unwrap();
-
+        
         let (mut send, recv) = self.connection.open_bi_stream().await?;
-
+        
         // Write stream header
         QuicProtocol::write_stream_header(&mut send, StreamType::Control).await?;
-
+        
         // Store the stream handle
         let handle = StreamHandle {
             stream_type: StreamType::Control,
             send_stream: Some(Arc::new(RwLock::new(send))),
             recv_stream: Some(Arc::new(RwLock::new(recv))),
         };
-
+        
         let stream_id = Uuid::new_v4();
         let mut streams = self.active_streams.write().await;
         streams.insert(stream_id, handle);
-
+        
         info!("Opened control stream: {}", stream_id);
-
+        
         Ok(())
     }
-
+    
     // Send a control message
     pub async fn send_control_message(&self, message: Message) -> Result<()> {
         // Find an active control stream
         let streams = self.active_streams.read().await;
-        let control_stream = streams
-            .values()
+        let control_stream = streams.values()
             .find(|h| matches!(h.stream_type, StreamType::Control))
             .cloned();
         drop(streams);
-
+        
         if let Some(handle) = control_stream {
             if let Some(send_stream) = &handle.send_stream {
                 let mut stream = send_stream.write().await;
@@ -196,18 +181,17 @@ impl StreamManager {
                 return Ok(());
             }
         }
-
+        
         // If no control stream exists, create one and send
         self.open_control_stream().await?;
-
+        
         // Now find the newly created control stream and send
         let streams = self.active_streams.read().await;
-        let control_stream = streams
-            .values()
+        let control_stream = streams.values()
             .find(|h| matches!(h.stream_type, StreamType::Control))
             .cloned();
         drop(streams);
-
+        
         if let Some(handle) = control_stream {
             if let Some(send_stream) = &handle.send_stream {
                 let mut stream = send_stream.write().await;
@@ -215,32 +199,30 @@ impl StreamManager {
                 return Ok(());
             }
         }
-
-        Err(crate::FileshareError::Transfer(
-            "Failed to create control stream".to_string(),
-        ))
+        
+        Err(crate::FileshareError::Transfer("Failed to create control stream".to_string()))
     }
-
+    
     // Open multiple file transfer streams for parallel chunk sending
     pub async fn open_file_transfer_streams(&self, count: usize) -> Result<Vec<SendStream>> {
         let mut streams = Vec::with_capacity(count);
-
+        
         for _ in 0..count {
             let _permit = self.stream_semaphore.acquire().await.unwrap();
-
+            
             let mut send = self.connection.open_uni_stream().await?;
-
+            
             // Write stream header
             QuicProtocol::write_stream_header(&mut send, StreamType::FileTransfer).await?;
-
+            
             streams.push(send);
         }
-
+        
         info!("Opened {} file transfer streams", count);
-
+        
         Ok(streams)
     }
-
+    
     // Send file chunks in parallel across multiple streams
     pub async fn send_chunks_parallel(
         &self,
@@ -250,22 +232,22 @@ impl StreamManager {
     ) -> Result<()> {
         let stream_count = max_streams.min(chunks.len()).max(1);
         let mut streams = self.open_file_transfer_streams(stream_count).await?;
-
+        
         // Distribute chunks across streams
         let chunks_per_stream = (chunks.len() + stream_count - 1) / stream_count;
         let mut futures = Vec::new();
-
+        
         for (stream_idx, stream) in streams.drain(..).enumerate() {
             let start_idx = stream_idx * chunks_per_stream;
             let end_idx = ((stream_idx + 1) * chunks_per_stream).min(chunks.len());
-
+            
             if start_idx >= chunks.len() {
                 break;
             }
-
+            
             let stream_chunks: Vec<_> = chunks[start_idx..end_idx].to_vec();
             let transfer_id = transfer_id;
-
+            
             let future = tokio::spawn(async move {
                 let mut stream = stream;
                 for (chunk_index, data, is_last) in stream_chunks {
@@ -275,32 +257,30 @@ impl StreamManager {
                         chunk_index,
                         &data,
                         is_last,
-                    )
-                    .await
-                    {
+                    ).await {
                         error!("Failed to send chunk {}: {}", chunk_index, e);
                         return Err(e);
                     }
-
+                    
                     if chunk_index % 10 == 0 {
                         debug!("Sent chunk {} on stream {}", chunk_index, stream_idx);
                     }
                 }
-
+                
                 // Finish the stream
                 if let Err(e) = stream.finish() {
                     warn!("Failed to finish stream: {}", e);
                 }
-
+                
                 Ok(())
             });
-
+            
             futures.push(future);
         }
-
+        
         // Wait for all streams to complete
         let results = futures::future::join_all(futures).await;
-
+        
         for (idx, result) in results.iter().enumerate() {
             match result {
                 Ok(Ok(())) => {}
@@ -308,24 +288,24 @@ impl StreamManager {
                 Err(e) => error!("Stream {} panicked: {}", idx, e),
             }
         }
-
+        
         Ok(())
     }
-
+    
     // Get connection statistics
     pub fn stats(&self) -> u64 {
         self.connection.connection.stats().frame_rx.stream
     }
-
+    
     // Check if connection is still alive
     pub fn is_alive(&self) -> bool {
         !self.connection.is_closed()
     }
-
+    
     // Close all streams and the connection
     pub async fn close(&self, error_code: u32, reason: &[u8]) {
         self.connection.connection.close(error_code.into(), reason);
-
+        
         // Clear active streams
         let mut streams = self.active_streams.write().await;
         streams.clear();
