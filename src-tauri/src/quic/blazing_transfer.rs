@@ -10,20 +10,16 @@ use tokio::sync::Semaphore;
 use tracing::{debug, error, info};
 use uuid::Uuid;
 
-// 🚀 BLAZING FAST constants - eliminate ALL delays and bottlenecks
-const OPTIMAL_CHUNK_SIZE: u64 = 8 * 1024 * 1024; // 8MB chunks for better parallelism
-const MAX_PARALLEL_STREAMS: usize = 64; // MAXIMUM streams for true parallelism
-const WRITE_CONCURRENCY: usize = 32; // More concurrent writes for speed
+// Optimized constants for maximum performance
+const SMALL_FILE_THRESHOLD: u64 = 10 * 1024 * 1024; // 10MB
+const OPTIMAL_CHUNK_SIZE: u64 = 16 * 1024 * 1024; // 16MB default for blazing speed
+const MAX_PARALLEL_STREAMS: usize = 64; // More streams for better parallelism
+const MAX_MEMORY_BUFFER: usize = 256 * 1024 * 1024; // 256MB max memory usage
+const WRITE_CONCURRENCY: usize = 32; // Concurrent disk writes
 
 pub struct BlazingTransfer;
 
 impl BlazingTransfer {
-    /// 🚀 BLAZING FAST transfer - skip bandwidth probe for maximum speed
-    async fn skip_probe_for_speed() -> u64 {
-        // Skip bandwidth probing to eliminate ALL delays - assume gigabit speed
-        1_000_000_000 // 1Gbps default for LAN transfers
-    }
-    
     /// Transfer file with maximum performance
     pub async fn transfer_file(
         stream_manager: Arc<StreamManager>,
@@ -41,11 +37,11 @@ impl BlazingTransfer {
             .unwrap_or("unknown")
             .to_string();
         
-        info!("🚀 Starting BLAZING FAST transfer: {} ({:.1} MB) - ZERO DELAYS, MAXIMUM THROUGHPUT!", 
+        info!("🚀 Starting BLAZING transfer: {} ({:.1} MB)", 
               filename, file_size as f64 / (1024.0 * 1024.0));
         
-        // 🚀 ALWAYS use parallel for ANY file > 1MB - eliminate single stream bottlenecks
-        let result = if file_size <= 1024 * 1024 { // Only files < 1MB use single stream
+        // Choose transfer method based on file size
+        let result = if file_size <= SMALL_FILE_THRESHOLD {
             Self::single_stream_transfer(stream_manager, source_path, target_path, filename, file_size).await
         } else {
             Self::blazing_parallel_transfer(stream_manager, source_path, target_path, filename, file_size).await
@@ -55,7 +51,7 @@ impl BlazingTransfer {
             Ok(()) => {
                 let duration = start_time.elapsed();
                 let speed_mbps = (file_size as f64 * 8.0) / (duration.as_secs_f64() * 1_000_000.0);
-                info!("🎆 BLAZING FAST transfer COMPLETE: {:.1} MB in {:.2}s ({:.1} Mbps) - MAXIMUM SPEED ACHIEVED!", 
+                info!("✅ BLAZING transfer complete: {:.1} MB in {:.2}s ({:.1} Mbps)", 
                       file_size as f64 / (1024.0 * 1024.0), duration.as_secs_f64(), speed_mbps);
             }
             Err(e) => {
@@ -75,7 +71,7 @@ impl BlazingTransfer {
         filename: String,
         file_size: u64,
     ) -> Result<()> {
-        info!("⚡ Using BLAZING single stream for small file ({:.1} MB) - INSTANT TRANSFER!", file_size as f64 / (1024.0 * 1024.0));
+        info!("📊 Using single stream for small file ({:.1} MB)", file_size as f64 / (1024.0 * 1024.0));
         
         let mut stream = stream_manager.open_file_transfer_streams(1).await?
             .into_iter().next()
@@ -109,7 +105,7 @@ impl BlazingTransfer {
         Ok(())
     }
     
-    /// 🚀 BLAZING FAST parallel transfer - ZERO delays, INSTANT parallel streaming
+    /// Blazing fast parallel transfer for large files
     async fn blazing_parallel_transfer(
         stream_manager: Arc<StreamManager>,
         source_path: PathBuf,
@@ -117,45 +113,37 @@ impl BlazingTransfer {
         filename: String,
         file_size: u64,
     ) -> Result<()> {
-        // ⚡ SKIP bandwidth probe for INSTANT start - assume maximum LAN speed
-        let _bandwidth = Self::skip_probe_for_speed().await;
-        
-        // 🔥 Calculate OPTIMAL parameters for maximum speed
-        let chunk_size = Self::calculate_adaptive_chunk_size(file_size, 0);
+        // Calculate optimal parameters
+        let chunk_size = Self::calculate_optimal_chunk_size(file_size);
         let total_chunks = (file_size + chunk_size - 1) / chunk_size;
-        let stream_count = std::cmp::min(MAX_PARALLEL_STREAMS, std::cmp::max(total_chunks as usize, 16)); // Minimum 16 streams
+        let stream_count = std::cmp::min(MAX_PARALLEL_STREAMS, total_chunks as usize);
         
-        info!("🚀 BLAZING parallel transfer: {} streams, {} chunks of {:.1} MB each - NO DELAYS!", 
+        info!("🚀 BLAZING parallel transfer: {} streams, {} chunks of {:.1} MB each", 
               stream_count, total_chunks, chunk_size as f64 / (1024.0 * 1024.0));
         
-        // Send control message IMMEDIATELY
+        // Send control message
         let control_stream = stream_manager.open_file_transfer_streams(1).await?
             .into_iter().next()
             .ok_or_else(|| FileshareError::Transfer("Failed to create control stream".to_string()))?;
             
         Self::send_control_message(control_stream, &filename, file_size, &target_path, chunk_size, total_chunks).await?;
         
-        // 🔥 Create shared state for blazing progress tracking
+        // Open data streams
+        let data_streams = stream_manager.open_file_transfer_streams(stream_count).await?;
+        
+        // Create shared state for progress tracking
         let bytes_sent = Arc::new(AtomicU64::new(0));
         let start_time = Instant::now();
         
-        // ⚡ DELAY control stream slightly to ensure receiver setup
-        tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
-        
-        // ⚡ INSTANT ALL STREAMS - NO PROGRESSIVE OPENING, NO DELAYS
-        info!("⚡ Opening ALL {} streams INSTANTLY for maximum parallel throughput!", stream_count);
-        let all_streams = stream_manager.open_file_transfer_streams(stream_count).await?;
-        
-        // 🚀 Launch ALL parallel senders IMMEDIATELY
-        let mut handles = Vec::with_capacity(stream_count);
+        // Launch parallel senders
+        let mut handles = Vec::new();
         let file_path = Arc::new(source_path);
         
-        // 🔥 IMMEDIATE parallel chunk distribution - no waiting, no delays
-        for (stream_idx, stream) in all_streams.into_iter().enumerate() {
+        for (stream_idx, stream) in data_streams.into_iter().enumerate() {
             let file_path = file_path.clone();
             let bytes_sent = bytes_sent.clone();
             
-            // ⚡ Smart chunk distribution for optimal parallelism
+            // Distribute chunks across streams
             let chunks_per_stream = (total_chunks + stream_count as u64 - 1) / stream_count as u64;
             let start_chunk = stream_idx as u64 * chunks_per_stream;
             let end_chunk = std::cmp::min(start_chunk + chunks_per_stream, total_chunks);
@@ -164,9 +152,8 @@ impl BlazingTransfer {
                 continue;
             }
             
-            // 🚀 INSTANT spawn - no delays between streams
             let handle = tokio::spawn(async move {
-                Self::send_chunks_ultra_fast(
+                Self::send_chunks_blazing(
                     stream,
                     file_path,
                     start_chunk,
@@ -181,18 +168,18 @@ impl BlazingTransfer {
             handles.push(handle);
         }
         
-        // ⚡ MINIMAL progress monitoring - maximum performance, minimal overhead
+        // Monitor progress
         let monitor_handle = tokio::spawn(async move {
             let mut last_bytes = 0u64;
             loop {
-                tokio::time::sleep(tokio::time::Duration::from_secs(2)).await; // Less frequent monitoring
+                tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
                 let current_bytes = bytes_sent.load(Ordering::Relaxed);
                 let elapsed = start_time.elapsed().as_secs_f64();
-                let speed_mbps = ((current_bytes - last_bytes) as f64 * 8.0) / 2_000_000.0; // Adjust for 2s interval
+                let speed_mbps = ((current_bytes - last_bytes) as f64 * 8.0) / 1_000_000.0;
                 let progress = (current_bytes as f64 / file_size as f64) * 100.0;
                 
                 if current_bytes < file_size {
-                    info!("🚀 BLAZING Progress: {:.1}% - Speed: {:.1} Mbps", progress, speed_mbps);
+                    info!("📊 Progress: {:.1}% - Speed: {:.1} Mbps", progress, speed_mbps);
                 }
                 
                 last_bytes = current_bytes;
@@ -202,12 +189,12 @@ impl BlazingTransfer {
             }
         });
         
-        // ⚡ IMMEDIATE completion check - no delays
+        // Wait for completion
         for handle in handles {
             match handle.await {
                 Ok(Ok(())) => {},
                 Ok(Err(e)) => return Err(e),
-                Err(e) => return Err(FileshareError::Transfer(format!("Stream failed: {}", e))),
+                Err(e) => return Err(FileshareError::Transfer(format!("Task failed: {}", e))),
             }
         }
         
@@ -239,42 +226,35 @@ impl BlazingTransfer {
         Ok(())
     }
     
-    /// 🚀 ULTRA FAST chunk sending - maximum performance, zero delays
-    async fn send_chunks_ultra_fast(
+    /// Send chunks with maximum performance
+    async fn send_chunks_blazing(
         mut stream: quinn::SendStream,
         file_path: Arc<PathBuf>,
         start_chunk: u64,
         end_chunk: u64,
-        base_chunk_size: u64,
+        chunk_size: u64,
         file_size: u64,
         stream_idx: usize,
         bytes_sent: Arc<AtomicU64>,
     ) -> Result<()> {
-        // 🔥 Adaptive chunk size based on stream position for optimal start
-        let chunk_size = Self::calculate_adaptive_chunk_size(file_size, stream_idx);
-        
         let mut file = tokio::fs::File::open(file_path.as_ref()).await?;
         let mut buffer = vec![0u8; chunk_size as usize];
         
         for chunk_idx in start_chunk..end_chunk {
-            let chunk_offset = chunk_idx * base_chunk_size; // Use base size for offset calculation
+            let chunk_offset = chunk_idx * chunk_size;
             file.seek(std::io::SeekFrom::Start(chunk_offset)).await?;
             
             let remaining = file_size.saturating_sub(chunk_offset);
-            let bytes_to_read = std::cmp::min(base_chunk_size, remaining) as usize; // Use base size for read
+            let bytes_to_read = std::cmp::min(chunk_size, remaining) as usize;
             
-            // ⚡ FAST exact read
             file.read_exact(&mut buffer[..bytes_to_read]).await
                 .map_err(|e| FileshareError::FileOperation(format!("Failed to read file chunk: {}", e)))?;
             
-            // 🚀 BLAZING FAST send: [chunk_id: u64][size: u32][data] - minimize syscalls
-            let mut chunk_header = Vec::with_capacity(12);
-            chunk_header.extend_from_slice(&chunk_idx.to_be_bytes());
-            chunk_header.extend_from_slice(&(bytes_to_read as u32).to_be_bytes());
-            
-            // ⚡ Single write for header + data for maximum performance
-            stream.write_all(&chunk_header).await
-                .map_err(|e| FileshareError::Transfer(format!("Failed to write chunk header: {}", e)))?;
+            // Send: [chunk_id: u64][size: u32][data]
+            stream.write_all(&chunk_idx.to_be_bytes()).await
+                .map_err(|e| FileshareError::Transfer(format!("Failed to write chunk ID: {}", e)))?;
+            stream.write_all(&(bytes_to_read as u32).to_be_bytes()).await
+                .map_err(|e| FileshareError::Transfer(format!("Failed to write chunk size: {}", e)))?;
             stream.write_all(&buffer[..bytes_to_read]).await
                 .map_err(|e| FileshareError::Transfer(format!("Failed to write chunk data: {}", e)))?;
             
@@ -283,25 +263,25 @@ impl BlazingTransfer {
         
         stream.finish()
             .map_err(|e| FileshareError::Transfer(format!("Failed to finish stream: {}", e)))?;
-        debug!("🚀 Stream {} BLAZED through chunks {}-{}", stream_idx, start_chunk, end_chunk);
+        debug!("✅ Stream {} completed: chunks {}-{}", stream_idx, start_chunk, end_chunk);
         Ok(())
     }
     
-    /// 🚀 OPTIMAL chunk sizing for INSTANT maximum throughput
-    fn calculate_adaptive_chunk_size(file_size: u64, _stream_idx: usize) -> u64 {
-        // ⚡ Use OPTIMAL fixed chunk size for maximum speed - no adaptive complexity
+    /// Calculate optimal chunk size for maximum throughput
+    fn calculate_optimal_chunk_size(file_size: u64) -> u64 {
         match file_size {
-            0..=100_000_000 => 4 * 1024 * 1024,            // <= 100MB: 4MB chunks
-            100_000_001..=500_000_000 => 8 * 1024 * 1024,   // 100-500MB: 8MB chunks
-            _ => 8 * 1024 * 1024,                           // > 500MB: 8MB chunks (optimal for most cases)
+            0..=100_000_000 => 8 * 1024 * 1024,           // <= 100MB: 8MB chunks
+            100_000_001..=500_000_000 => 16 * 1024 * 1024,  // 100-500MB: 16MB chunks
+            500_000_001..=2_000_000_000 => 32 * 1024 * 1024, // 500MB-2GB: 32MB chunks
+            _ => 64 * 1024 * 1024,                        // > 2GB: 64MB chunks
         }
     }
 }
 
-/// 🚀 BLAZING FAST receiver with ULTRA parallel writes - zero delays
+/// Blazing fast receiver with true parallel writes
 pub struct BlazingReceiver;
 
-// 🚀 BLAZING transfer state - optimized for maximum parallel throughput
+// Per-transfer state without global locks
 struct TransferState {
     filename: String,
     file_size: u64,
@@ -312,7 +292,6 @@ struct TransferState {
     received_chunks: AtomicU64,
     write_semaphore: Arc<Semaphore>,
     completed: AtomicBool,
-    start_time: Instant, // Track blazing fast performance
 }
 
 // Use DashMap for lock-free concurrent access
@@ -388,7 +367,7 @@ impl BlazingReceiver {
         
         file.sync_all().await
             .map_err(|e| FileshareError::Transfer(format!("Failed to sync file: {}", e)))?;
-        info!("🎆 BLAZING single stream transfer COMPLETE: {} - MAXIMUM SPEED!", filename);
+        info!("✅ Single stream transfer complete: {}", filename);
         Ok(())
     }
     
@@ -410,7 +389,7 @@ impl BlazingReceiver {
         let total_chunks: u64 = parts[5].parse()
             .map_err(|_| FileshareError::Transfer("Invalid total chunks".to_string()))?;
         
-        info!("🚀 BLAZING FAST parallel receive: {} ({:.1} MB, {} chunks) - READY FOR MAXIMUM THROUGHPUT!", 
+        info!("🎛️ BLAZING parallel receive: {} ({:.1} MB, {} chunks)", 
               filename, file_size as f64 / (1024.0 * 1024.0), total_chunks);
         
         // Create file with pre-allocation for optimal performance
@@ -420,7 +399,7 @@ impl BlazingReceiver {
         file.sync_all().await
             .map_err(|e| FileshareError::Transfer(format!("Failed to sync file: {}", e)))?; // Ensure allocation is complete
         
-        // 🚀 Create BLAZING transfer state for maximum performance
+        // Create transfer state
         let state = Arc::new(TransferState {
             filename: filename.clone(),
             file_size,
@@ -431,40 +410,33 @@ impl BlazingReceiver {
             received_chunks: AtomicU64::new(0),
             write_semaphore: Arc::new(Semaphore::new(WRITE_CONCURRENCY)),
             completed: AtomicBool::new(false),
-            start_time: Instant::now(),
         });
         
         ACTIVE_TRANSFERS.insert(filename, state);
         Ok(())
     }
     
-    /// 🚀 ULTRA FAST data stream processing with smart retry
+    /// Process data stream with parallel writes
     async fn process_data_stream(
         mut recv_stream: quinn::RecvStream,
         first_bytes: [u8; 4],
     ) -> Result<()> {
-        // ⚡ WAIT for active transfer with timeout (max 5 seconds)
-        let mut retries = 0;
-        let state = loop {
-            if let Some(entry) = ACTIVE_TRANSFERS.iter()
-                .find(|entry| !entry.value().completed.load(Ordering::Relaxed)) {
-                break entry.value().clone();
-            }
-            
-            retries += 1;
-            if retries > 50 { // 5 seconds max wait (50 * 100ms)
-                return Err(FileshareError::Transfer("No active transfer found after 5 seconds".to_string()));
-            }
-            
-            tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
-        };
-        
         // Read rest of chunk ID
         let mut id_bytes = [0u8; 8];
         id_bytes[..4].copy_from_slice(&first_bytes);
         recv_stream.read_exact(&mut id_bytes[4..]).await
             .map_err(|e| FileshareError::Transfer(format!("Failed to read chunk ID: {}", e)))?;
         let first_chunk_id = u64::from_be_bytes(id_bytes);
+        
+        // Find active transfer
+        let transfer_key = ACTIVE_TRANSFERS.iter()
+            .find(|entry| !entry.value().completed.load(Ordering::Relaxed))
+            .map(|entry| entry.key().clone())
+            .ok_or_else(|| FileshareError::Transfer("No active transfer".to_string()))?;
+        
+        let state = ACTIVE_TRANSFERS.get(&transfer_key)
+            .ok_or_else(|| FileshareError::Transfer("Transfer not found".to_string()))?
+            .clone();
         
         // Process first chunk
         let mut size_bytes = [0u8; 4];
@@ -479,7 +451,7 @@ impl BlazingReceiver {
         // Write first chunk in parallel
         Self::write_chunk_parallel(state.clone(), first_chunk_id, chunk_data).await?;
         
-        // 🚀 BLAZING FAST remaining chunks processing
+        // Process remaining chunks
         loop {
             // Read chunk header
             let mut chunk_header = [0u8; 12]; // chunk_id (8) + size (4)
@@ -507,26 +479,26 @@ impl BlazingReceiver {
         Ok(())
     }
     
-    /// 🚀 ULTRA FAST parallel writes - maximum disk throughput, zero delays
+    /// Write chunk with true parallelism using seek
     async fn write_chunk_parallel(
         state: Arc<TransferState>,
         chunk_id: u64,
         data: Vec<u8>,
     ) -> Result<()> {
-        // ⚡ Acquire write permit for controlled blazing concurrency
+        // Acquire write permit to control concurrency
         let _permit = state.write_semaphore.acquire().await
             .map_err(|_| FileshareError::Transfer("Failed to acquire write permit".to_string()))?;
         
-        // 🚀 Clone handles for BLAZING parallel access
+        // Clone file handle for parallel access
         let file = state.file.clone();
         let state_clone = state.clone();
         
-        // ⚡ Spawn ULTRA FAST parallel write task
+        // Spawn parallel write task
         tokio::spawn(async move {
             let mut file = file.lock().await;
             let offset = chunk_id * state_clone.chunk_size;
             
-            // 🚀 BLAZING FAST seek and write - single operation
+            // Seek to chunk position and write
             if let Err(e) = file.seek(std::io::SeekFrom::Start(offset)).await {
                 error!("Failed to seek to offset {}: {}", offset, e);
                 return;
@@ -537,32 +509,24 @@ impl BlazingReceiver {
                 return;
             }
             
-            // ⚡ FAST progress update
+            // Update progress
             let received = state_clone.received_chunks.fetch_add(1, Ordering::Relaxed) + 1;
             
-            // ⚡ MINIMAL progress reports for maximum speed (every 30 chunks or completion)
-            if received % 30 == 0 || received == state_clone.total_chunks {
+            if received % 10 == 0 || received == state_clone.total_chunks {
                 let progress = (received as f64 / state_clone.total_chunks as f64) * 100.0;
-                let elapsed = state_clone.start_time.elapsed().as_secs_f64();
-                let speed_mbps = (received as f64 * state_clone.chunk_size as f64 * 8.0) / (elapsed * 1_000_000.0);
-                info!("🚀 BLAZING Progress: {:.1}% ({}/{}) - {:.1} Mbps", progress, received, state_clone.total_chunks, speed_mbps);
+                info!("📊 Progress: {:.1}% ({}/{})", progress, received, state_clone.total_chunks);
             }
             
-            // ⚡ INSTANT completion check
+            // Check completion
             if received == state_clone.total_chunks {
-                let elapsed = state_clone.start_time.elapsed();
-                let total_mb = (state_clone.file_size as f64) / (1024.0 * 1024.0);
-                let speed_mbps = (state_clone.file_size as f64 * 8.0) / (elapsed.as_secs_f64() * 1_000_000.0);
-                
                 if let Err(e) = file.sync_all().await {
                     error!("Failed to sync file: {}", e);
                     return;
                 }
                 state_clone.completed.store(true, Ordering::Relaxed);
-                info!("🎆 BLAZING transfer COMPLETED: {} ({:.1} MB in {:.2}s at {:.1} Mbps)", 
-                      state_clone.filename, total_mb, elapsed.as_secs_f64(), speed_mbps);
+                info!("🎉 BLAZING transfer complete: {}", state_clone.filename);
                 
-                // ⚡ Instant cleanup
+                // Cleanup
                 ACTIVE_TRANSFERS.remove(&state_clone.filename);
             }
         });

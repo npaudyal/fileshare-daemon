@@ -10,7 +10,8 @@ use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 use futures;
 
-const MAX_CONCURRENT_STREAMS: usize = 128; // 🚀 BLAZING maximum concurrent streams
+const MAX_CONCURRENT_STREAMS: usize = 16; // Maximum concurrent streams per connection
+const STREAM_POOL_SIZE: usize = 8; // Pre-allocated stream pool size
 
 pub struct StreamManager {
     connection: QuicConnection,
@@ -217,7 +218,7 @@ impl StreamManager {
             streams.push(send);
         }
         
-        info!("🚀 Opened {} BLAZING file transfer streams - READY FOR MAXIMUM THROUGHPUT!", count);
+        info!("Opened {} file transfer streams", count);
         
         Ok(streams)
     }
