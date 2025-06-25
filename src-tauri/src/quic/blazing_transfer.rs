@@ -113,20 +113,26 @@ impl BlazingTransfer {
         filename: String,
         file_size: u64,
     ) -> Result<()> {
-        // Calculate optimal parameters
+        // Calculate optimal parameters with aggressive parallelism
         let chunk_size = Self::calculate_optimal_chunk_size(file_size);
         let total_chunks = (file_size + chunk_size - 1) / chunk_size;
-        let stream_count = std::cmp::min(MAX_PARALLEL_STREAMS, total_chunks as usize);
+        
+        // Use more streams for better congestion control bypass
+        let ideal_streams = std::cmp::min(total_chunks as usize, MAX_PARALLEL_STREAMS);
+        let stream_count = std::cmp::max(ideal_streams, 8); // Minimum 8 streams for good parallelism
         
         info!("🚀 BLAZING parallel transfer: {} streams, {} chunks of {:.1} MB each", 
               stream_count, total_chunks, chunk_size as f64 / (1024.0 * 1024.0));
         
-        // Send control message
+        // Send control message and warm up connection
         let control_stream = stream_manager.open_file_transfer_streams(1).await?
             .into_iter().next()
             .ok_or_else(|| FileshareError::Transfer("Failed to create control stream".to_string()))?;
             
         Self::send_control_message(control_stream, &filename, file_size, &target_path, chunk_size, total_chunks).await?;
+        
+        // Brief delay to let receiver initialize
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
         
         // Open data streams
         let data_streams = stream_manager.open_file_transfer_streams(stream_count).await?;
@@ -168,9 +174,10 @@ impl BlazingTransfer {
             handles.push(handle);
         }
         
-        // Monitor progress
+        // Monitor progress with better reporting during slow start
         let monitor_handle = tokio::spawn(async move {
             let mut last_bytes = 0u64;
+            let mut slow_start_warned = false;
             loop {
                 tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
                 let current_bytes = bytes_sent.load(Ordering::Relaxed);
@@ -179,7 +186,12 @@ impl BlazingTransfer {
                 let progress = (current_bytes as f64 / file_size as f64) * 100.0;
                 
                 if current_bytes < file_size {
-                    info!("📊 Progress: {:.1}% - Speed: {:.1} Mbps", progress, speed_mbps);
+                    if elapsed > 10.0 && progress < 5.0 && !slow_start_warned {
+                        info!("📊 Progress: {:.1}% - QUIC slow start phase, speed will increase...", progress);
+                        slow_start_warned = true;
+                    } else {
+                        info!("📊 Progress: {:.1}% - Speed: {:.1} Mbps", progress, speed_mbps);
+                    }
                 }
                 
                 last_bytes = current_bytes;
@@ -240,7 +252,14 @@ impl BlazingTransfer {
         let mut file = tokio::fs::File::open(file_path.as_ref()).await?;
         let mut buffer = vec![0u8; chunk_size as usize];
         
-        for chunk_idx in start_chunk..end_chunk {
+        // Send chunks with small initial delay to reduce congestion
+        for (idx, chunk_idx) in (start_chunk..end_chunk).enumerate() {
+            // Small staggered delay for first few chunks to help with congestion control
+            if idx < 3 && stream_idx > 0 {
+                tokio::time::sleep(tokio::time::Duration::from_millis(stream_idx as u64 * 10)).await;
+            }
+            
+            let chunk_idx = chunk_idx;
             let chunk_offset = chunk_idx * chunk_size;
             file.seek(std::io::SeekFrom::Start(chunk_offset)).await?;
             
@@ -270,10 +289,11 @@ impl BlazingTransfer {
     /// Calculate optimal chunk size for maximum throughput
     fn calculate_optimal_chunk_size(file_size: u64) -> u64 {
         match file_size {
-            0..=100_000_000 => 8 * 1024 * 1024,           // <= 100MB: 8MB chunks
-            100_000_001..=500_000_000 => 16 * 1024 * 1024,  // 100-500MB: 16MB chunks
-            500_000_001..=2_000_000_000 => 32 * 1024 * 1024, // 500MB-2GB: 32MB chunks
-            _ => 64 * 1024 * 1024,                        // > 2GB: 64MB chunks
+            0..=50_000_000 => 4 * 1024 * 1024,           // <= 50MB: 4MB chunks
+            50_000_001..=200_000_000 => 8 * 1024 * 1024,   // 50-200MB: 8MB chunks  
+            200_000_001..=1_000_000_000 => 12 * 1024 * 1024, // 200MB-1GB: 12MB chunks
+            1_000_000_001..=5_000_000_000 => 16 * 1024 * 1024, // 1-5GB: 16MB chunks
+            _ => 24 * 1024 * 1024,                        // > 5GB: 24MB chunks
         }
     }
 }
