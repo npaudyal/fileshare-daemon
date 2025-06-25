@@ -57,6 +57,9 @@ rustls-pemfile = "2.0"
 rcgen = "0.13"
 futures = "0.3"
 ring = "0.17"
+# High-performance parallel I/O
+memmap2 = "0.9"
+parking_lot = "0.12"
 
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.52", features = [

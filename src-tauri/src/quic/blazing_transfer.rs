@@ -9,6 +9,8 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt, AsyncSeekExt};
 use tokio::sync::Semaphore;
 use tracing::{debug, error, info};
 use uuid::Uuid;
+use memmap2::MmapMut;
+use std::fs::OpenOptions;
 
 // Optimized constants for maximum performance
 const SMALL_FILE_THRESHOLD: u64 = 10 * 1024 * 1024; // 10MB
@@ -113,10 +115,10 @@ impl BlazingTransfer {
         filename: String,
         file_size: u64,
     ) -> Result<()> {
-        // Calculate optimal parameters
+        // Calculate optimal parameters with better distribution
         let chunk_size = Self::calculate_optimal_chunk_size(file_size);
         let total_chunks = (file_size + chunk_size - 1) / chunk_size;
-        let stream_count = std::cmp::min(MAX_PARALLEL_STREAMS, total_chunks as usize);
+        let stream_count = std::cmp::min(MAX_PARALLEL_STREAMS, total_chunks as usize).max(1);
         
         info!("🚀 BLAZING parallel transfer: {} streams, {} chunks of {:.1} MB each", 
               stream_count, total_chunks, chunk_size as f64 / (1024.0 * 1024.0));
@@ -143,21 +145,22 @@ impl BlazingTransfer {
             let file_path = file_path.clone();
             let bytes_sent = bytes_sent.clone();
             
-            // Distribute chunks across streams
-            let chunks_per_stream = (total_chunks + stream_count as u64 - 1) / stream_count as u64;
-            let start_chunk = stream_idx as u64 * chunks_per_stream;
-            let end_chunk = std::cmp::min(start_chunk + chunks_per_stream, total_chunks);
+            // Distribute chunks evenly using round-robin for better balance
+            let start_chunk = stream_idx as u64;
+            let chunk_step = stream_count as u64;
+            let chunks_for_this_stream: Vec<u64> = (start_chunk..total_chunks)
+                .step_by(chunk_step as usize)
+                .collect();
             
-            if start_chunk >= total_chunks {
+            if chunks_for_this_stream.is_empty() {
                 continue;
             }
             
             let handle = tokio::spawn(async move {
-                Self::send_chunks_blazing(
+                Self::send_chunks_optimized(
                     stream,
                     file_path,
-                    start_chunk,
-                    end_chunk,
+                    chunks_for_this_stream,
                     chunk_size,
                     file_size,
                     stream_idx,
@@ -226,21 +229,22 @@ impl BlazingTransfer {
         Ok(())
     }
     
-    /// Send chunks with maximum performance
-    async fn send_chunks_blazing(
+    /// Optimized chunk sending with single file handle and positioned reads
+    async fn send_chunks_optimized(
         mut stream: quinn::SendStream,
         file_path: Arc<PathBuf>,
-        start_chunk: u64,
-        end_chunk: u64,
+        chunk_indices: Vec<u64>,
         chunk_size: u64,
         file_size: u64,
         stream_idx: usize,
         bytes_sent: Arc<AtomicU64>,
     ) -> Result<()> {
+        // Use single file handle for this stream
         let mut file = tokio::fs::File::open(file_path.as_ref()).await?;
         let mut buffer = vec![0u8; chunk_size as usize];
         
-        for chunk_idx in start_chunk..end_chunk {
+        let chunk_count = chunk_indices.len();
+        for chunk_idx in chunk_indices {
             let chunk_offset = chunk_idx * chunk_size;
             file.seek(std::io::SeekFrom::Start(chunk_offset)).await?;
             
@@ -263,7 +267,7 @@ impl BlazingTransfer {
         
         stream.finish()
             .map_err(|e| FileshareError::Transfer(format!("Failed to finish stream: {}", e)))?;
-        debug!("✅ Stream {} completed: chunks {}-{}", stream_idx, start_chunk, end_chunk);
+        debug!("✅ Stream {} completed {} chunks", stream_idx, chunk_count);
         Ok(())
     }
     
@@ -281,16 +285,16 @@ impl BlazingTransfer {
 /// Blazing fast receiver with true parallel writes
 pub struct BlazingReceiver;
 
-// Per-transfer state without global locks
+// Optimized per-transfer state with true parallelism
 struct TransferState {
     filename: String,
     file_size: u64,
     chunk_size: u64,
     total_chunks: u64,
     target_path: PathBuf,
-    file: Arc<tokio::sync::Mutex<tokio::fs::File>>,
+    memory_map: Arc<parking_lot::Mutex<MmapMut>>, // Fast mutex for memory map
     received_chunks: AtomicU64,
-    write_semaphore: Arc<Semaphore>,
+    chunk_bitmap: Arc<parking_lot::Mutex<Vec<bool>>>, // Track received chunks
     completed: AtomicBool,
 }
 
@@ -307,9 +311,10 @@ impl BlazingReceiver {
             .map_err(|e| FileshareError::Transfer(format!("Failed to read header length: {}", e)))?;
         let header_len = u32::from_be_bytes(len_bytes) as usize;
         
-        // Check if this is a data stream (no header)
-        if header_len < 10 || header_len > 1000 {
-            // This is a data stream, process chunks
+        // Check if this is a data stream by validating header length range
+        // Control headers are typically 50-500 bytes, data streams start with chunk ID
+        if header_len > 100_000 || header_len == 0 {
+            // This looks like chunk data (chunk_id as header_len), process as data stream
             return Self::process_data_stream(recv_stream, len_bytes).await;
         }
         
@@ -392,23 +397,35 @@ impl BlazingReceiver {
         info!("🎛️ BLAZING parallel receive: {} ({:.1} MB, {} chunks)", 
               filename, file_size as f64 / (1024.0 * 1024.0), total_chunks);
         
-        // Create file with pre-allocation for optimal performance
-        let file = tokio::fs::File::create(&target_path).await?;
-        file.set_len(file_size).await
-            .map_err(|e| FileshareError::Transfer(format!("Failed to pre-allocate file: {}", e)))?;
-        file.sync_all().await
-            .map_err(|e| FileshareError::Transfer(format!("Failed to sync file: {}", e)))?; // Ensure allocation is complete
+        // Create file and memory map for true parallel writes
+        let file = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .read(true)
+            .truncate(true)
+            .open(&target_path)
+            .map_err(|e| FileshareError::Transfer(format!("Failed to create file: {}", e)))?;
         
-        // Create transfer state
+        // Pre-allocate file size
+        file.set_len(file_size)
+            .map_err(|e| FileshareError::Transfer(format!("Failed to pre-allocate file: {}", e)))?;
+        
+        // Create memory map for parallel writes
+        let mmap = unsafe {
+            MmapMut::map_mut(&file)
+                .map_err(|e| FileshareError::Transfer(format!("Failed to create memory map: {}", e)))?
+        };
+        
+        // Create transfer state with optimized architecture
         let state = Arc::new(TransferState {
             filename: filename.clone(),
             file_size,
             chunk_size,
             total_chunks,
             target_path,
-            file: Arc::new(tokio::sync::Mutex::new(file)),
+            memory_map: Arc::new(parking_lot::Mutex::new(mmap)),
             received_chunks: AtomicU64::new(0),
-            write_semaphore: Arc::new(Semaphore::new(WRITE_CONCURRENCY)),
+            chunk_bitmap: Arc::new(parking_lot::Mutex::new(vec![false; total_chunks as usize])),
             completed: AtomicBool::new(false),
         });
         
@@ -479,57 +496,63 @@ impl BlazingReceiver {
         Ok(())
     }
     
-    /// Write chunk with true parallelism using seek
+    /// Write chunk with true parallelism using memory-mapped I/O
     async fn write_chunk_parallel(
         state: Arc<TransferState>,
         chunk_id: u64,
         data: Vec<u8>,
     ) -> Result<()> {
-        // Acquire write permit to control concurrency
-        let _permit = state.write_semaphore.acquire().await
-            .map_err(|_| FileshareError::Transfer("Failed to acquire write permit".to_string()))?;
+        let offset = chunk_id * state.chunk_size;
+        let chunk_idx = chunk_id as usize;
         
-        // Clone file handle for parallel access
-        let file = state.file.clone();
-        let state_clone = state.clone();
+        // Write directly to memory map (true parallel access)
+        {
+            let mut mmap = state.memory_map.lock();
+            let end_offset = offset + data.len() as u64;
+            
+            if end_offset <= state.file_size {
+                let start = offset as usize;
+                let end = end_offset as usize;
+                mmap[start..end].copy_from_slice(&data);
+            } else {
+                error!("Chunk {} offset {} exceeds file size {}", chunk_id, end_offset, state.file_size);
+                return Err(FileshareError::Transfer("Chunk exceeds file size".to_string()));
+            }
+        }
         
-        // Spawn parallel write task
-        tokio::spawn(async move {
-            let mut file = file.lock().await;
-            let offset = chunk_id * state_clone.chunk_size;
-            
-            // Seek to chunk position and write
-            if let Err(e) = file.seek(std::io::SeekFrom::Start(offset)).await {
-                error!("Failed to seek to offset {}: {}", offset, e);
-                return;
+        // Update chunk bitmap and progress atomically
+        let received = {
+            let mut bitmap = state.chunk_bitmap.lock();
+            if chunk_idx < bitmap.len() && !bitmap[chunk_idx] {
+                bitmap[chunk_idx] = true;
+                state.received_chunks.fetch_add(1, Ordering::Relaxed) + 1
+            } else {
+                // Duplicate chunk, ignore
+                return Ok(());
             }
-            
-            if let Err(e) = file.write_all(&data).await {
-                error!("Failed to write chunk {}: {}", chunk_id, e);
-                return;
-            }
-            
-            // Update progress
-            let received = state_clone.received_chunks.fetch_add(1, Ordering::Relaxed) + 1;
-            
-            if received % 10 == 0 || received == state_clone.total_chunks {
-                let progress = (received as f64 / state_clone.total_chunks as f64) * 100.0;
-                info!("📊 Progress: {:.1}% ({}/{})", progress, received, state_clone.total_chunks);
-            }
-            
-            // Check completion
-            if received == state_clone.total_chunks {
-                if let Err(e) = file.sync_all().await {
-                    error!("Failed to sync file: {}", e);
-                    return;
+        };
+        
+        if received % 20 == 0 || received == state.total_chunks {
+            let progress = (received as f64 / state.total_chunks as f64) * 100.0;
+            info!("📊 Progress: {:.1}% ({}/{})", progress, received, state.total_chunks);
+        }
+        
+        // Check completion
+        if received == state.total_chunks {
+            // Flush memory map to disk
+            {
+                let mmap = state.memory_map.lock();
+                if let Err(e) = mmap.flush() {
+                    error!("Failed to flush memory map: {}", e);
                 }
-                state_clone.completed.store(true, Ordering::Relaxed);
-                info!("🎉 BLAZING transfer complete: {}", state_clone.filename);
-                
-                // Cleanup
-                ACTIVE_TRANSFERS.remove(&state_clone.filename);
             }
-        });
+            
+            state.completed.store(true, Ordering::Relaxed);
+            info!("🎉 BLAZING transfer complete: {}", state.filename);
+            
+            // Cleanup
+            ACTIVE_TRANSFERS.remove(&state.filename);
+        }
         
         Ok(())
     }
