@@ -12,7 +12,7 @@ use tokio::sync::{mpsc, RwLock, Semaphore};
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
-const MAX_CONCURRENT_STREAMS: usize = 16; // Maximum concurrent streams per connection
+const MAX_CONCURRENT_STREAMS: usize = 64; // Maximum concurrent streams per connection
 const STREAM_POOL_SIZE: usize = 8; // Pre-allocated stream pool size
 
 pub struct StreamManager {

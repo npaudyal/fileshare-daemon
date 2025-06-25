@@ -13,14 +13,11 @@ use uuid::Uuid;
 #[cfg(unix)]
 use std::os::unix::fs::OpenOptionsExt;
 
-// Optimized constants for maximum performance
+// Optimized constants for maximum blazing performance
 const SMALL_FILE_THRESHOLD: u64 = 10 * 1024 * 1024; // 10MB
-const OPTIMAL_CHUNK_SIZE: u64 = 16 * 1024 * 1024; // 16MB default
-const MAX_PARALLEL_STREAMS: usize = 64; // Maximum concurrent streams
-const INITIAL_STREAMS: usize = 4; // Start with fewer streams
-const STREAM_RAMP_UP_INTERVAL: Duration = Duration::from_millis(500);
-const WRITE_CONCURRENCY: usize = 32; // Concurrent disk writes
-const PROBE_SIZE: usize = 10 * 1024 * 1024; // 10MB bandwidth probe
+const OPTIMAL_CHUNK_SIZE: u64 = 8 * 1024 * 1024; // 8MB for better parallelism
+const MAX_PARALLEL_STREAMS: usize = 32; // Optimal for most networks
+const WRITE_CONCURRENCY: usize = 64; // High concurrent disk writes
 
 pub struct BlazingTransfer;
 
@@ -43,15 +40,14 @@ impl BlazingTransfer {
         info!("🚀 Starting BLAZING transfer: {} ({:.1} MB)", 
               filename, file_size as f64 / (1024.0 * 1024.0));
         
-        // Probe bandwidth first for LAN transfers
-        let bandwidth_mbps = Self::probe_bandwidth(&stream_manager).await?;
-        info!("🔍 Detected bandwidth: {:.1} Mbps", bandwidth_mbps);
+        // Skip bandwidth probing for instant start
+        let bandwidth_mbps = 1000.0; // Assume high LAN bandwidth
         
         let result = if file_size <= SMALL_FILE_THRESHOLD {
             Self::single_stream_transfer(stream_manager, source_path, target_path, filename, file_size).await
         } else {
             Self::blazing_parallel_transfer(
-                stream_manager, source_path, target_path, filename, file_size, bandwidth_mbps
+                stream_manager, source_path, target_path, filename, file_size
             ).await
         };
         
@@ -71,23 +67,6 @@ impl BlazingTransfer {
         Ok(())
     }
     
-    async fn probe_bandwidth(stream_manager: &Arc<StreamManager>) -> Result<f64> {
-        let mut stream = stream_manager.open_file_transfer_streams(1).await?
-            .into_iter().next()
-            .ok_or_else(|| FileshareError::Transfer("Failed to create probe stream".to_string()))?;
-        
-        let probe_data = vec![0u8; PROBE_SIZE];
-        let start = Instant::now();
-        
-        stream.write_all(b"PROBE|").await?;
-        stream.write_all(&probe_data).await?;
-        stream.finish()?;
-        
-        let elapsed = start.elapsed();
-        let bandwidth_mbps = (PROBE_SIZE as f64 * 8.0) / (elapsed.as_secs_f64() * 1_000_000.0);
-        
-        Ok(bandwidth_mbps)
-    }
     
     async fn single_stream_transfer(
         stream_manager: Arc<StreamManager>,
@@ -130,16 +109,15 @@ impl BlazingTransfer {
         target_path: String,
         filename: String,
         file_size: u64,
-        bandwidth_mbps: f64,
     ) -> Result<()> {
-        let chunk_size = Self::calculate_optimal_chunk_size(file_size, bandwidth_mbps);
+        let chunk_size = Self::calculate_optimal_chunk_size(file_size);
         let total_chunks = (file_size + chunk_size - 1) / chunk_size;
-        let optimal_streams = Self::calculate_optimal_streams(file_size, bandwidth_mbps, total_chunks);
+        let optimal_streams = Self::calculate_optimal_streams(file_size, total_chunks);
         
-        info!("🚀 BLAZING parallel transfer: up to {} streams, {} chunks of {:.1} MB each", 
+        info!("🚀 BLAZING parallel transfer: {} streams, {} chunks of {:.1} MB each", 
               optimal_streams, total_chunks, chunk_size as f64 / (1024.0 * 1024.0));
         
-        // Send control message
+        // Send control message first
         let control_stream = stream_manager.open_file_transfer_streams(1).await?
             .into_iter().next()
             .ok_or_else(|| FileshareError::Transfer("Failed to create control stream".to_string()))?;
@@ -148,155 +126,53 @@ impl BlazingTransfer {
             control_stream, &filename, file_size, &target_path, chunk_size, total_chunks
         ).await?;
         
+        // Create ALL streams immediately - no progressive launch
+        let streams = stream_manager.open_file_transfer_streams(optimal_streams).await?;
+        
         // Create progress tracking
         let bytes_sent = Arc::new(AtomicU64::new(0));
-        let active_streams = Arc::new(AtomicUsize::new(0));
         let chunks_sent = Arc::new(AtomicU64::new(0));
         
-        // Use mpsc instead of broadcast for chunk distribution
-        let (chunk_tx, chunk_rx) = mpsc::channel::<u64>(total_chunks as usize);
-        
-        // Fill chunk queue
-        for chunk_idx in 0..total_chunks {
-            chunk_tx.send(chunk_idx).await
-                .map_err(|_| FileshareError::Transfer("Failed to send chunk index".to_string()))?;
-        }
-        
-        // Wrap in Arc and Mutex for sharing
-        let chunk_rx = Arc::new(tokio::sync::Mutex::new(chunk_rx));
-        
-        // Progressive stream launcher
-        let stream_manager_clone = stream_manager.clone();
-        let file_path = Arc::new(source_path);
-        let bytes_sent_clone = bytes_sent.clone();
-        let active_streams_clone = active_streams.clone();
-        let chunks_sent_clone = chunks_sent.clone();
-        
-        let stream_launcher = tokio::spawn(async move {
-            Self::progressive_stream_launcher(
-                stream_manager_clone,
-                file_path,
-                chunk_rx,
-                chunk_size,
-                file_size,
-                total_chunks,
-                optimal_streams,
-                bytes_sent_clone,
-                active_streams_clone,
-                chunks_sent_clone,
-            ).await
-        });
-        
-        // Progress monitor
+        // Start progress monitor
         let monitor_handle = tokio::spawn(Self::monitor_progress(
             bytes_sent.clone(),
-            active_streams.clone(),
             chunks_sent.clone(),
             file_size,
             total_chunks,
             Instant::now(),
         ));
         
-        // Wait for completion
-        stream_launcher.await??;
-        monitor_handle.abort();
-        
-        Ok(())
-    }
-    
-    async fn progressive_stream_launcher(
-        stream_manager: Arc<StreamManager>,
-        file_path: Arc<PathBuf>,
-        chunk_rx: Arc<tokio::sync::Mutex<mpsc::Receiver<u64>>>,
-        chunk_size: u64,
-        file_size: u64,
-        total_chunks: u64,
-        max_streams: usize,
-        bytes_sent: Arc<AtomicU64>,
-        active_streams: Arc<AtomicUsize>,
-        chunks_sent: Arc<AtomicU64>,
-    ) -> Result<()> {
+        // Launch all streams immediately with chunks distributed evenly
         let mut handles = Vec::new();
-        let mut interval = tokio::time::interval(STREAM_RAMP_UP_INTERVAL);
+        let chunks_per_stream = (total_chunks + optimal_streams as u64 - 1) / optimal_streams as u64;
         
-        // Start with initial streams
-        for stream_idx in 0..INITIAL_STREAMS.min(max_streams) {
-            if let Ok(stream) = stream_manager.open_file_transfer_streams(1).await?
-                .into_iter().next()
-                .ok_or_else(|| FileshareError::Transfer("Failed to create stream".to_string())) 
-            {
-                active_streams.fetch_add(1, Ordering::Relaxed);
-                
-                let file_path = file_path.clone();
-                let bytes_sent = bytes_sent.clone();
-                let active_streams = active_streams.clone();
-                let chunks_sent = chunks_sent.clone();
-                let chunk_rx = chunk_rx.clone();
-                
-                let handle = tokio::spawn(async move {
-                    let result = Self::stream_chunk_sender(
-                        stream,
-                        stream_idx,
-                        file_path,
-                        chunk_rx,
-                        chunk_size,
-                        file_size,
-                        total_chunks,  // Add this parameter
-                        bytes_sent,
-                        chunks_sent,
-                    ).await;
-                    
-                    active_streams.fetch_sub(1, Ordering::Relaxed);
-                    result
-                });
-                
-                handles.push(handle);
-            }
-        }
-        
-        // Progressively add more streams based on performance
-        let mut current_streams = INITIAL_STREAMS;
-        while current_streams < max_streams && chunks_sent.load(Ordering::Relaxed) < total_chunks {
-            interval.tick().await;
+        for (stream_idx, stream) in streams.into_iter().enumerate() {
+            let start_chunk = stream_idx as u64 * chunks_per_stream;
+            let end_chunk = ((stream_idx + 1) as u64 * chunks_per_stream).min(total_chunks);
             
-            let progress = chunks_sent.load(Ordering::Relaxed) as f64 / total_chunks as f64;
-            let should_add_stream = progress > 0.1 && current_streams < max_streams;
-            
-            if should_add_stream {
-                if let Ok(stream) = stream_manager.open_file_transfer_streams(1).await?
-                    .into_iter().next()
-                    .ok_or_else(|| FileshareError::Transfer("Failed to create stream".to_string())) 
-                {
-                    current_streams += 1;
-                    active_streams.fetch_add(1, Ordering::Relaxed);
-                    
-                    let file_path = file_path.clone();
-                    let bytes_sent = bytes_sent.clone();
-                    let active_streams_clone = active_streams.clone();
-                    let chunks_sent = chunks_sent.clone();
-                    let chunk_rx = chunk_rx.clone();
-                    
-                    let handle = tokio::spawn(async move {
-                        let result = Self::stream_chunk_sender(
-                            stream,
-                            current_streams - 1,
-                            file_path,
-                            chunk_rx,
-                            chunk_size,
-                            file_size,
-                            total_chunks,  // Add this parameter
-                            bytes_sent,
-                            chunks_sent,
-                        ).await;
-                        
-                        active_streams_clone.fetch_sub(1, Ordering::Relaxed);
-                        result
-                    });
-                    
-                    handles.push(handle);
-                    info!("📈 Added stream {} (total: {})", current_streams, current_streams);
-                }
+            if start_chunk >= total_chunks {
+                break;
             }
+            
+            let file_path = source_path.clone();
+            let bytes_sent = bytes_sent.clone();
+            let chunks_sent = chunks_sent.clone();
+            
+            let handle = tokio::spawn(async move {
+                Self::blazing_stream_sender(
+                    stream,
+                    stream_idx,
+                    file_path,
+                    chunk_size,
+                    file_size,
+                    start_chunk,
+                    end_chunk,
+                    bytes_sent,
+                    chunks_sent,
+                ).await
+            });
+            
+            handles.push(handle);
         }
         
         // Wait for all streams to complete
@@ -304,23 +180,23 @@ impl BlazingTransfer {
             handle.await??;
         }
         
+        monitor_handle.abort();
         Ok(())
     }
     
-    async fn stream_chunk_sender(
+    async fn blazing_stream_sender(
         mut stream: quinn::SendStream,
         stream_idx: usize,
-        file_path: Arc<PathBuf>,
-        chunk_rx: Arc<tokio::sync::Mutex<mpsc::Receiver<u64>>>,
+        file_path: PathBuf,
         chunk_size: u64,
         file_size: u64,
-        total_chunks: u64,  // Add this parameter
+        start_chunk: u64,
+        end_chunk: u64,
         bytes_sent: Arc<AtomicU64>,
         chunks_sent: Arc<AtomicU64>,
     ) -> Result<()> {
-        let mut file = tokio::fs::File::open(file_path.as_ref()).await?;
+        let mut file = tokio::fs::File::open(&file_path).await?;
         let mut buffer = vec![0u8; chunk_size as usize];
-        let mut sent_count = 0;
         
         // Send filename first to identify this transfer
         let filename = file_path.file_name()
@@ -333,18 +209,9 @@ impl BlazingTransfer {
         stream.write_all(&(filename_bytes.len() as u32).to_be_bytes()).await?;
         stream.write_all(filename_bytes).await?;
         
-        debug!("📤 Stream {} sending chunks for file: {}", stream_idx, filename);
+        debug!("📤 Stream {} sending chunks {}-{} for file: {}", stream_idx, start_chunk, end_chunk - 1, filename);
         
-        loop {
-            // Get next chunk from shared receiver
-            let chunk_idx = {
-                let mut rx = chunk_rx.lock().await;
-                match rx.recv().await {
-                    Some(idx) => idx,
-                    None => break, // No more chunks
-                }
-            };
-            
+        for chunk_idx in start_chunk..end_chunk {
             let chunk_offset = chunk_idx * chunk_size;
             file.seek(std::io::SeekFrom::Start(chunk_offset)).await?;
             
@@ -360,17 +227,13 @@ impl BlazingTransfer {
             
             bytes_sent.fetch_add(bytes_to_read as u64, Ordering::Relaxed);
             chunks_sent.fetch_add(1, Ordering::Relaxed);
-            sent_count += 1;
-            
-            if sent_count % 10 == 0 || chunks_sent.load(Ordering::Relaxed) == total_chunks {
-                debug!("📦 Stream {} progress: sent {} chunks", stream_idx, sent_count);
-            }
         }
         
         stream.finish()?;
-        debug!("✅ Stream {} completed: sent {} chunks", stream_idx, sent_count);
+        debug!("✅ Stream {} completed: chunks {}-{}", stream_idx, start_chunk, end_chunk - 1);
         Ok(())
     }
+    
     async fn send_control_message(
         mut stream: quinn::SendStream,
         filename: &str,
@@ -393,7 +256,6 @@ impl BlazingTransfer {
     
     async fn monitor_progress(
         bytes_sent: Arc<AtomicU64>,
-        active_streams: Arc<AtomicUsize>,
         chunks_sent: Arc<AtomicU64>,
         file_size: u64,
         total_chunks: u64,
@@ -407,22 +269,16 @@ impl BlazingTransfer {
             
             let current_bytes = bytes_sent.load(Ordering::Relaxed);
             let current_chunks = chunks_sent.load(Ordering::Relaxed);
-            let current_streams = active_streams.load(Ordering::Relaxed);
             
             let interval_bytes = current_bytes - last_bytes;
             let interval_time = last_time.elapsed();
             let interval_speed_mbps = (interval_bytes as f64 * 8.0) / 
                 (interval_time.as_secs_f64() * 1_000_000.0);
             
-            let overall_speed_mbps = (current_bytes as f64 * 8.0) / 
-                (start_time.elapsed().as_secs_f64() * 1_000_000.0);
-            
             let progress = (current_chunks as f64 / total_chunks as f64) * 100.0;
             
             if current_bytes < file_size {
-                info!("📊 Progress: {:.1}% - Speed: {:.1} Mbps (avg: {:.1} Mbps) - Streams: {} - Chunks: {}/{}", 
-                      progress, interval_speed_mbps, overall_speed_mbps, current_streams, 
-                      current_chunks, total_chunks);
+                info!("📊 Progress: {:.1}% - Speed: {:.1} Mbps", progress, interval_speed_mbps);
             }
             
             last_bytes = current_bytes;
@@ -434,34 +290,24 @@ impl BlazingTransfer {
         }
     }
     
-    fn calculate_optimal_chunk_size(file_size: u64, bandwidth_mbps: f64) -> u64 {
-        let base_chunk = match file_size {
-            0..=100_000_000 => 8 * 1024 * 1024,
-            100_000_001..=500_000_000 => 16 * 1024 * 1024,
-            500_000_001..=2_000_000_000 => 32 * 1024 * 1024,
-            _ => 64 * 1024 * 1024,
-        };
-        
-        // Adjust based on bandwidth
-        if bandwidth_mbps > 1000.0 {
-            base_chunk * 2
-        } else {
-            base_chunk
+    fn calculate_optimal_chunk_size(file_size: u64) -> u64 {
+        match file_size {
+            0..=100_000_000 => 4 * 1024 * 1024,      // 4MB for small files
+            100_000_001..=500_000_000 => 8 * 1024 * 1024,    // 8MB for medium files
+            500_000_001..=2_000_000_000 => 16 * 1024 * 1024, // 16MB for large files
+            _ => 32 * 1024 * 1024,                            // 32MB for very large files
         }
     }
     
-    fn calculate_optimal_streams(file_size: u64, bandwidth_mbps: f64, total_chunks: u64) -> usize {
+    fn calculate_optimal_streams(file_size: u64, total_chunks: u64) -> usize {
         let base_streams = match file_size {
-            0..=100_000_000 => 8,
-            100_000_001..=500_000_000 => 16,
-            500_000_001..=2_000_000_000 => 32,
-            _ => 64,
+            0..=50_000_000 => 4,                     // 4 streams for small files
+            50_000_001..=200_000_000 => 8,           // 8 streams for medium files  
+            200_000_001..=1_000_000_000 => 16,       // 16 streams for large files
+            _ => 24,                                  // 24 streams for very large files
         };
         
-        let bandwidth_factor = (bandwidth_mbps / 100.0).max(1.0);
-        let optimal = (base_streams as f64 * bandwidth_factor) as usize;
-        
-        optimal.min(MAX_PARALLEL_STREAMS).min(total_chunks as usize)
+        base_streams.min(MAX_PARALLEL_STREAMS).min(total_chunks as usize)
     }
 }
 
