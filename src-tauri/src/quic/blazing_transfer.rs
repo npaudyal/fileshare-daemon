@@ -41,15 +41,10 @@ impl BlazingTransfer {
               filename, file_size as f64 / (1024.0 * 1024.0));
         
         // Skip bandwidth probing for instant start
-        let bandwidth_mbps = 1000.0; // Assume high LAN bandwidth
+        let _bandwidth_mbps = 1000.0; // Assume high LAN bandwidth
         
-        let result = if file_size <= SMALL_FILE_THRESHOLD {
-            Self::single_stream_transfer(stream_manager, source_path, target_path, filename, file_size).await
-        } else {
-            Self::blazing_parallel_transfer(
-                stream_manager, source_path, target_path, filename, file_size
-            ).await
-        };
+        // For now, use single stream for ALL transfers to ensure reliability
+        let result = Self::single_stream_transfer(stream_manager, source_path, target_path, filename, file_size).await;
         
         match result {
             Ok(()) => {
@@ -75,7 +70,7 @@ impl BlazingTransfer {
         filename: String,
         file_size: u64,
     ) -> Result<()> {
-        info!("📊 Using single stream for small file ({:.1} MB)", file_size as f64 / (1024.0 * 1024.0));
+        info!("🚀 Using optimized single stream for BLAZING speed ({:.1} MB)", file_size as f64 / (1024.0 * 1024.0));
         
         let mut stream = stream_manager.open_file_transfer_streams(1).await?
             .into_iter().next()
@@ -87,7 +82,12 @@ impl BlazingTransfer {
         stream.write_all(header_bytes).await?;
         
         let mut file = tokio::fs::File::open(&source_path).await?;
-        let mut buffer = vec![0u8; OPTIMAL_CHUNK_SIZE as usize];
+        
+        // Use very large buffer for maximum speed
+        let buffer_size = (64 * 1024 * 1024).min(file_size as usize); // 64MB or file size
+        let mut buffer = vec![0u8; buffer_size];
+        
+        info!("📤 Starting blazing single stream transfer with {:.1} MB buffer", buffer_size as f64 / (1024.0 * 1024.0));
         
         loop {
             match file.read(&mut buffer).await {
@@ -100,6 +100,7 @@ impl BlazingTransfer {
         }
         
         stream.finish()?;
+        info!("✅ Single stream transfer completed");
         Ok(())
     }
     
@@ -128,9 +129,6 @@ impl BlazingTransfer {
         
         info!("✅ Control message sent for {} chunks", total_chunks);
         
-        // Create ALL streams immediately - no delay needed with proper protocol
-        let streams = stream_manager.open_file_transfer_streams(optimal_streams).await?;
-        
         // Create progress tracking
         let bytes_sent = Arc::new(AtomicU64::new(0));
         let chunks_sent = Arc::new(AtomicU64::new(0));
@@ -144,27 +142,25 @@ impl BlazingTransfer {
             Instant::now(),
         ));
         
-        // Launch all streams immediately with chunks distributed evenly
+        // Create exactly the number of streams we need (one per chunk if few chunks)
+        let actual_streams = optimal_streams.min(total_chunks as usize);
+        let streams = stream_manager.open_file_transfer_streams(actual_streams).await?;
+        
+        info!("🚀 Using {} streams for {} chunks", actual_streams, total_chunks);
+        
+        // Distribute chunks evenly across streams
         let mut handles = Vec::new();
-        let chunks_per_stream = (total_chunks + optimal_streams as u64 - 1) / optimal_streams as u64;
+        let chunks_per_stream = (total_chunks + actual_streams as u64 - 1) / actual_streams as u64;
         
-        // Only use streams that actually have chunks
-        let effective_streams = streams.into_iter().enumerate()
-            .filter_map(|(stream_idx, stream)| {
-                let start_chunk = stream_idx as u64 * chunks_per_stream;
-                if start_chunk < total_chunks {
-                    let end_chunk = ((stream_idx + 1) as u64 * chunks_per_stream).min(total_chunks);
-                    Some((stream_idx, stream, start_chunk, end_chunk))
-                } else {
-                    None
-                }
-            })
-            .collect::<Vec<_>>();
-        
-        info!("🚀 Using {} streams out of {} requested for {} chunks", 
-              effective_streams.len(), optimal_streams, total_chunks);
-        
-        for (stream_idx, stream, start_chunk, end_chunk) in effective_streams {
+        for (stream_idx, stream) in streams.into_iter().enumerate() {
+            let start_chunk = stream_idx as u64 * chunks_per_stream;
+            let end_chunk = ((stream_idx + 1) as u64 * chunks_per_stream).min(total_chunks);
+            
+            // Skip streams with no chunks
+            if start_chunk >= total_chunks {
+                break;
+            }
+            
             let file_path = source_path.clone();
             let bytes_sent = bytes_sent.clone();
             let chunks_sent = chunks_sent.clone();
@@ -206,6 +202,13 @@ impl BlazingTransfer {
         bytes_sent: Arc<AtomicU64>,
         chunks_sent: Arc<AtomicU64>,
     ) -> Result<()> {
+        // Don't send anything if there are no chunks for this stream
+        if start_chunk >= end_chunk {
+            debug!("📤 Stream {} has no chunks to send, skipping", stream_idx);
+            stream.finish()?;
+            return Ok(());
+        }
+        
         let mut file = tokio::fs::File::open(&file_path).await?;
         let mut buffer = vec![0u8; chunk_size as usize];
         
