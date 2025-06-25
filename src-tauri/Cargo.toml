@@ -41,6 +41,7 @@ gethostname = "1.0.2"
 global-hotkey = "0.5"
 crossbeam-channel = "0.5"
 lazy_static = "1.4"
+dashmap = "5.5"
 # Compression support
 zstd = "0.13"
 lz4 = "1.24"

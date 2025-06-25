@@ -2,7 +2,7 @@ use crate::{
     config::Settings,
     network::{discovery::DeviceInfo, protocol::*},
     quic::{
-        OptimizedTransfer, OptimizedReceiver, QuicConnection, QuicConnectionManager,
+        BlazingTransfer, QuicConnectionManager,
         StreamManager,
     },
     FileshareError, Result,
@@ -10,10 +10,10 @@ use crate::{
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, RwLock};
-use tokio::time::{interval, timeout};
+use tokio::time::timeout;
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
@@ -367,7 +367,7 @@ impl PeerManager {
 
         // Use optimized transfer
         tokio::spawn(async move {
-            if let Err(e) = OptimizedTransfer::transfer_file(
+            if let Err(e) = BlazingTransfer::transfer_file(
                 stream_manager,
                 file_path,
                 String::new(), // Target path will be determined by receiver
@@ -377,7 +377,7 @@ impl PeerManager {
             }
         });
 
-        info!("Started optimized QUIC file transfer to peer {}", peer_id);
+        info!("Started BLAZING QUIC file transfer to peer {}", peer_id);
         Ok(())
     }
 
@@ -780,11 +780,11 @@ impl PeerManager {
                     let source_path_clone = source_path.clone();
                     let target_path_clone = target_path.clone();
                     
-                    info!("🚀 Starting optimized QUIC transfer: {} -> {}", file_path, target_path);
+                    info!("🚀 Starting BLAZING QUIC transfer: {} -> {}", file_path, target_path);
                     
                     // Start optimized transfer
                     tokio::spawn(async move {
-                        if let Err(e) = OptimizedTransfer::transfer_file(
+                        if let Err(e) = BlazingTransfer::transfer_file(
                             stream_manager,
                             source_path_clone,
                             target_path_clone,
@@ -794,7 +794,7 @@ impl PeerManager {
                         }
                     });
                     
-                    info!("✅ Optimized transfer initiated: {} -> {}", file_path, target_path);
+                    info!("✅ BLAZING transfer initiated: {} -> {}", file_path, target_path);
                 } else {
                     error!("❌ No stream manager found for peer {}", resolved_peer_id);
                 }

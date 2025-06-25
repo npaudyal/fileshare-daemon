@@ -127,9 +127,9 @@ impl StreamManager {
         
         match stream_type {
             StreamType::FileTransfer => {
-                // Use optimized receiver for all file transfers
-                if let Err(e) = crate::quic::OptimizedReceiver::handle_incoming_transfer(recv).await {
-                    error!("Failed to handle optimized transfer: {}", e);
+                // Use blazing receiver for maximum performance
+                if let Err(e) = crate::quic::BlazingReceiver::handle_incoming_transfer(recv).await {
+                    error!("Failed to handle blazing transfer: {}", e);
                 }
             }
             _ => {
