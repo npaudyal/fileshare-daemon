@@ -148,14 +148,23 @@ impl BlazingTransfer {
         let mut handles = Vec::new();
         let chunks_per_stream = (total_chunks + optimal_streams as u64 - 1) / optimal_streams as u64;
         
-        for (stream_idx, stream) in streams.into_iter().enumerate() {
-            let start_chunk = stream_idx as u64 * chunks_per_stream;
-            let end_chunk = ((stream_idx + 1) as u64 * chunks_per_stream).min(total_chunks);
-            
-            if start_chunk >= total_chunks {
-                break;
-            }
-            
+        // Only use streams that actually have chunks
+        let effective_streams = streams.into_iter().enumerate()
+            .filter_map(|(stream_idx, stream)| {
+                let start_chunk = stream_idx as u64 * chunks_per_stream;
+                if start_chunk < total_chunks {
+                    let end_chunk = ((stream_idx + 1) as u64 * chunks_per_stream).min(total_chunks);
+                    Some((stream_idx, stream, start_chunk, end_chunk))
+                } else {
+                    None
+                }
+            })
+            .collect::<Vec<_>>();
+        
+        info!("🚀 Using {} streams out of {} requested for {} chunks", 
+              effective_streams.len(), optimal_streams, total_chunks);
+        
+        for (stream_idx, stream, start_chunk, end_chunk) in effective_streams {
             let file_path = source_path.clone();
             let bytes_sent = bytes_sent.clone();
             let chunks_sent = chunks_sent.clone();
@@ -306,10 +315,16 @@ impl BlazingTransfer {
             0..=50_000_000 => 4,                     // 4 streams for small files
             50_000_001..=200_000_000 => 8,           // 8 streams for medium files  
             200_000_001..=1_000_000_000 => 16,       // 16 streams for large files
-            _ => 24,                                  // 24 streams for very large files
+            _ => 32,                                  // 32 streams for very large files
         };
         
-        base_streams.min(MAX_PARALLEL_STREAMS).min(total_chunks as usize)
+        // Never create more streams than chunks, and ensure at least 2 chunks per stream
+        let optimal = base_streams.min(MAX_PARALLEL_STREAMS).min(total_chunks as usize);
+        if total_chunks < 2 {
+            1
+        } else {
+            optimal.min(total_chunks as usize / 2).max(1)
+        }
     }
 }
 
@@ -412,12 +427,15 @@ impl BlazingReceiver {
             tokio::time::sleep(Duration::from_millis(10)).await;
         };
         
-        // Process chunks
+        // Process chunks (if any)
         loop {
             let mut chunk_header = [0u8; 12]; // chunk_id (8) + size (4)
             match recv_stream.read_exact(&mut chunk_header).await {
                 Ok(_) => {},
-                Err(_) => break,
+                Err(_) => {
+                    debug!("📥 Stream ended (no chunks or end of chunks)");
+                    break;
+                }
             }
             
             let chunk_id = u64::from_be_bytes(chunk_header[0..8].try_into().unwrap());
@@ -428,9 +446,18 @@ impl BlazingReceiver {
             }
             
             let mut chunk_data = vec![0u8; chunk_size];
-            recv_stream.read_exact(&mut chunk_data).await?;
+            match recv_stream.read_exact(&mut chunk_data).await {
+                Ok(_) => {},
+                Err(e) => {
+                    debug!("📥 Failed to read chunk data: {}", e);
+                    break;
+                }
+            }
             
-            state.chunk_writer.send((chunk_id, chunk_data)).await?;
+            if let Err(e) = state.chunk_writer.send((chunk_id, chunk_data)).await {
+                debug!("📥 Failed to send chunk to writer: {}", e);
+                break;
+            }
             
             let received = state.received_chunks.fetch_add(1, Ordering::Relaxed) + 1;
             
@@ -442,6 +469,7 @@ impl BlazingReceiver {
             if received == state.total_chunks {
                 state.completed.store(true, Ordering::Relaxed);
                 info!("🎉 All chunks received for: {}", state.filename);
+                break;
             }
         }
         
