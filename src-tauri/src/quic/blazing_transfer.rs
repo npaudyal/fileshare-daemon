@@ -152,15 +152,18 @@ impl BlazingTransfer {
         let bytes_sent = Arc::new(AtomicU64::new(0));
         let active_streams = Arc::new(AtomicUsize::new(0));
         let chunks_sent = Arc::new(AtomicU64::new(0));
-        let (chunk_tx, _) = tokio::sync::broadcast::channel(total_chunks as usize);
+        
+        // Use mpsc instead of broadcast for chunk distribution
+        let (chunk_tx, chunk_rx) = mpsc::channel::<u64>(total_chunks as usize);
         
         // Fill chunk queue
         for chunk_idx in 0..total_chunks {
-            chunk_tx.send(chunk_idx).map_err(|e| FileshareError::Transfer(format!("Chunk send error: {e}")))?;
+            chunk_tx.send(chunk_idx).await
+                .map_err(|_| FileshareError::Transfer("Failed to send chunk index".to_string()))?;
         }
         
-        // Keep chunk_tx alive for creating receivers
-        let chunk_tx = Arc::new(chunk_tx);
+        // Wrap in Arc and Mutex for sharing
+        let chunk_rx = Arc::new(tokio::sync::Mutex::new(chunk_rx));
         
         // Progressive stream launcher
         let stream_manager_clone = stream_manager.clone();
@@ -168,13 +171,12 @@ impl BlazingTransfer {
         let bytes_sent_clone = bytes_sent.clone();
         let active_streams_clone = active_streams.clone();
         let chunks_sent_clone = chunks_sent.clone();
-        let chunk_tx_clone = chunk_tx.clone();
         
         let stream_launcher = tokio::spawn(async move {
             Self::progressive_stream_launcher(
                 stream_manager_clone,
                 file_path,
-                chunk_tx_clone,
+                chunk_rx,
                 chunk_size,
                 file_size,
                 total_chunks,
@@ -205,7 +207,7 @@ impl BlazingTransfer {
     async fn progressive_stream_launcher(
         stream_manager: Arc<StreamManager>,
         file_path: Arc<PathBuf>,
-        chunk_tx: Arc<tokio::sync::broadcast::Sender<u64>>,
+        chunk_rx: Arc<tokio::sync::Mutex<mpsc::Receiver<u64>>>,
         chunk_size: u64,
         file_size: u64,
         total_chunks: u64,
@@ -229,14 +231,14 @@ impl BlazingTransfer {
                 let bytes_sent = bytes_sent.clone();
                 let active_streams = active_streams.clone();
                 let chunks_sent = chunks_sent.clone();
-                let mut chunk_rx = chunk_tx.subscribe();
+                let chunk_rx = chunk_rx.clone();
                 
                 let handle = tokio::spawn(async move {
                     let result = Self::stream_chunk_sender(
                         stream,
                         stream_idx,
                         file_path,
-                        &mut chunk_rx,
+                        chunk_rx,
                         chunk_size,
                         file_size,
                         bytes_sent,
@@ -271,14 +273,14 @@ impl BlazingTransfer {
                     let bytes_sent = bytes_sent.clone();
                     let active_streams_clone = active_streams.clone();
                     let chunks_sent = chunks_sent.clone();
-                    let mut chunk_rx = chunk_tx.subscribe();
+                    let chunk_rx = chunk_rx.clone();
                     
                     let handle = tokio::spawn(async move {
                         let result = Self::stream_chunk_sender(
                             stream,
                             current_streams - 1,
                             file_path,
-                            &mut chunk_rx,
+                            chunk_rx,
                             chunk_size,
                             file_size,
                             bytes_sent,
@@ -307,7 +309,7 @@ impl BlazingTransfer {
         mut stream: quinn::SendStream,
         stream_idx: usize,
         file_path: Arc<PathBuf>,
-        chunk_rx: &mut tokio::sync::broadcast::Receiver<u64>,
+        chunk_rx: Arc<tokio::sync::Mutex<mpsc::Receiver<u64>>>,
         chunk_size: u64,
         file_size: u64,
         bytes_sent: Arc<AtomicU64>,
@@ -318,34 +320,31 @@ impl BlazingTransfer {
         let mut sent_count = 0;
         
         loop {
-            match chunk_rx.recv().await {
-                Ok(chunk_idx) => {
-                    let chunk_offset = chunk_idx * chunk_size;
-                    file.seek(std::io::SeekFrom::Start(chunk_offset)).await?;
-                    
-                    let remaining = file_size.saturating_sub(chunk_offset);
-                    let bytes_to_read = std::cmp::min(chunk_size, remaining) as usize;
-                    
-                    file.read_exact(&mut buffer[..bytes_to_read]).await?;
-                    
-                    // Send: [chunk_id: u64][size: u32][data]
-                    stream.write_all(&chunk_idx.to_be_bytes()).await?;
-                    stream.write_all(&(bytes_to_read as u32).to_be_bytes()).await?;
-                    stream.write_all(&buffer[..bytes_to_read]).await?;
-                    
-                    bytes_sent.fetch_add(bytes_to_read as u64, Ordering::Relaxed);
-                    chunks_sent.fetch_add(1, Ordering::Relaxed);
-                    sent_count += 1;
+            // Get next chunk from shared receiver
+            let chunk_idx = {
+                let mut rx = chunk_rx.lock().await;
+                match rx.recv().await {
+                    Some(idx) => idx,
+                    None => break, // No more chunks
                 }
-                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
-                    // We missed some messages, but that's OK - other streams will handle them
-                    continue;
-                }
-                Err(tokio::sync::broadcast::error::RecvError::Closed) => {
-                    // All chunks have been sent
-                    break;
-                }
-            }
+            };
+            
+            let chunk_offset = chunk_idx * chunk_size;
+            file.seek(std::io::SeekFrom::Start(chunk_offset)).await?;
+            
+            let remaining = file_size.saturating_sub(chunk_offset);
+            let bytes_to_read = std::cmp::min(chunk_size, remaining) as usize;
+            
+            file.read_exact(&mut buffer[..bytes_to_read]).await?;
+            
+            // Send: [chunk_id: u64][size: u32][data]
+            stream.write_all(&chunk_idx.to_be_bytes()).await?;
+            stream.write_all(&(bytes_to_read as u32).to_be_bytes()).await?;
+            stream.write_all(&buffer[..bytes_to_read]).await?;
+            
+            bytes_sent.fetch_add(bytes_to_read as u64, Ordering::Relaxed);
+            chunks_sent.fetch_add(1, Ordering::Relaxed);
+            sent_count += 1;
         }
         
         stream.finish()?;
