@@ -3,7 +3,7 @@ use crate::{FileshareError, Result};
 use dashmap::DashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicBool, Ordering};
 use std::time::{Instant, Duration};
 use tokio::io::{AsyncReadExt, AsyncWriteExt, AsyncSeekExt};
 use tokio::sync::{Semaphore, RwLock, mpsc};
@@ -379,9 +379,10 @@ impl BlazingReceiver {
             debug!("📥 Length {} not in control range, treating as data stream", first_len);
         }
         
-        // This is a data stream with filename header
-        debug!("📥 Processing as data stream with filename length: {}", first_len);
-        Self::process_data_stream_with_filename_direct(recv_stream, first_len).await
+        // This is a data stream - the first_len is actually chunk data, not filename length
+        let first_bytes = (first_len as u32).to_be_bytes();
+        debug!("📥 Processing as legacy data stream (first 4 bytes: {:?})", first_bytes);
+        Self::process_data_stream_legacy_direct(recv_stream, first_bytes).await
     }
     
     async fn receive_single_stream(
@@ -541,6 +542,68 @@ impl BlazingReceiver {
                 }
             }
         });
+        
+        Ok(())
+    }
+    
+    async fn process_data_stream_legacy_direct(
+        mut recv_stream: quinn::RecvStream,
+        first_bytes: [u8; 4],
+    ) -> Result<()> {
+        debug!("📥 Processing legacy data stream with first bytes: {:?}", first_bytes);
+        
+        // Wait for an active transfer to be available
+        let start_time = Instant::now();
+        let (transfer_key, state) = loop {
+            if let Some(entry) = ACTIVE_TRANSFERS.iter()
+                .find(|entry| !entry.value().completed.load(Ordering::Relaxed)) {
+                break (entry.key().clone(), entry.value().clone());
+            }
+            
+            if start_time.elapsed() > Duration::from_secs(10) {
+                return Err(FileshareError::Transfer("No active transfer found within timeout".to_string()));
+            }
+            
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        };
+        
+        debug!("📥 Found active transfer: {}", transfer_key);
+        
+        // The first_bytes are the first 4 bytes of chunk_id
+        let mut id_bytes = [0u8; 8];
+        id_bytes[..4].copy_from_slice(&first_bytes);
+        recv_stream.read_exact(&mut id_bytes[4..]).await?;
+        let chunk_id = u64::from_be_bytes(id_bytes);
+        
+        debug!("📥 Processing chunk {} for transfer: {}", chunk_id, transfer_key);
+        
+        // Read chunk size
+        let mut size_bytes = [0u8; 4];
+        recv_stream.read_exact(&mut size_bytes).await?;
+        let chunk_size = u32::from_be_bytes(size_bytes) as usize;
+        
+        if chunk_size > 100 * 1024 * 1024 {
+            return Err(FileshareError::Transfer(format!("Chunk too large: {} bytes", chunk_size)));
+        }
+        
+        // Read chunk data
+        let mut chunk_data = vec![0u8; chunk_size];
+        recv_stream.read_exact(&mut chunk_data).await?;
+        
+        // Send to writer
+        state.chunk_writer.send((chunk_id, chunk_data)).await?;
+        
+        let received = state.received_chunks.fetch_add(1, Ordering::Relaxed) + 1;
+        
+        if received % 10 == 0 || received == state.total_chunks {
+            let progress = (received as f64 / state.total_chunks as f64) * 100.0;
+            debug!("📊 Progress: {:.1}% ({}/{})", progress, received, state.total_chunks);
+        }
+        
+        if received == state.total_chunks {
+            state.completed.store(true, Ordering::Relaxed);
+            info!("🎉 All chunks received for: {}", state.filename);
+        }
         
         Ok(())
     }
