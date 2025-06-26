@@ -134,6 +134,9 @@ impl BlazingTransfer {
         let transfer_id = Uuid::new_v4().to_string();
         Self::send_control_message(control_stream, &filename, file_size, &target_path, chunk_size, total_chunks, &transfer_id).await?;
         
+        // Small delay to ensure control message is processed before data streams
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+        
         // Open data streams
         let data_streams = stream_manager.open_file_transfer_streams(stream_count).await?;
         
@@ -349,6 +352,7 @@ impl BlazingReceiver {
         // Check for data stream magic bytes
         if first_bytes == [0xDA, 0x7A, 0x57, 0x12] {
             // This is a data stream
+            info!("🔄 Detected data stream with magic bytes");
             return Self::process_data_stream_direct(recv_stream).await;
         }
         
@@ -367,6 +371,7 @@ impl BlazingReceiver {
             .map_err(|_| FileshareError::Transfer("Invalid UTF-8 in header".to_string()))?;
         
         let parts: Vec<&str> = header.split('|').collect();
+        info!("📨 Received control message: {}", parts[0]);
         match parts[0] {
             "BLAZING_SINGLE" => Self::receive_single_stream(recv_stream, &parts).await,
             "BLAZING_PARALLEL" => Self::receive_parallel_control(recv_stream, &parts).await,
@@ -469,7 +474,8 @@ impl BlazingReceiver {
             transfer_id: transfer_id.clone(),
         });
         
-        ACTIVE_TRANSFERS.insert(transfer_id, state);
+        ACTIVE_TRANSFERS.insert(transfer_id.clone(), state);
+        info!("✅ Registered transfer {} in ACTIVE_TRANSFERS", transfer_id);
         Ok(())
     }
     
@@ -489,9 +495,16 @@ impl BlazingReceiver {
         let transfer_id = String::from_utf8(id_bytes)
             .map_err(|_| FileshareError::Transfer("Invalid UTF-8 in transfer ID".to_string()))?;
         
-        let state = ACTIVE_TRANSFERS.get(&transfer_id)
-            .ok_or_else(|| FileshareError::Transfer(format!("Transfer {} not found", transfer_id)))?
-            .clone();
+        info!("📥 Received data stream for transfer ID: {}", transfer_id);
+        
+        let state = match ACTIVE_TRANSFERS.get(&transfer_id) {
+            Some(state) => state.clone(),
+            None => {
+                error!("Transfer {} not found in ACTIVE_TRANSFERS. Active transfers: {:?}", 
+                       transfer_id, ACTIVE_TRANSFERS.iter().map(|e| e.key().clone()).collect::<Vec<_>>());
+                return Err(FileshareError::Transfer(format!("Transfer {} not found", transfer_id)));
+            }
+        };
         
         // Process chunks directly without spawning tasks
         loop {
