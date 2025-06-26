@@ -9,6 +9,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt, AsyncSeekExt};
 use tokio::sync::Semaphore;
 use tracing::{debug, error, info};
 use uuid::Uuid;
+use quinn::{SendStream, RecvStream};
 #[cfg(unix)]
 use std::os::unix::fs::FileExt;
 #[cfg(windows)]
@@ -145,16 +146,16 @@ impl BlazingTransfer {
         let file_path = Arc::new(source_path);
         let transfer_id = Arc::new(transfer_id);
         
+        // Better chunk distribution for even load balancing
+        let base_chunks = total_chunks / stream_count as u64;
+        let extra_chunks = total_chunks % stream_count as u64;
+        
         for (stream_idx, stream) in data_streams.into_iter().enumerate() {
             let file_path = file_path.clone();
             let bytes_sent = bytes_sent.clone();
             let transfer_id = transfer_id.clone();
             
-            // Better chunk distribution for even load balancing
-            let base_chunks = total_chunks / stream_count as u64;
-            let extra_chunks = total_chunks % stream_count as u64;
-            
-            let start_chunk = if stream_idx as u64 <= extra_chunks {
+            let start_chunk = if (stream_idx as u64) < extra_chunks {
                 stream_idx as u64 * (base_chunks + 1)
             } else {
                 extra_chunks * (base_chunks + 1) + (stream_idx as u64 - extra_chunks) * base_chunks
@@ -225,7 +226,7 @@ impl BlazingTransfer {
     
     /// Send control message with transfer ID
     async fn send_control_message(
-        mut stream: quinn::SendStream,
+        mut stream: SendStream,
         filename: &str,
         file_size: u64,
         target_path: &str,
@@ -248,9 +249,9 @@ impl BlazingTransfer {
         Ok(())
     }
     
-    /// Send chunks with maximum performance and transfer ID
+    /// Send chunks with maximum performance - using special protocol for data streams
     async fn send_chunks_blazing(
-        mut stream: quinn::SendStream,
+        mut stream: SendStream,
         file_path: Arc<PathBuf>,
         start_chunk: u64,
         end_chunk: u64,
@@ -260,13 +261,17 @@ impl BlazingTransfer {
         bytes_sent: Arc<AtomicU64>,
         transfer_id: &str,
     ) -> Result<()> {
-        // Send stream header with transfer ID
-        let stream_header = format!("DATA_STREAM|{}", transfer_id);
-        let header_bytes = stream_header.as_bytes();
-        stream.write_all(&(header_bytes.len() as u32).to_be_bytes()).await
-            .map_err(|e| FileshareError::Transfer(format!("Failed to write stream header length: {}", e)))?;
-        stream.write_all(header_bytes).await
-            .map_err(|e| FileshareError::Transfer(format!("Failed to write stream header: {}", e)))?;
+        // Send a special marker to indicate this is a data stream with transfer ID
+        // Format: MAGIC_BYTES (4) + transfer_id length (4) + transfer_id + chunks
+        const MAGIC_BYTES: [u8; 4] = [0xDA, 0x7A, 0x57, 0x12]; // "DATA_STREAM" magic
+        stream.write_all(&MAGIC_BYTES).await
+            .map_err(|e| FileshareError::Transfer(format!("Failed to write magic bytes: {}", e)))?;
+        
+        let id_bytes = transfer_id.as_bytes();
+        stream.write_all(&(id_bytes.len() as u32).to_be_bytes()).await
+            .map_err(|e| FileshareError::Transfer(format!("Failed to write transfer ID length: {}", e)))?;
+        stream.write_all(id_bytes).await
+            .map_err(|e| FileshareError::Transfer(format!("Failed to write transfer ID: {}", e)))?;
         
         let mut file = tokio::fs::File::open(file_path.as_ref()).await?;
         let mut buffer = vec![0u8; chunk_size as usize];
@@ -326,7 +331,7 @@ struct TransferState {
     received_chunks: AtomicU64,
     write_semaphore: Arc<Semaphore>,
     completed: AtomicBool,
-    transfer_id: String, // Add unique transfer ID
+    transfer_id: String,
 }
 
 // Use DashMap for lock-free concurrent access
@@ -335,17 +340,23 @@ lazy_static::lazy_static! {
 }
 
 impl BlazingReceiver {
-    pub async fn handle_incoming_transfer(mut recv_stream: quinn::RecvStream) -> Result<()> {
-        // Read header length
-        let mut len_bytes = [0u8; 4];
-        recv_stream.read_exact(&mut len_bytes).await
-            .map_err(|e| FileshareError::Transfer(format!("Failed to read header length: {}", e)))?;
-        let header_len = u32::from_be_bytes(len_bytes) as usize;
+    pub async fn handle_incoming_transfer(mut recv_stream: RecvStream) -> Result<()> {
+        // First, check if this is a data stream by looking for magic bytes
+        let mut first_bytes = [0u8; 4];
+        recv_stream.read_exact(&mut first_bytes).await
+            .map_err(|e| FileshareError::Transfer(format!("Failed to read initial bytes: {}", e)))?;
         
-        // Check if this is a data stream (no header)
-        if header_len < 10 || header_len > 1000 {
-            // This is a data stream, process chunks
-            return Self::process_data_stream(recv_stream, len_bytes).await;
+        // Check for data stream magic bytes
+        if first_bytes == [0xDA, 0x7A, 0x57, 0x12] {
+            // This is a data stream
+            return Self::process_data_stream_direct(recv_stream).await;
+        }
+        
+        // Otherwise, it's a control stream with header length
+        let header_len = u32::from_be_bytes(first_bytes) as usize;
+        
+        if header_len > 1000 {
+            return Err(FileshareError::Transfer("Invalid header length".to_string()));
         }
         
         // Read header
@@ -365,7 +376,7 @@ impl BlazingReceiver {
     
     /// Handle single stream transfer
     async fn receive_single_stream(
-        mut recv_stream: quinn::RecvStream,
+        mut recv_stream: RecvStream,
         parts: &[&str],
     ) -> Result<()> {
         if parts.len() < 4 {
@@ -408,7 +419,7 @@ impl BlazingReceiver {
     
     /// Initialize parallel transfer with lock-free file access
     async fn receive_parallel_control(
-        _recv_stream: quinn::RecvStream,
+        _recv_stream: RecvStream,
         parts: &[&str],
     ) -> Result<()> {
         if parts.len() < 7 {
@@ -462,26 +473,22 @@ impl BlazingReceiver {
         Ok(())
     }
     
-    /// Process data stream with true parallel writes
-    async fn process_data_stream(
-        mut recv_stream: quinn::RecvStream,
-        len_bytes: [u8; 4],
+    /// Process data stream directly with magic bytes protocol
+    async fn process_data_stream_direct(
+        mut recv_stream: RecvStream,
     ) -> Result<()> {
-        let header_len = u32::from_be_bytes(len_bytes) as usize;
+        // Read transfer ID length and ID
+        let mut id_len_bytes = [0u8; 4];
+        recv_stream.read_exact(&mut id_len_bytes).await
+            .map_err(|e| FileshareError::Transfer(format!("Failed to read transfer ID length: {}", e)))?;
+        let id_len = u32::from_be_bytes(id_len_bytes) as usize;
         
-        // Read stream header to get transfer ID
-        let mut header_bytes = vec![0u8; header_len];
-        recv_stream.read_exact(&mut header_bytes).await
-            .map_err(|e| FileshareError::Transfer(format!("Failed to read stream header: {}", e)))?;
-        let header = String::from_utf8(header_bytes)
-            .map_err(|_| FileshareError::Transfer("Invalid UTF-8 in stream header".to_string()))?;
+        let mut id_bytes = vec![0u8; id_len];
+        recv_stream.read_exact(&mut id_bytes).await
+            .map_err(|e| FileshareError::Transfer(format!("Failed to read transfer ID: {}", e)))?;
+        let transfer_id = String::from_utf8(id_bytes)
+            .map_err(|_| FileshareError::Transfer("Invalid UTF-8 in transfer ID".to_string()))?;
         
-        let parts: Vec<&str> = header.split('|').collect();
-        if parts.len() < 2 || parts[0] != "DATA_STREAM" {
-            return Err(FileshareError::Transfer("Invalid data stream header".to_string()));
-        }
-        
-        let transfer_id = parts[1].to_string();
         let state = ACTIVE_TRANSFERS.get(&transfer_id)
             .ok_or_else(|| FileshareError::Transfer(format!("Transfer {} not found", transfer_id)))?
             .clone();
