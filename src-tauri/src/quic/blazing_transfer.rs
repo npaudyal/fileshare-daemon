@@ -11,7 +11,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
-use tokio::sync::{Semaphore, Mutex};
+use tokio::sync::{Semaphore, Mutex, mpsc};
 use tracing::{debug, error, info};
 use uuid::Uuid;
 
@@ -20,7 +20,7 @@ const SMALL_FILE_THRESHOLD: u64 = 10 * 1024 * 1024; // 10MB
 const OPTIMAL_CHUNK_SIZE: u64 = 16 * 1024 * 1024; // 16MB default for blazing speed
 const MAX_PARALLEL_STREAMS: usize = 64; // More streams for better parallelism
 const MAX_MEMORY_BUFFER: usize = 256 * 1024 * 1024; // 256MB max memory usage
-const WRITE_CONCURRENCY: usize = 32; // Concurrent disk writes
+const WRITE_CONCURRENCY: usize = 4; // Concurrent disk writes - reduced for macOS SSD performance
 
 pub struct BlazingTransfer;
 
@@ -609,10 +609,18 @@ impl BlazingTransfer {
     }
 }
 
+/// Write operation for batching
+#[derive(Debug)]
+struct WriteOperation {
+    chunk_id: u64,
+    offset: u64,
+    data: Vec<u8>,
+}
+
 /// Blazing fast receiver with true parallel writes
 pub struct BlazingReceiver;
 
-// Per-transfer state with lock-free file access on Unix
+// Per-transfer state with optimized write queue
 struct TransferState {
     filename: String,
     file_size: u64,
@@ -625,6 +633,7 @@ struct TransferState {
     file: Arc<std::sync::Mutex<std::fs::File>>, // Need mutex on Windows
     received_chunks: AtomicU64,
     write_semaphore: Arc<Semaphore>,
+    write_queue_tx: mpsc::UnboundedSender<WriteOperation>,
     completed: AtomicBool,
     transfer_id: String,
 }
@@ -771,6 +780,9 @@ impl BlazingReceiver {
         file.sync_all()
             .map_err(|e| FileshareError::Transfer(format!("Failed to sync file: {}", e)))?;
 
+        // Create write queue for batched operations
+        let (write_queue_tx, mut write_queue_rx) = mpsc::unbounded_channel::<WriteOperation>();
+
         // Create transfer state with platform-specific file handling
         let state = Arc::new(TransferState {
             filename: filename.clone(),
@@ -785,7 +797,14 @@ impl BlazingReceiver {
             received_chunks: AtomicU64::new(0),
             write_semaphore: Arc::new(Semaphore::new(WRITE_CONCURRENCY)),
             completed: AtomicBool::new(false),
+            write_queue_tx,
             transfer_id: transfer_id.clone(),
+        });
+
+        // Start write queue worker for batched disk operations
+        let state_clone = state.clone();
+        tokio::spawn(async move {
+            Self::write_queue_worker(state_clone, write_queue_rx).await;
         });
 
         ACTIVE_TRANSFERS.insert(transfer_id.clone(), state);
@@ -864,94 +883,120 @@ impl BlazingReceiver {
                 FileshareError::Transfer(format!("Failed to read chunk data: {}", e))
             })?;
 
-            // Write chunk directly with pwrite (no mutex needed)
-            Self::write_chunk_direct(state.clone(), chunk_id, chunk_data).await?;
+            // Send chunk to write queue for batched processing
+            let offset = chunk_id * state.chunk_size;
+            let write_operation = WriteOperation {
+                chunk_id,
+                offset,
+                data: chunk_data,
+            };
+
+            if let Err(e) = state.write_queue_tx.send(write_operation) {
+                error!("Failed to queue write operation: {}", e);
+                return Err(FileshareError::Transfer(format!(
+                    "Failed to queue write operation: {}", e
+                )));
+            }
         }
 
         Ok(())
     }
 
-    /// Write chunk directly with pwrite for true parallelism (no mutex)
-    async fn write_chunk_direct(
+
+    /// Write queue worker for batched disk operations
+    async fn write_queue_worker(
         state: Arc<TransferState>,
-        chunk_id: u64,
-        data: Vec<u8>,
-    ) -> Result<()> {
-        // Acquire write permit to control memory usage
-        let _permit =
-            state.write_semaphore.acquire().await.map_err(|_| {
-                FileshareError::Transfer("Failed to acquire write permit".to_string())
-            })?;
+        mut write_queue_rx: mpsc::UnboundedReceiver<WriteOperation>,
+    ) {
+        info!("🔧 Starting write queue worker for transfer {}", state.transfer_id);
+        
+        while let Some(operation) = write_queue_rx.recv().await {
+            // Acquire write permit to control concurrent disk operations
+            let _permit = match state.write_semaphore.acquire().await {
+                Ok(permit) => permit,
+                Err(_) => {
+                    error!("Failed to acquire write permit for transfer {}", state.transfer_id);
+                    continue;
+                }
+            };
 
-        let offset = chunk_id * state.chunk_size;
-        let file = state.file.clone();
-        let state_clone = state.clone();
-
-        // Use blocking task for pwrite since it's not async
-        tokio::task::spawn_blocking(move || {
-            // Use pwrite for position-independent parallel writes
-            #[cfg(unix)]
-            {
-                file.write_at(&data, offset).map_err(|e| {
-                    FileshareError::Transfer(format!("Failed to write chunk {}: {}", chunk_id, e))
-                })
-            }
-            #[cfg(windows)]
-            {
-                use std::io::{Seek, SeekFrom, Write};
-                let mut file = file.lock().unwrap();
-                file.seek(SeekFrom::Start(offset))
-                    .map_err(|e| FileshareError::Transfer(format!("Failed to seek: {}", e)))?;
-                file.write_all(&data).map_err(|e| {
-                    FileshareError::Transfer(format!("Failed to write chunk {}: {}", chunk_id, e))
-                })
-            }
-        })
-        .await
-        .map_err(|e| FileshareError::Transfer(format!("Task join error: {}", e)))??;
-
-        // Update progress
-        let received = state.received_chunks.fetch_add(1, Ordering::Relaxed) + 1;
-
-        if received % 10 == 0 || received == state.total_chunks {
-            let progress = (received as f64 / state.total_chunks as f64) * 100.0;
-            info!(
-                "📊 Progress: {:.1}% ({}/{})",
-                progress, received, state.total_chunks
-            );
-        }
-
-        // Check completion
-        if received == state.total_chunks {
             let file = state.file.clone();
-            let filename = state.filename.clone();
-            let transfer_id = state.transfer_id.clone();
+            let chunk_id = operation.chunk_id;
+            let offset = operation.offset;
+            let data = operation.data;
+            let state_clone = state.clone();
 
-            tokio::task::spawn_blocking(move || {
+            // Perform the write in a blocking task
+            let write_result = tokio::task::spawn_blocking(move || {
                 #[cfg(unix)]
                 {
-                    file.sync_all().map_err(|e| {
-                        FileshareError::Transfer(format!("Failed to sync file: {}", e))
+                    file.write_at(&data, offset).map_err(|e| {
+                        FileshareError::Transfer(format!("Failed to write chunk {}: {}", chunk_id, e))
                     })
                 }
                 #[cfg(windows)]
                 {
-                    let file = file.lock().unwrap();
-                    file.sync_all().map_err(|e| {
-                        FileshareError::Transfer(format!("Failed to sync file: {}", e))
+                    use std::io::{Seek, SeekFrom, Write};
+                    let mut file = file.lock().unwrap();
+                    file.seek(SeekFrom::Start(offset))
+                        .map_err(|e| FileshareError::Transfer(format!("Failed to seek: {}", e)))?;
+                    file.write_all(&data).map_err(|e| {
+                        FileshareError::Transfer(format!("Failed to write chunk {}: {}", chunk_id, e))
                     })
                 }
-            })
-            .await
-            .map_err(|e| FileshareError::Transfer(format!("Task join error: {}", e)))??;
+            }).await;
 
-            state.completed.store(true, Ordering::Relaxed);
-            info!("🎉 BLAZING transfer complete: {}", filename);
+            match write_result {
+                Ok(Ok(_)) => {
+                    // Update progress
+                    let received = state_clone.received_chunks.fetch_add(1, Ordering::Relaxed) + 1;
 
-            // Cleanup
-            ACTIVE_TRANSFERS.remove(&transfer_id);
+                    if received % 10 == 0 || received == state_clone.total_chunks {
+                        let progress = (received as f64 / state_clone.total_chunks as f64) * 100.0;
+                        info!(
+                            "📊 Progress: {:.1}% ({}/{})",
+                            progress, received, state_clone.total_chunks
+                        );
+                    }
+
+                    // Check completion
+                    if received == state_clone.total_chunks {
+                        let file = state_clone.file.clone();
+                        let filename = state_clone.filename.clone();
+                        let transfer_id = state_clone.transfer_id.clone();
+
+                        let sync_result = tokio::task::spawn_blocking(move || {
+                            #[cfg(unix)]
+                            {
+                                file.sync_all().map_err(|e| {
+                                    FileshareError::Transfer(format!("Failed to sync file: {}", e))
+                                })
+                            }
+                            #[cfg(windows)]
+                            {
+                                let file = file.lock().unwrap();
+                                file.sync_all().map_err(|e| {
+                                    FileshareError::Transfer(format!("Failed to sync file: {}", e))
+                                })
+                            }
+                        }).await;
+
+                        match sync_result {
+                            Ok(Ok(_)) => {
+                                state_clone.completed.store(true, Ordering::Relaxed);
+                                info!("🎉 BLAZING transfer complete: {}", filename);
+                                ACTIVE_TRANSFERS.remove(&transfer_id);
+                            }
+                            Ok(Err(e)) => error!("Failed to sync file: {}", e),
+                            Err(e) => error!("Sync task failed: {}", e),
+                        }
+                    }
+                }
+                Ok(Err(e)) => error!("Write operation failed: {}", e),
+                Err(e) => error!("Write task failed: {}", e),
+            }
         }
 
-        Ok(())
+        info!("🔧 Write queue worker finished for transfer {}", state.transfer_id);
     }
 }
