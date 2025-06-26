@@ -6,7 +6,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicBool, Ordering};
 use std::time::Instant;
 use tokio::io::{AsyncReadExt, AsyncWriteExt, AsyncSeekExt};
-use tokio::sync::Semaphore;
+use tokio::sync::{Semaphore, Mutex};
 use tracing::{debug, error, info};
 use uuid::Uuid;
 use quinn::{SendStream, RecvStream};
@@ -121,7 +121,16 @@ impl BlazingTransfer {
         // Calculate optimal parameters
         let chunk_size = Self::calculate_optimal_chunk_size(file_size);
         let total_chunks = (file_size + chunk_size - 1) / chunk_size;
-        let stream_count = std::cmp::min(MAX_PARALLEL_STREAMS, total_chunks as usize);
+        // Limit streams to ensure each stream gets meaningful work
+        let max_streams = std::cmp::min(MAX_PARALLEL_STREAMS, total_chunks as usize);
+        // Ensure we don't have too many streams for the amount of work
+        let stream_count = if total_chunks <= 4 {
+            std::cmp::min(2, max_streams) // For small files, use at most 2 streams
+        } else if total_chunks <= 10 {
+            std::cmp::min(total_chunks as usize / 2, max_streams) // Use half as many streams as chunks
+        } else {
+            std::cmp::min(max_streams, 16) // Cap at 16 streams for better balance
+        };
         
         info!("🚀 BLAZING parallel transfer: {} streams, {} chunks of {:.1} MB each", 
               stream_count, total_chunks, chunk_size as f64 / (1024.0 * 1024.0));
@@ -135,7 +144,7 @@ impl BlazingTransfer {
         Self::send_control_message(control_stream, &filename, file_size, &target_path, chunk_size, total_chunks, &transfer_id).await?;
         
         // Small delay to ensure control message is processed before data streams
-        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
         
         // Open data streams
         let data_streams = stream_manager.open_file_transfer_streams(stream_count).await?;
@@ -144,44 +153,25 @@ impl BlazingTransfer {
         let bytes_sent = Arc::new(AtomicU64::new(0));
         let start_time = Instant::now();
         
-        // Launch parallel senders
+        // Create a work queue for chunks
+        let chunk_queue = Arc::new(Mutex::new((0..total_chunks).collect::<Vec<_>>()));
+        
+        // Launch parallel senders with work-stealing
         let mut handles = Vec::new();
         let file_path = Arc::new(source_path);
         let transfer_id = Arc::new(transfer_id);
-        
-        // Better chunk distribution for even load balancing
-        let base_chunks = total_chunks / stream_count as u64;
-        let extra_chunks = total_chunks % stream_count as u64;
         
         for (stream_idx, stream) in data_streams.into_iter().enumerate() {
             let file_path = file_path.clone();
             let bytes_sent = bytes_sent.clone();
             let transfer_id = transfer_id.clone();
-            
-            let start_chunk = if (stream_idx as u64) < extra_chunks {
-                stream_idx as u64 * (base_chunks + 1)
-            } else {
-                extra_chunks * (base_chunks + 1) + (stream_idx as u64 - extra_chunks) * base_chunks
-            };
-            
-            let chunks_for_this_stream = if (stream_idx as u64) < extra_chunks {
-                base_chunks + 1
-            } else {
-                base_chunks
-            };
-            
-            let end_chunk = start_chunk + chunks_for_this_stream;
-            
-            if start_chunk >= total_chunks {
-                continue;
-            }
+            let chunk_queue = chunk_queue.clone();
             
             let handle = tokio::spawn(async move {
-                Self::send_chunks_blazing(
+                Self::send_chunks_work_stealing(
                     stream,
                     file_path,
-                    start_chunk,
-                    end_chunk,
+                    chunk_queue,
                     chunk_size,
                     file_size,
                     stream_idx,
@@ -252,6 +242,72 @@ impl BlazingTransfer {
         Ok(())
     }
     
+    /// Send chunks with work-stealing for better load balancing
+    async fn send_chunks_work_stealing(
+        mut stream: SendStream,
+        file_path: Arc<PathBuf>,
+        chunk_queue: Arc<Mutex<Vec<u64>>>,
+        chunk_size: u64,
+        file_size: u64,
+        stream_idx: usize,
+        bytes_sent: Arc<AtomicU64>,
+        transfer_id: &str,
+    ) -> Result<()> {
+        // Send a special marker to indicate this is a data stream with transfer ID
+        // Format: MAGIC_BYTES (4) + transfer_id length (4) + transfer_id + chunks
+        const MAGIC_BYTES: [u8; 4] = [0xDA, 0x7A, 0x57, 0x12]; // "DATA_STREAM" magic
+        stream.write_all(&MAGIC_BYTES).await
+            .map_err(|e| FileshareError::Transfer(format!("Failed to write magic bytes: {}", e)))?;
+        
+        let id_bytes = transfer_id.as_bytes();
+        stream.write_all(&(id_bytes.len() as u32).to_be_bytes()).await
+            .map_err(|e| FileshareError::Transfer(format!("Failed to write transfer ID length: {}", e)))?;
+        stream.write_all(id_bytes).await
+            .map_err(|e| FileshareError::Transfer(format!("Failed to write transfer ID: {}", e)))?;
+        
+        let mut file = tokio::fs::File::open(file_path.as_ref()).await?;
+        let mut buffer = vec![0u8; chunk_size as usize];
+        let mut chunks_sent = 0u64;
+        
+        // Work-stealing loop
+        loop {
+            // Try to get a chunk from the queue
+            let chunk_idx = {
+                let mut queue = chunk_queue.lock().await;
+                queue.pop()
+            };
+            
+            let Some(chunk_idx) = chunk_idx else {
+                break; // No more work
+            };
+            
+            let chunk_offset = chunk_idx * chunk_size;
+            file.seek(std::io::SeekFrom::Start(chunk_offset)).await?;
+            
+            let remaining = file_size.saturating_sub(chunk_offset);
+            let bytes_to_read = std::cmp::min(chunk_size, remaining) as usize;
+            
+            file.read_exact(&mut buffer[..bytes_to_read]).await
+                .map_err(|e| FileshareError::FileOperation(format!("Failed to read file chunk: {}", e)))?;
+            
+            // Send: [chunk_id: u64][size: u32][data]
+            stream.write_all(&chunk_idx.to_be_bytes()).await
+                .map_err(|e| FileshareError::Transfer(format!("Failed to write chunk ID: {}", e)))?;
+            stream.write_all(&(bytes_to_read as u32).to_be_bytes()).await
+                .map_err(|e| FileshareError::Transfer(format!("Failed to write chunk size: {}", e)))?;
+            stream.write_all(&buffer[..bytes_to_read]).await
+                .map_err(|e| FileshareError::Transfer(format!("Failed to write chunk data: {}", e)))?;
+            
+            bytes_sent.fetch_add(bytes_to_read as u64, Ordering::Relaxed);
+            chunks_sent += 1;
+        }
+        
+        stream.finish()
+            .map_err(|e| FileshareError::Transfer(format!("Failed to finish stream: {}", e)))?;
+        debug!("✅ Stream {} completed: sent {} chunks", stream_idx, chunks_sent);
+        Ok(())
+    }
+    
     /// Send chunks with maximum performance - using special protocol for data streams
     async fn send_chunks_blazing(
         mut stream: SendStream,
@@ -309,10 +365,11 @@ impl BlazingTransfer {
     /// Calculate optimal chunk size for maximum throughput
     fn calculate_optimal_chunk_size(file_size: u64) -> u64 {
         match file_size {
-            0..=100_000_000 => 8 * 1024 * 1024,           // <= 100MB: 8MB chunks
-            100_000_001..=500_000_000 => 16 * 1024 * 1024,  // 100-500MB: 16MB chunks
-            500_000_001..=2_000_000_000 => 32 * 1024 * 1024, // 500MB-2GB: 32MB chunks
-            _ => 64 * 1024 * 1024,                        // > 2GB: 64MB chunks
+            0..=50_000_000 => 4 * 1024 * 1024,              // <= 50MB: 4MB chunks
+            50_000_001..=200_000_000 => 8 * 1024 * 1024,    // 50-200MB: 8MB chunks
+            200_000_001..=500_000_000 => 16 * 1024 * 1024,  // 200-500MB: 16MB chunks
+            500_000_001..=1_000_000_000 => 32 * 1024 * 1024, // 500MB-1GB: 32MB chunks
+            _ => 64 * 1024 * 1024,                           // > 1GB: 64MB chunks
         }
     }
 }
