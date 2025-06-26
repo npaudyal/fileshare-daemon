@@ -6,7 +6,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicBool, Ordering};
 use std::time::Instant;
 use tokio::io::{AsyncReadExt, AsyncWriteExt, AsyncSeekExt};
-use tokio::sync::{Semaphore, Mutex};
+use tokio::sync::Semaphore;
 use tracing::{debug, error, info};
 use uuid::Uuid;
 use quinn::{SendStream, RecvStream};
@@ -126,10 +126,12 @@ impl BlazingTransfer {
         // Ensure we don't have too many streams for the amount of work
         let stream_count = if total_chunks <= 4 {
             std::cmp::min(2, max_streams) // For small files, use at most 2 streams
-        } else if total_chunks <= 10 {
-            std::cmp::min(total_chunks as usize / 2, max_streams) // Use half as many streams as chunks
+        } else if total_chunks <= 8 {
+            std::cmp::min(total_chunks as usize, max_streams) // Use same number of streams as chunks
+        } else if total_chunks <= 20 {
+            std::cmp::min(total_chunks as usize * 3 / 4, max_streams) // Use 75% as many streams as chunks
         } else {
-            std::cmp::min(max_streams, 16) // Cap at 16 streams for better balance
+            std::cmp::min(max_streams, 16) // Cap at 16 streams for larger files
         };
         
         info!("🚀 BLAZING parallel transfer: {} streams, {} chunks of {:.1} MB each", 
@@ -153,25 +155,46 @@ impl BlazingTransfer {
         let bytes_sent = Arc::new(AtomicU64::new(0));
         let start_time = Instant::now();
         
-        // Create a work queue for chunks
-        let chunk_queue = Arc::new(Mutex::new((0..total_chunks).collect::<Vec<_>>()));
+        // Distribute chunks as evenly as possible
+        let chunks_per_stream = total_chunks / stream_count as u64;
+        let extra_chunks = total_chunks % stream_count as u64;
         
-        // Launch parallel senders with work-stealing
+        let mut stream_chunks: Vec<Vec<u64>> = Vec::with_capacity(stream_count);
+        let mut chunk_idx = 0u64;
+        
+        for stream_idx in 0..stream_count {
+            let chunks_for_this_stream = if (stream_idx as u64) < extra_chunks {
+                chunks_per_stream + 1
+            } else {
+                chunks_per_stream
+            };
+            
+            let mut chunks = Vec::with_capacity(chunks_for_this_stream as usize);
+            for _ in 0..chunks_for_this_stream {
+                chunks.push(chunk_idx);
+                chunk_idx += 1;
+            }
+            stream_chunks.push(chunks);
+        }
+        
+        info!("📋 Chunk distribution: {} streams with {} chunks each, {} streams with {} chunks each", 
+              extra_chunks, chunks_per_stream + 1, stream_count as u64 - extra_chunks, chunks_per_stream);
+        
+        // Launch parallel senders with pre-assigned chunks
         let mut handles = Vec::new();
         let file_path = Arc::new(source_path);
         let transfer_id = Arc::new(transfer_id);
         
-        for (stream_idx, stream) in data_streams.into_iter().enumerate() {
+        for (stream_idx, (stream, chunks)) in data_streams.into_iter().zip(stream_chunks.into_iter()).enumerate() {
             let file_path = file_path.clone();
             let bytes_sent = bytes_sent.clone();
             let transfer_id = transfer_id.clone();
-            let chunk_queue = chunk_queue.clone();
             
             let handle = tokio::spawn(async move {
-                Self::send_chunks_work_stealing(
+                Self::send_chunks_round_robin(
                     stream,
                     file_path,
-                    chunk_queue,
+                    chunks,
                     chunk_size,
                     file_size,
                     stream_idx,
@@ -239,6 +262,59 @@ impl BlazingTransfer {
             .map_err(|e| FileshareError::Transfer(format!("Failed to finish stream: {}", e)))?;
         
         info!("✅ Control message sent for {} chunks (ID: {})", total_chunks, transfer_id);
+        Ok(())
+    }
+    
+    /// Send chunks with round-robin assignment for even distribution
+    async fn send_chunks_round_robin(
+        mut stream: SendStream,
+        file_path: Arc<PathBuf>,
+        chunks: Vec<u64>,
+        chunk_size: u64,
+        file_size: u64,
+        stream_idx: usize,
+        bytes_sent: Arc<AtomicU64>,
+        transfer_id: &str,
+    ) -> Result<()> {
+        // Send a special marker to indicate this is a data stream with transfer ID
+        const MAGIC_BYTES: [u8; 4] = [0xDA, 0x7A, 0x57, 0x12];
+        stream.write_all(&MAGIC_BYTES).await
+            .map_err(|e| FileshareError::Transfer(format!("Failed to write magic bytes: {}", e)))?;
+        
+        let id_bytes = transfer_id.as_bytes();
+        stream.write_all(&(id_bytes.len() as u32).to_be_bytes()).await
+            .map_err(|e| FileshareError::Transfer(format!("Failed to write transfer ID length: {}", e)))?;
+        stream.write_all(id_bytes).await
+            .map_err(|e| FileshareError::Transfer(format!("Failed to write transfer ID: {}", e)))?;
+        
+        let mut file = tokio::fs::File::open(file_path.as_ref()).await?;
+        let mut buffer = vec![0u8; chunk_size as usize];
+        
+        // Send assigned chunks
+        for chunk_idx in chunks {
+            let chunk_offset = chunk_idx * chunk_size;
+            file.seek(std::io::SeekFrom::Start(chunk_offset)).await?;
+            
+            let remaining = file_size.saturating_sub(chunk_offset);
+            let bytes_to_read = std::cmp::min(chunk_size, remaining) as usize;
+            
+            file.read_exact(&mut buffer[..bytes_to_read]).await
+                .map_err(|e| FileshareError::FileOperation(format!("Failed to read file chunk: {}", e)))?;
+            
+            // Send: [chunk_id: u64][size: u32][data]
+            stream.write_all(&chunk_idx.to_be_bytes()).await
+                .map_err(|e| FileshareError::Transfer(format!("Failed to write chunk ID: {}", e)))?;
+            stream.write_all(&(bytes_to_read as u32).to_be_bytes()).await
+                .map_err(|e| FileshareError::Transfer(format!("Failed to write chunk size: {}", e)))?;
+            stream.write_all(&buffer[..bytes_to_read]).await
+                .map_err(|e| FileshareError::Transfer(format!("Failed to write chunk data: {}", e)))?;
+            
+            bytes_sent.fetch_add(bytes_to_read as u64, Ordering::Relaxed);
+        }
+        
+        stream.finish()
+            .map_err(|e| FileshareError::Transfer(format!("Failed to finish stream: {}", e)))?;
+        debug!("✅ Stream {} completed: chunks {:?}", stream_idx, chunks);
         Ok(())
     }
     
