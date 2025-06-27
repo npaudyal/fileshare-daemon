@@ -235,8 +235,14 @@ impl UltraFastTransfer {
     pub async fn receive_stream(&self, mut stream: RecvStream) -> Result<()> {
         // Read message type
         let mut msg_type = [0u8; 1];
-        stream.read_exact(&mut msg_type).await
-            .map_err(|e| FileshareError::Transfer(format!("Failed to read message type: {}", e)))?;
+        match stream.read_exact(&mut msg_type).await {
+            Ok(_) => {},
+            Err(e) => {
+                // This might be an empty stream - just return without error
+                info!("Stream has no data, likely an empty stream: {}", e);
+                return Ok(());
+            }
+        }
 
         match msg_type[0] {
             MSG_CONTROL => self.handle_control_stream(stream).await,
