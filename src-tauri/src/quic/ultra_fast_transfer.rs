@@ -22,7 +22,6 @@ const PROTOCOL_VERSION: u8 = 2;
 const MSG_CONTROL: u8 = 0x01;
 const MSG_DATA: u8 = 0x02;
 
-#[derive(Clone)]
 struct TransferInfo {
     filename: String,
     file_size: u64,
@@ -38,7 +37,7 @@ pub struct UltraFastTransfer {
     // Buffer pool to reduce allocations
     buffer_pool: Arc<RwLock<Vec<Vec<u8>>>>,
     // Active transfers
-    transfers: Arc<RwLock<HashMap<Uuid, TransferInfo>>>,
+    transfers: Arc<RwLock<HashMap<Uuid, Arc<TransferInfo>>>>,
 }
 
 impl UltraFastTransfer {
@@ -130,6 +129,7 @@ impl UltraFastTransfer {
             }
 
             handles.push(tokio::spawn(async move {
+                info!("Stream {} starting with {} chunks: {:?}", idx, chunks.len(), chunks);
                 // Pre-allocate buffer for this stream
                 let mut buffer = vec![0u8; CHUNK_SIZE as usize];
                 
@@ -322,7 +322,7 @@ impl UltraFastTransfer {
             file_handle: Arc::new(Mutex::new(file)),
         };
 
-        self.transfers.write().await.insert(transfer_id, info);
+        self.transfers.write().await.insert(transfer_id, Arc::new(info));
         Ok(())
     }
 
@@ -345,7 +345,7 @@ impl UltraFastTransfer {
                 loop {
                     let transfers = self.transfers.read().await;
                     if let Some(info) = transfers.get(&transfer_id) {
-                        let info_clone = info.clone();
+                        let info_clone = Arc::clone(info);
                         drop(transfers);
                         break info_clone;
                     }
