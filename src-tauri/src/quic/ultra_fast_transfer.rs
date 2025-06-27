@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
-use tokio::sync::RwLock;
+use tokio::sync::{RwLock, Mutex};
 use tracing::{error, info};
 use uuid::Uuid;
 
@@ -31,6 +31,7 @@ struct TransferInfo {
     start_time: Instant,
     chunks_received: Arc<AtomicU64>,
     completed: Arc<AtomicBool>,
+    file_handle: Arc<Mutex<tokio::fs::File>>,
 }
 
 pub struct UltraFastTransfer {
@@ -308,17 +309,17 @@ impl UltraFastTransfer {
         let file = tokio::fs::File::create(&target_path).await?;
         file.set_len(file_size).await?;
         file.sync_all().await?;
-        drop(file);
 
-        // Create transfer info
+        // Create transfer info with shared file handle
         let info = TransferInfo {
             filename,
             file_size,
-            target_path,
+            target_path: target_path.clone(),
             chunk_count,
             start_time: Instant::now(),
             chunks_received: Arc::new(AtomicU64::new(0)),
             completed: Arc::new(AtomicBool::new(false)),
+            file_handle: Arc::new(Mutex::new(file)),
         };
 
         self.transfers.write().await.insert(transfer_id, info);
@@ -374,13 +375,19 @@ impl UltraFastTransfer {
             stream.read_exact(&mut buffer[..chunk_size]).await
                 .map_err(|e| FileshareError::Transfer(format!("Failed to read chunk data: {}", e)))?;
 
-            // Write chunk directly to disk
+            // Write chunk directly to disk using shared file handle
             let offset = chunk_id * CHUNK_SIZE;
-            self.write_chunk(&info.target_path, offset, &buffer[..chunk_size]).await?;
+            Self::write_chunk_to_file(&info.file_handle, offset, &buffer[..chunk_size]).await?;
 
             // Update progress
             let received = info.chunks_received.fetch_add(1, Ordering::Relaxed) + 1;
             if received == info.chunk_count {
+                // Sync file to disk before marking as complete
+                {
+                    let mut file = info.file_handle.lock().await;
+                    file.sync_all().await?;
+                }
+                
                 info.completed.store(true, Ordering::Relaxed);
                 let duration = info.start_time.elapsed();
                 let speed_mbps = (info.file_size as f64 * 8.0) / (duration.as_secs_f64() * 1_000_000.0);
@@ -397,13 +404,12 @@ impl UltraFastTransfer {
         Ok(())
     }
 
-    async fn write_chunk(&self, path: &PathBuf, offset: u64, data: &[u8]) -> Result<()> {
-        // Open file in append mode for better performance
-        let mut file = tokio::fs::OpenOptions::new()
-            .write(true)
-            .open(path)
-            .await?;
-        
+    async fn write_chunk_to_file(
+        file_handle: &Arc<Mutex<tokio::fs::File>>,
+        offset: u64,
+        data: &[u8],
+    ) -> Result<()> {
+        let mut file = file_handle.lock().await;
         file.seek(std::io::SeekFrom::Start(offset)).await?;
         file.write_all(data).await?;
         Ok(())
