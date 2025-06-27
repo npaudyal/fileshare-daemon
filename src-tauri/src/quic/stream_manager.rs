@@ -127,9 +127,10 @@ impl StreamManager {
         
         match stream_type {
             StreamType::FileTransfer => {
-                // Create ultra-fast transfer instance and handle stream
+                // Create ultra-fast transfer instance and handle stream directly
+                // Note: The stream header has already been consumed by read_stream_header
                 let transfer = crate::quic::ultra_fast_transfer::UltraFastTransfer::new();
-                if let Err(e) = transfer.receive_stream(recv).await {
+                if let Err(e) = transfer.receive_stream_without_header(recv).await {
                     error!("Failed to handle ultra-fast transfer: {}", e);
                 }
             }
