@@ -8,7 +8,7 @@ use std::sync::Arc;
 use std::time::Instant;
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use tokio::sync::RwLock;
-use tracing::info;
+use tracing::{error, info};
 use uuid::Uuid;
 
 // Performance constants
@@ -73,7 +73,7 @@ impl UltraFastTransfer {
 
         let transfer_id = Uuid::new_v4();
         let chunk_count = (file_size + CHUNK_SIZE - 1) / CHUNK_SIZE;
-        let stream_count = (chunk_count as usize).min(MAX_STREAMS);
+        let stream_count = (chunk_count as usize).min(MAX_STREAMS).max(1);
 
         // Send control message on first stream
         let mut control_stream = stream_manager
@@ -114,6 +114,15 @@ impl UltraFastTransfer {
             while chunk_idx < chunk_count {
                 chunks.push(chunk_idx);
                 chunk_idx += stream_count as u64;
+            }
+
+            // Skip streams with no chunks
+            if chunks.is_empty() {
+                // Close the empty stream
+                if let Err(e) = stream.finish() {
+                    error!("Failed to close empty stream: {}", e);
+                }
+                continue;
             }
 
             handles.push(tokio::spawn(async move {
