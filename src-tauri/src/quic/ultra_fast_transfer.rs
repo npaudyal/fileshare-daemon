@@ -92,6 +92,9 @@ impl UltraFastTransfer {
             chunk_count,
         ).await?;
 
+        // Small delay to ensure control message is processed first
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+
         // Open all data streams at once
         let data_streams = stream_manager
             .open_file_transfer_streams(stream_count)
@@ -335,12 +338,26 @@ impl UltraFastTransfer {
             }
             let transfer_id = Uuid::from_bytes(transfer_id);
 
-            // Get transfer info
-            let transfers = self.transfers.read().await;
-            let info = transfers.get(&transfer_id)
-                .ok_or_else(|| FileshareError::Transfer("Transfer not found".to_string()))?
-                .clone();
-            drop(transfers);
+            // Get transfer info (with retry for race conditions)
+            let info = {
+                let mut retries = 0;
+                loop {
+                    let transfers = self.transfers.read().await;
+                    if let Some(info) = transfers.get(&transfer_id) {
+                        let info_clone = info.clone();
+                        drop(transfers);
+                        break info_clone;
+                    }
+                    drop(transfers);
+                    
+                    if retries >= 10 {
+                        return Err(FileshareError::Transfer("Transfer not found after retries".to_string()));
+                    }
+                    
+                    retries += 1;
+                    tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+                }
+            };
 
             // Read chunk header
             let mut chunk_id = [0u8; 8];
