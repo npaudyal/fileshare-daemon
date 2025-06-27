@@ -2,7 +2,7 @@ use crate::{
     config::Settings,
     network::{discovery::DeviceInfo, protocol::*},
     quic::{
-        QuicConnectionManager,
+        BlazingTransfer, QuicConnectionManager,
         StreamManager,
     },
     FileshareError, Result,
@@ -365,13 +365,13 @@ impl PeerManager {
             .ok_or_else(|| FileshareError::Transfer("No stream manager for peer".to_string()))?
             .clone();
 
-        // Use ultra-fast transfer
+        // Use optimized transfer
         tokio::spawn(async move {
-            let transfer = crate::quic::ultra_fast_transfer::UltraFastTransfer::new();
-            if let Err(e) = transfer.send_file(
+            if let Err(e) = BlazingTransfer::transfer_file(
                 stream_manager,
                 file_path,
                 String::new(), // Target path will be determined by receiver
+                peer_id,
             ).await {
                 error!("❌ File transfer failed: {}", e);
             }
@@ -782,13 +782,13 @@ impl PeerManager {
                     
                     info!("🚀 Starting BLAZING QUIC transfer: {} -> {}", file_path, target_path);
                     
-                    // Start ultra-fast transfer
+                    // Start optimized transfer
                     tokio::spawn(async move {
-                        let transfer = crate::quic::ultra_fast_transfer::UltraFastTransfer::new();
-                        if let Err(e) = transfer.send_file(
+                        if let Err(e) = BlazingTransfer::transfer_file(
                             stream_manager,
                             source_path_clone,
                             target_path_clone,
+                            resolved_peer_id,
                         ).await {
                             error!("❌ Transfer failed: {}", e);
                         }

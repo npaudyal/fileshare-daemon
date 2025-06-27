@@ -195,6 +195,34 @@ impl QuicConnectionManager {
     }
 }
 
+// Create optimized transport config for high-throughput LAN transfers
+fn create_optimized_transport_config() -> quinn::TransportConfig {
+    let mut config = quinn::TransportConfig::default();
+    
+    // Maximize flow control windows for LAN environments
+    config.stream_receive_window(quinn::VarInt::from_u32(128 * 1024 * 1024)); // 128MB per stream
+    config.receive_window(quinn::VarInt::from_u32(1024 * 1024 * 1024)); // 1GB connection window
+    config.send_window(1024 * 1024 * 1024); // 1GB send window
+    
+    // Allow many concurrent streams
+    config.max_concurrent_bidi_streams(quinn::VarInt::from_u32(1024));
+    config.max_concurrent_uni_streams(quinn::VarInt::from_u32(1024));
+    
+    // Increase datagram buffer for better throughput
+    config.datagram_receive_buffer_size(Some(64 * 1024 * 1024)); // 64MB
+    
+    // Set longer idle timeout for stable connections
+    config.max_idle_timeout(Some(quinn::VarInt::from_u32(300_000).into())); // 5 minutes
+    
+    // Disable keep-alive for LAN (unnecessary overhead)
+    config.keep_alive_interval(None);
+    
+    // Use BBR congestion control for better throughput
+    config.congestion_controller_factory(Arc::new(quinn::congestion::BbrConfig::default()));
+    
+    config
+}
+
 // Helper functions for creating configs
 fn create_server_config() -> Result<quinn::ServerConfig> {
     // Generate a self-signed certificate for development
@@ -210,11 +238,15 @@ fn create_server_config() -> Result<quinn::ServerConfig> {
     let key_der = rustls_pki_types::PrivateKeyDer::try_from(priv_key)
         .map_err(|e| FileshareError::Config(format!("Invalid private key: {}", e)))?;
     
-    let server_config = quinn::ServerConfig::with_single_cert(cert_chain, key_der)
+    let mut server_config = quinn::ServerConfig::with_single_cert(cert_chain, key_der)
         .map_err(|e| FileshareError::Network(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             format!("Failed to create server config: {}", e)
         )))?;
+    
+    // Apply optimized transport config
+    let transport_config = Arc::new(create_optimized_transport_config());
+    server_config.transport_config(transport_config);
     
     Ok(server_config)
 }
@@ -282,10 +314,14 @@ fn create_client_config() -> Result<quinn::ClientConfig> {
         .with_custom_certificate_verifier(std::sync::Arc::new(SkipServerVerification))
         .with_no_client_auth();
 
-    let client_config = quinn::ClientConfig::new(std::sync::Arc::new(
+    let mut client_config = quinn::ClientConfig::new(std::sync::Arc::new(
         quinn::crypto::rustls::QuicClientConfig::try_from(crypto)
             .map_err(|e| FileshareError::Config(format!("Failed to create QUIC client config: {}", e)))?,
     ));
+    
+    // Apply optimized transport config
+    let transport_config = Arc::new(create_optimized_transport_config());
+    client_config.transport_config(transport_config);
     
     Ok(client_config)
 }
