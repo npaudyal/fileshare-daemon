@@ -11,7 +11,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
-use tokio::sync::{Semaphore, Mutex, mpsc};
+use tokio::sync::Semaphore;
 use tracing::{debug, error, info};
 use uuid::Uuid;
 
@@ -20,7 +20,7 @@ const SMALL_FILE_THRESHOLD: u64 = 10 * 1024 * 1024; // 10MB
 const OPTIMAL_CHUNK_SIZE: u64 = 16 * 1024 * 1024; // 16MB default for blazing speed
 const MAX_PARALLEL_STREAMS: usize = 64; // More streams for better parallelism
 const MAX_MEMORY_BUFFER: usize = 256 * 1024 * 1024; // 256MB max memory usage
-const WRITE_CONCURRENCY: usize = 4; // Concurrent disk writes - reduced for macOS SSD performance
+const WRITE_CONCURRENCY: usize = 32; // Concurrent disk writes
 
 pub struct BlazingTransfer;
 
@@ -157,18 +157,7 @@ impl BlazingTransfer {
         // Calculate optimal parameters
         let chunk_size = Self::calculate_optimal_chunk_size(file_size);
         let total_chunks = (file_size + chunk_size - 1) / chunk_size;
-        // Limit streams to ensure each stream gets meaningful work
-        let max_streams = std::cmp::min(MAX_PARALLEL_STREAMS, total_chunks as usize);
-        // Ensure we don't have too many streams for the amount of work
-        let stream_count = if total_chunks <= 4 {
-            std::cmp::min(2, max_streams) // For small files, use at most 2 streams
-        } else if total_chunks <= 8 {
-            std::cmp::min(total_chunks as usize, max_streams) // Use same number of streams as chunks
-        } else if total_chunks <= 20 {
-            std::cmp::min(total_chunks as usize * 3 / 4, max_streams) // Use 75% as many streams as chunks
-        } else {
-            std::cmp::min(max_streams, 16) // Cap at 16 streams for larger files
-        };
+        let stream_count = std::cmp::min(MAX_PARALLEL_STREAMS, total_chunks as usize);
 
         info!(
             "🚀 BLAZING parallel transfer: {} streams, {} chunks of {:.1} MB each",
@@ -200,7 +189,7 @@ impl BlazingTransfer {
         .await?;
 
         // Small delay to ensure control message is processed before data streams
-        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
         // Open data streams
         let data_streams = stream_manager
@@ -211,55 +200,44 @@ impl BlazingTransfer {
         let bytes_sent = Arc::new(AtomicU64::new(0));
         let start_time = Instant::now();
 
-        // Distribute chunks as evenly as possible
-        let chunks_per_stream = total_chunks / stream_count as u64;
-        let extra_chunks = total_chunks % stream_count as u64;
-
-        let mut stream_chunks: Vec<Vec<u64>> = Vec::with_capacity(stream_count);
-        let mut chunk_idx = 0u64;
-
-        for stream_idx in 0..stream_count {
-            let chunks_for_this_stream = if (stream_idx as u64) < extra_chunks {
-                chunks_per_stream + 1
-            } else {
-                chunks_per_stream
-            };
-
-            let mut chunks = Vec::with_capacity(chunks_for_this_stream as usize);
-            for _ in 0..chunks_for_this_stream {
-                chunks.push(chunk_idx);
-                chunk_idx += 1;
-            }
-            stream_chunks.push(chunks);
-        }
-
-        info!(
-            "📋 Chunk distribution: {} streams with {} chunks each, {} streams with {} chunks each",
-            extra_chunks,
-            chunks_per_stream + 1,
-            stream_count as u64 - extra_chunks,
-            chunks_per_stream
-        );
-
-        // Launch parallel senders with pre-assigned chunks
+        // Launch parallel senders
         let mut handles = Vec::new();
         let file_path = Arc::new(source_path);
         let transfer_id = Arc::new(transfer_id);
 
-        for (stream_idx, (stream, chunks)) in data_streams
-            .into_iter()
-            .zip(stream_chunks.into_iter())
-            .enumerate()
-        {
+        // Better chunk distribution for even load balancing
+        let base_chunks = total_chunks / stream_count as u64;
+        let extra_chunks = total_chunks % stream_count as u64;
+
+        for (stream_idx, stream) in data_streams.into_iter().enumerate() {
             let file_path = file_path.clone();
             let bytes_sent = bytes_sent.clone();
             let transfer_id = transfer_id.clone();
 
+            let start_chunk = if (stream_idx as u64) < extra_chunks {
+                stream_idx as u64 * (base_chunks + 1)
+            } else {
+                extra_chunks * (base_chunks + 1) + (stream_idx as u64 - extra_chunks) * base_chunks
+            };
+
+            let chunks_for_this_stream = if (stream_idx as u64) < extra_chunks {
+                base_chunks + 1
+            } else {
+                base_chunks
+            };
+
+            let end_chunk = start_chunk + chunks_for_this_stream;
+
+            if start_chunk >= total_chunks {
+                continue;
+            }
+
             let handle = tokio::spawn(async move {
-                Self::send_chunks_round_robin(
+                Self::send_chunks_blazing(
                     stream,
                     file_path,
-                    chunks,
+                    start_chunk,
+                    end_chunk,
                     chunk_size,
                     file_size,
                     stream_idx,
@@ -341,177 +319,6 @@ impl BlazingTransfer {
         info!(
             "✅ Control message sent for {} chunks (ID: {})",
             total_chunks, transfer_id
-        );
-        Ok(())
-    }
-
-    /// Send chunks with round-robin assignment for even distribution
-    async fn send_chunks_round_robin(
-        mut stream: SendStream,
-        file_path: Arc<PathBuf>,
-        chunks: Vec<u64>,
-        chunk_size: u64,
-        file_size: u64,
-        stream_idx: usize,
-        bytes_sent: Arc<AtomicU64>,
-        transfer_id: &str,
-    ) -> Result<()> {
-        // Send a special marker to indicate this is a data stream with transfer ID
-        const MAGIC_BYTES: [u8; 4] = [0xDA, 0x7A, 0x57, 0x12];
-        stream
-            .write_all(&MAGIC_BYTES)
-            .await
-            .map_err(|e| FileshareError::Transfer(format!("Failed to write magic bytes: {}", e)))?;
-
-        let id_bytes = transfer_id.as_bytes();
-        stream
-            .write_all(&(id_bytes.len() as u32).to_be_bytes())
-            .await
-            .map_err(|e| {
-                FileshareError::Transfer(format!("Failed to write transfer ID length: {}", e))
-            })?;
-        stream
-            .write_all(id_bytes)
-            .await
-            .map_err(|e| FileshareError::Transfer(format!("Failed to write transfer ID: {}", e)))?;
-
-        let mut file = tokio::fs::File::open(file_path.as_ref()).await?;
-        let mut buffer = vec![0u8; chunk_size as usize];
-
-        // Send assigned chunks
-        let chunks_clone = chunks.clone();
-        for chunk_idx in chunks {
-            let chunk_offset = chunk_idx * chunk_size;
-            file.seek(std::io::SeekFrom::Start(chunk_offset)).await?;
-
-            let remaining = file_size.saturating_sub(chunk_offset);
-            let bytes_to_read = std::cmp::min(chunk_size, remaining) as usize;
-
-            file.read_exact(&mut buffer[..bytes_to_read])
-                .await
-                .map_err(|e| {
-                    FileshareError::FileOperation(format!("Failed to read file chunk: {}", e))
-                })?;
-
-            // Send: [chunk_id: u64][size: u32][data]
-            stream
-                .write_all(&chunk_idx.to_be_bytes())
-                .await
-                .map_err(|e| {
-                    FileshareError::Transfer(format!("Failed to write chunk ID: {}", e))
-                })?;
-            stream
-                .write_all(&(bytes_to_read as u32).to_be_bytes())
-                .await
-                .map_err(|e| {
-                    FileshareError::Transfer(format!("Failed to write chunk size: {}", e))
-                })?;
-            stream
-                .write_all(&buffer[..bytes_to_read])
-                .await
-                .map_err(|e| {
-                    FileshareError::Transfer(format!("Failed to write chunk data: {}", e))
-                })?;
-
-            bytes_sent.fetch_add(bytes_to_read as u64, Ordering::Relaxed);
-        }
-
-        stream
-            .finish()
-            .map_err(|e| FileshareError::Transfer(format!("Failed to finish stream: {}", e)))?;
-        debug!("✅ Stream {} completed: chunks {:?}", stream_idx, chunks_clone);
-        Ok(())
-    }
-
-    /// Send chunks with work-stealing for better load balancing
-    async fn send_chunks_work_stealing(
-        mut stream: SendStream,
-        file_path: Arc<PathBuf>,
-        chunk_queue: Arc<Mutex<Vec<u64>>>,
-        chunk_size: u64,
-        file_size: u64,
-        stream_idx: usize,
-        bytes_sent: Arc<AtomicU64>,
-        transfer_id: &str,
-    ) -> Result<()> {
-        // Send a special marker to indicate this is a data stream with transfer ID
-        // Format: MAGIC_BYTES (4) + transfer_id length (4) + transfer_id + chunks
-        const MAGIC_BYTES: [u8; 4] = [0xDA, 0x7A, 0x57, 0x12]; // "DATA_STREAM" magic
-        stream
-            .write_all(&MAGIC_BYTES)
-            .await
-            .map_err(|e| FileshareError::Transfer(format!("Failed to write magic bytes: {}", e)))?;
-
-        let id_bytes = transfer_id.as_bytes();
-        stream
-            .write_all(&(id_bytes.len() as u32).to_be_bytes())
-            .await
-            .map_err(|e| {
-                FileshareError::Transfer(format!("Failed to write transfer ID length: {}", e))
-            })?;
-        stream
-            .write_all(id_bytes)
-            .await
-            .map_err(|e| FileshareError::Transfer(format!("Failed to write transfer ID: {}", e)))?;
-
-        let mut file = tokio::fs::File::open(file_path.as_ref()).await?;
-        let mut buffer = vec![0u8; chunk_size as usize];
-        let mut chunks_sent = 0u64;
-
-        // Work-stealing loop
-        loop {
-            // Try to get a chunk from the queue
-            let chunk_idx = {
-                let mut queue = chunk_queue.lock().await;
-                queue.pop()
-            };
-
-            let Some(chunk_idx) = chunk_idx else {
-                break; // No more work
-            };
-
-            let chunk_offset = chunk_idx * chunk_size;
-            file.seek(std::io::SeekFrom::Start(chunk_offset)).await?;
-
-            let remaining = file_size.saturating_sub(chunk_offset);
-            let bytes_to_read = std::cmp::min(chunk_size, remaining) as usize;
-
-            file.read_exact(&mut buffer[..bytes_to_read])
-                .await
-                .map_err(|e| {
-                    FileshareError::FileOperation(format!("Failed to read file chunk: {}", e))
-                })?;
-
-            // Send: [chunk_id: u64][size: u32][data]
-            stream
-                .write_all(&chunk_idx.to_be_bytes())
-                .await
-                .map_err(|e| {
-                    FileshareError::Transfer(format!("Failed to write chunk ID: {}", e))
-                })?;
-            stream
-                .write_all(&(bytes_to_read as u32).to_be_bytes())
-                .await
-                .map_err(|e| {
-                    FileshareError::Transfer(format!("Failed to write chunk size: {}", e))
-                })?;
-            stream
-                .write_all(&buffer[..bytes_to_read])
-                .await
-                .map_err(|e| {
-                    FileshareError::Transfer(format!("Failed to write chunk data: {}", e))
-                })?;
-
-            bytes_sent.fetch_add(bytes_to_read as u64, Ordering::Relaxed);
-            chunks_sent += 1;
-        }
-
-        stream
-            .finish()
-            .map_err(|e| FileshareError::Transfer(format!("Failed to finish stream: {}", e)))?;
-        debug!(
-            "✅ Stream {} completed: sent {} chunks",
-            stream_idx, chunks_sent
         );
         Ok(())
     }
@@ -600,27 +407,18 @@ impl BlazingTransfer {
     /// Calculate optimal chunk size for maximum throughput
     fn calculate_optimal_chunk_size(file_size: u64) -> u64 {
         match file_size {
-            0..=50_000_000 => 4 * 1024 * 1024,           // <= 50MB: 4MB chunks
-            50_000_001..=200_000_000 => 8 * 1024 * 1024, // 50-200MB: 8MB chunks
-            200_000_001..=500_000_000 => 16 * 1024 * 1024, // 200-500MB: 16MB chunks
-            500_000_001..=1_000_000_000 => 32 * 1024 * 1024, // 500MB-1GB: 32MB chunks
-            _ => 64 * 1024 * 1024,                       // > 1GB: 64MB chunks
+            0..=100_000_000 => 8 * 1024 * 1024, // <= 100MB: 8MB chunks
+            100_000_001..=500_000_000 => 16 * 1024 * 1024, // 100-500MB: 16MB chunks
+            500_000_001..=2_000_000_000 => 32 * 1024 * 1024, // 500MB-2GB: 32MB chunks
+            _ => 64 * 1024 * 1024,              // > 2GB: 64MB chunks
         }
     }
-}
-
-/// Write operation for batching
-#[derive(Debug)]
-struct WriteOperation {
-    chunk_id: u64,
-    offset: u64,
-    data: Vec<u8>,
 }
 
 /// Blazing fast receiver with true parallel writes
 pub struct BlazingReceiver;
 
-// Per-transfer state with optimized write queue
+// Per-transfer state with lock-free file access on Unix
 struct TransferState {
     filename: String,
     file_size: u64,
@@ -633,7 +431,6 @@ struct TransferState {
     file: Arc<std::sync::Mutex<std::fs::File>>, // Need mutex on Windows
     received_chunks: AtomicU64,
     write_semaphore: Arc<Semaphore>,
-    write_queue_tx: mpsc::UnboundedSender<WriteOperation>,
     completed: AtomicBool,
     transfer_id: String,
 }
@@ -780,9 +577,6 @@ impl BlazingReceiver {
         file.sync_all()
             .map_err(|e| FileshareError::Transfer(format!("Failed to sync file: {}", e)))?;
 
-        // Create write queue for batched operations
-        let (write_queue_tx, mut write_queue_rx) = mpsc::unbounded_channel::<WriteOperation>();
-
         // Create transfer state with platform-specific file handling
         let state = Arc::new(TransferState {
             filename: filename.clone(),
@@ -797,14 +591,7 @@ impl BlazingReceiver {
             received_chunks: AtomicU64::new(0),
             write_semaphore: Arc::new(Semaphore::new(WRITE_CONCURRENCY)),
             completed: AtomicBool::new(false),
-            write_queue_tx,
             transfer_id: transfer_id.clone(),
-        });
-
-        // Start write queue worker for batched disk operations
-        let state_clone = state.clone();
-        tokio::spawn(async move {
-            Self::write_queue_worker(state_clone, write_queue_rx).await;
         });
 
         ACTIVE_TRANSFERS.insert(transfer_id.clone(), state);
@@ -883,120 +670,94 @@ impl BlazingReceiver {
                 FileshareError::Transfer(format!("Failed to read chunk data: {}", e))
             })?;
 
-            // Send chunk to write queue for batched processing
-            let offset = chunk_id * state.chunk_size;
-            let write_operation = WriteOperation {
-                chunk_id,
-                offset,
-                data: chunk_data,
-            };
-
-            if let Err(e) = state.write_queue_tx.send(write_operation) {
-                error!("Failed to queue write operation: {}", e);
-                return Err(FileshareError::Transfer(format!(
-                    "Failed to queue write operation: {}", e
-                )));
-            }
+            // Write chunk directly with pwrite (no mutex needed)
+            Self::write_chunk_direct(state.clone(), chunk_id, chunk_data).await?;
         }
 
         Ok(())
     }
 
-
-    /// Write queue worker for batched disk operations
-    async fn write_queue_worker(
+    /// Write chunk directly with pwrite for true parallelism (no mutex)
+    async fn write_chunk_direct(
         state: Arc<TransferState>,
-        mut write_queue_rx: mpsc::UnboundedReceiver<WriteOperation>,
-    ) {
-        info!("🔧 Starting write queue worker for transfer {}", state.transfer_id);
-        
-        while let Some(operation) = write_queue_rx.recv().await {
-            // Acquire write permit to control concurrent disk operations
-            let _permit = match state.write_semaphore.acquire().await {
-                Ok(permit) => permit,
-                Err(_) => {
-                    error!("Failed to acquire write permit for transfer {}", state.transfer_id);
-                    continue;
-                }
-            };
+        chunk_id: u64,
+        data: Vec<u8>,
+    ) -> Result<()> {
+        // Acquire write permit to control memory usage
+        let _permit =
+            state.write_semaphore.acquire().await.map_err(|_| {
+                FileshareError::Transfer("Failed to acquire write permit".to_string())
+            })?;
 
+        let offset = chunk_id * state.chunk_size;
+        let file = state.file.clone();
+        let state_clone = state.clone();
+
+        // Use blocking task for pwrite since it's not async
+        tokio::task::spawn_blocking(move || {
+            // Use pwrite for position-independent parallel writes
+            #[cfg(unix)]
+            {
+                file.write_at(&data, offset).map_err(|e| {
+                    FileshareError::Transfer(format!("Failed to write chunk {}: {}", chunk_id, e))
+                })
+            }
+            #[cfg(windows)]
+            {
+                use std::io::{Seek, SeekFrom, Write};
+                let mut file = file.lock().unwrap();
+                file.seek(SeekFrom::Start(offset))
+                    .map_err(|e| FileshareError::Transfer(format!("Failed to seek: {}", e)))?;
+                file.write_all(&data).map_err(|e| {
+                    FileshareError::Transfer(format!("Failed to write chunk {}: {}", chunk_id, e))
+                })
+            }
+        })
+        .await
+        .map_err(|e| FileshareError::Transfer(format!("Task join error: {}", e)))??;
+
+        // Update progress
+        let received = state.received_chunks.fetch_add(1, Ordering::Relaxed) + 1;
+
+        if received % 10 == 0 || received == state.total_chunks {
+            let progress = (received as f64 / state.total_chunks as f64) * 100.0;
+            info!(
+                "📊 Progress: {:.1}% ({}/{})",
+                progress, received, state.total_chunks
+            );
+        }
+
+        // Check completion
+        if received == state.total_chunks {
             let file = state.file.clone();
-            let chunk_id = operation.chunk_id;
-            let offset = operation.offset;
-            let data = operation.data;
-            let state_clone = state.clone();
+            let filename = state.filename.clone();
+            let transfer_id = state.transfer_id.clone();
 
-            // Perform the write in a blocking task
-            let write_result = tokio::task::spawn_blocking(move || {
+            tokio::task::spawn_blocking(move || {
                 #[cfg(unix)]
                 {
-                    file.write_at(&data, offset).map_err(|e| {
-                        FileshareError::Transfer(format!("Failed to write chunk {}: {}", chunk_id, e))
+                    file.sync_all().map_err(|e| {
+                        FileshareError::Transfer(format!("Failed to sync file: {}", e))
                     })
                 }
                 #[cfg(windows)]
                 {
-                    use std::io::{Seek, SeekFrom, Write};
-                    let mut file = file.lock().unwrap();
-                    file.seek(SeekFrom::Start(offset))
-                        .map_err(|e| FileshareError::Transfer(format!("Failed to seek: {}", e)))?;
-                    file.write_all(&data).map_err(|e| {
-                        FileshareError::Transfer(format!("Failed to write chunk {}: {}", chunk_id, e))
+                    let file = file.lock().unwrap();
+                    file.sync_all().map_err(|e| {
+                        FileshareError::Transfer(format!("Failed to sync file: {}", e))
                     })
                 }
-            }).await;
+            })
+            .await
+            .map_err(|e| FileshareError::Transfer(format!("Task join error: {}", e)))??;
 
-            match write_result {
-                Ok(Ok(_)) => {
-                    // Update progress
-                    let received = state_clone.received_chunks.fetch_add(1, Ordering::Relaxed) + 1;
+            state.completed.store(true, Ordering::Relaxed);
+            info!("🎉 BLAZING transfer complete: {}", filename);
 
-                    if received % 10 == 0 || received == state_clone.total_chunks {
-                        let progress = (received as f64 / state_clone.total_chunks as f64) * 100.0;
-                        info!(
-                            "📊 Progress: {:.1}% ({}/{})",
-                            progress, received, state_clone.total_chunks
-                        );
-                    }
-
-                    // Check completion
-                    if received == state_clone.total_chunks {
-                        let file = state_clone.file.clone();
-                        let filename = state_clone.filename.clone();
-                        let transfer_id = state_clone.transfer_id.clone();
-
-                        let sync_result = tokio::task::spawn_blocking(move || {
-                            #[cfg(unix)]
-                            {
-                                file.sync_all().map_err(|e| {
-                                    FileshareError::Transfer(format!("Failed to sync file: {}", e))
-                                })
-                            }
-                            #[cfg(windows)]
-                            {
-                                let file = file.lock().unwrap();
-                                file.sync_all().map_err(|e| {
-                                    FileshareError::Transfer(format!("Failed to sync file: {}", e))
-                                })
-                            }
-                        }).await;
-
-                        match sync_result {
-                            Ok(Ok(_)) => {
-                                state_clone.completed.store(true, Ordering::Relaxed);
-                                info!("🎉 BLAZING transfer complete: {}", filename);
-                                ACTIVE_TRANSFERS.remove(&transfer_id);
-                            }
-                            Ok(Err(e)) => error!("Failed to sync file: {}", e),
-                            Err(e) => error!("Sync task failed: {}", e),
-                        }
-                    }
-                }
-                Ok(Err(e)) => error!("Write operation failed: {}", e),
-                Err(e) => error!("Write task failed: {}", e),
-            }
+            // Cleanup
+            ACTIVE_TRANSFERS.remove(&transfer_id);
         }
 
-        info!("🔧 Write queue worker finished for transfer {}", state.transfer_id);
+        Ok(())
     }
 }

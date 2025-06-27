@@ -127,9 +127,10 @@ impl StreamManager {
         
         match stream_type {
             StreamType::FileTransfer => {
-                // Use blazing receiver for maximum performance
-                if let Err(e) = crate::quic::BlazingReceiver::handle_incoming_transfer(recv).await {
-                    error!("Failed to handle blazing transfer: {}", e);
+                // Create ultra-fast transfer instance and handle stream
+                let transfer = crate::quic::ultra_fast_transfer::UltraFastTransfer::new();
+                if let Err(e) = transfer.receive_stream(recv).await {
+                    error!("Failed to handle ultra-fast transfer: {}", e);
                 }
             }
             _ => {
@@ -207,18 +208,31 @@ impl StreamManager {
     pub async fn open_file_transfer_streams(&self, count: usize) -> Result<Vec<SendStream>> {
         let mut streams = Vec::with_capacity(count);
         
+        // Open all streams in parallel for faster setup
+        let mut handles = Vec::new();
         for _ in 0..count {
-            let _permit = self.stream_semaphore.acquire().await.unwrap();
+            let conn = self.connection.clone();
+            let permit = self.stream_semaphore.clone().acquire_owned().await.unwrap();
             
-            let mut send = self.connection.open_uni_stream().await?;
-            
-            // Write stream header
-            QuicProtocol::write_stream_header(&mut send, StreamType::FileTransfer).await?;
-            
-            streams.push(send);
+            handles.push(tokio::spawn(async move {
+                let mut send = conn.open_uni_stream().await?;
+                // Write stream header
+                QuicProtocol::write_stream_header(&mut send, StreamType::FileTransfer).await?;
+                drop(permit); // Release permit after stream is ready
+                Ok::<SendStream, FileshareError>(send)
+            }));
         }
         
-        info!("Opened {} file transfer streams", count);
+        // Collect all streams
+        for handle in handles {
+            match handle.await {
+                Ok(Ok(stream)) => streams.push(stream),
+                Ok(Err(e)) => return Err(e),
+                Err(e) => return Err(FileshareError::Transfer(format!("Failed to spawn task: {}", e))),
+            }
+        }
+        
+        info!("Opened {} file transfer streams in parallel", count);
         
         Ok(streams)
     }
