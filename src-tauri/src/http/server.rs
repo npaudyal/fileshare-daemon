@@ -23,7 +23,7 @@ use futures::stream::StreamExt;
 use crate::{FileshareError, Result};
 
 // Buffer size for streaming - optimized for LAN speeds
-const STREAM_BUFFER_SIZE: usize = 16 * 1024 * 1024; // 16MB chunks for HTTP streaming
+const STREAM_BUFFER_SIZE: usize = 64 * 1024 * 1024; // 64MB chunks for maximum HTTP streaming throughput
 
 #[derive(Clone)]
 pub struct HttpFileServer {

@@ -945,21 +945,15 @@ impl PeerManager {
                     *file_size as f64 / (1024.0 * 1024.0)
                 );
 
-                // Determine target path based on the clipboard's current target
-                let target_path = {
-                    let clipboard_state = clipboard.network_clipboard.read().await;
-                    if let Some(item) = &*clipboard_state {
-                        // Use the target path from clipboard paste operation
-                        PathBuf::from(&item.file_path)
-                            .parent()
-                            .unwrap_or(std::path::Path::new("."))
-                            .join(filename)
-                    } else {
-                        // Fallback to downloads directory
-                        dirs::download_dir()
-                            .unwrap_or_else(|| PathBuf::from("."))
-                            .join(filename)
-                    }
+                // Determine target path - get the current directory where user wants to paste
+                let target_path = if let Ok(Some((target_path, _))) = clipboard.paste_to_current_location().await {
+                    // Use the target path from the clipboard paste operation
+                    target_path
+                } else {
+                    // Fallback to downloads directory
+                    dirs::download_dir()
+                        .unwrap_or_else(|| PathBuf::from("."))
+                        .join(filename)
                 };
 
                 info!("⬇️ Starting HTTP download to: {:?}", target_path);

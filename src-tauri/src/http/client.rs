@@ -13,8 +13,8 @@ use http_body_util::BodyExt;
 
 use crate::{FileshareError, Result};
 
-// Download buffer size - optimized for LAN speeds
-const DOWNLOAD_BUFFER_SIZE: usize = 32 * 1024 * 1024; // 32MB buffer
+// Download buffer size - optimized for LAN speeds  
+const DOWNLOAD_BUFFER_SIZE: usize = 64 * 1024 * 1024; // 64MB buffer for maximum LAN throughput
 
 pub struct HttpFileClient {
     client: Client<hyper_util::client::legacy::connect::HttpConnector, http_body_util::Empty<Bytes>>,
@@ -23,9 +23,10 @@ pub struct HttpFileClient {
 impl HttpFileClient {
     pub fn new() -> Self {
         let client = Client::builder(TokioExecutor::new())
-            .pool_idle_timeout(std::time::Duration::from_secs(30))
-            .pool_max_idle_per_host(16) // Allow more connections for parallel downloads
+            .pool_idle_timeout(std::time::Duration::from_secs(60))
+            .pool_max_idle_per_host(32) // More connections for parallel downloads
             .http2_only(false) // Use HTTP/1.1 for better compatibility and streaming
+            .http1_max_buf_size(DOWNLOAD_BUFFER_SIZE) // Set maximum buffer size
             .build_http();
         
         Self { client }
@@ -137,8 +138,8 @@ impl HttpFileClient {
             if let Some(data) = chunk.data_ref() {
                 buffer.extend_from_slice(data);
                 
-                // Write to file when buffer is large enough  
-                if buffer.len() >= DOWNLOAD_BUFFER_SIZE {
+                // Write to file when buffer is large enough or getting close to capacity
+                if buffer.len() >= DOWNLOAD_BUFFER_SIZE / 2 {
                     file.write_all(&buffer).await
                         .map_err(|e| FileshareError::FileOperation(format!("Failed to write: {}", e)))?;
                     
