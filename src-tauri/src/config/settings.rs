@@ -25,6 +25,7 @@ pub struct DeviceSettings {
 pub struct NetworkSettings {
     pub port: u16,
     pub discovery_port: u16,
+    pub http_port: u16,
     pub service_name: String,
     pub timeout_seconds: u64,
 }
@@ -59,6 +60,7 @@ impl Default for Settings {
             network: NetworkSettings {
                 port: 9876,
                 discovery_port: 9877,
+                http_port: 9878,
                 service_name: "_fileshare._tcp.local.".to_string(),
                 timeout_seconds: 30,
             },

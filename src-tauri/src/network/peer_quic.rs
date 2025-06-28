@@ -1,10 +1,8 @@
 use crate::{
     config::Settings,
+    http::HttpTransferManager,
     network::{discovery::DeviceInfo, protocol::*},
-    quic::{
-        UltraTransfer, BlazingTransfer, QuicConnectionManager,
-        StreamManager,
-    },
+    quic::{QuicConnectionManager, StreamManager},
     FileshareError, Result,
 };
 use std::collections::HashMap;
@@ -13,7 +11,6 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, RwLock};
-use tokio::time::timeout;
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
@@ -70,6 +67,8 @@ pub struct PeerManager {
     temp_to_real_id_map: HashMap<Uuid, Uuid>,
     // Temporary storage for incoming stream managers before handshake
     incoming_stream_managers: Arc<RwLock<HashMap<Uuid, Arc<StreamManager>>>>,
+    // HTTP transfer manager for file transfers
+    http_transfer_manager: Arc<HttpTransferManager>,
 }
 
 impl PeerManager {
@@ -79,11 +78,17 @@ impl PeerManager {
         // Create QUIC connection manager
         let bind_addr: SocketAddr = format!("0.0.0.0:{}", settings.network.port)
             .parse()
-            .map_err(|e| FileshareError::Network(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                format!("Invalid address: {}", e)
-            )))?;
+            .map_err(|e| {
+                FileshareError::Network(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!("Invalid address: {}", e),
+                ))
+            })?;
         let quic_manager = Arc::new(QuicConnectionManager::new(bind_addr).await?);
+
+        // Create HTTP transfer manager
+        let http_transfer_manager =
+            Arc::new(HttpTransferManager::new(settings.network.http_port).await?);
 
         let peer_manager = Self {
             settings,
@@ -94,10 +99,14 @@ impl PeerManager {
             stream_managers: HashMap::new(),
             temp_to_real_id_map: HashMap::new(),
             incoming_stream_managers: Arc::new(RwLock::new(HashMap::new())),
+            http_transfer_manager,
         };
 
         // Start accepting QUIC connections
         peer_manager.start_quic_listener();
+
+        // Start HTTP server
+        peer_manager.http_transfer_manager.start_server().await?;
 
         Ok(peer_manager)
     }
@@ -122,18 +131,24 @@ impl PeerManager {
 
                         tokio::spawn(async move {
                             let temp_id = connection.get_peer_id();
-                            let stream_manager = Arc::new(StreamManager::new(connection.clone(), message_tx.clone()));
-                            
+                            let stream_manager = Arc::new(StreamManager::new(
+                                connection.clone(),
+                                message_tx.clone(),
+                            ));
+
                             // Store in incoming managers
                             {
                                 let mut managers = incoming_managers.write().await;
                                 managers.insert(temp_id, stream_manager.clone());
-                                info!("✅ Stored incoming stream manager with temp ID: {}", temp_id);
+                                info!(
+                                    "✅ Stored incoming stream manager with temp ID: {}",
+                                    temp_id
+                                );
                             }
-                            
+
                             // Start the stream listener
                             stream_manager.start_stream_listener().await;
-                            
+
                             // Keep connection alive
                             loop {
                                 if connection.is_closed() {
@@ -157,10 +172,12 @@ impl PeerManager {
         });
     }
 
-
     /// Resolve a peer ID, mapping temporary IDs to real device IDs when available
     fn resolve_peer_id(&self, peer_id: Uuid) -> Uuid {
-        self.temp_to_real_id_map.get(&peer_id).copied().unwrap_or(peer_id)
+        self.temp_to_real_id_map
+            .get(&peer_id)
+            .copied()
+            .unwrap_or(peer_id)
     }
 
     pub async fn get_all_discovered_devices(&self) -> Vec<DeviceInfo> {
@@ -188,21 +205,34 @@ impl PeerManager {
                 "🔄 Updated existing peer: {} - Current status: {:?}",
                 existing_peer.device_info.name, existing_peer.connection_status
             );
-            
+
             // Check if we need to attempt connection for existing peer
-            if matches!(existing_peer.connection_status, ConnectionStatus::Disconnected | ConnectionStatus::Error(_)) {
+            if matches!(
+                existing_peer.connection_status,
+                ConnectionStatus::Disconnected | ConnectionStatus::Error(_)
+            ) {
                 if self.should_connect_to_peer(&device_info) {
-                    info!("🔗 Attempting QUIC connection to existing peer: {}", device_info.name);
+                    info!(
+                        "🔗 Attempting QUIC connection to existing peer: {}",
+                        device_info.name
+                    );
                     if let Err(e) = self.connect_to_peer(device_info.id).await {
-                        error!("❌ Failed to connect to existing peer {}: {}", device_info.name, e);
+                        error!(
+                            "❌ Failed to connect to existing peer {}: {}",
+                            device_info.name, e
+                        );
                     }
                 } else {
-                    info!("⏭️ Skipping connection to existing peer {} (require_pairing: {})", 
-                          device_info.name, self.settings.security.require_pairing);
+                    info!(
+                        "⏭️ Skipping connection to existing peer {} (require_pairing: {})",
+                        device_info.name, self.settings.security.require_pairing
+                    );
                 }
             } else {
-                info!("ℹ️ Existing peer {} already has status {:?}, not attempting connection", 
-                      device_info.name, existing_peer.connection_status);
+                info!(
+                    "ℹ️ Existing peer {} already has status {:?}, not attempting connection",
+                    device_info.name, existing_peer.connection_status
+                );
             }
             return Ok(());
         }
@@ -217,18 +247,26 @@ impl PeerManager {
             reconnection_attempts: 0,
         };
 
-        info!("✅ Adding new peer: {} ({}) at {}", device_info.name, device_info.id, device_info.addr);
+        info!(
+            "✅ Adding new peer: {} ({}) at {}",
+            device_info.name, device_info.id, device_info.addr
+        );
         self.peers.insert(device_info.id, peer);
 
         // Attempt to connect
         if self.should_connect_to_peer(&device_info) {
-            info!("🔗 Attempting QUIC connection to peer: {}", device_info.name);
+            info!(
+                "🔗 Attempting QUIC connection to peer: {}",
+                device_info.name
+            );
             if let Err(e) = self.connect_to_peer(device_info.id).await {
                 error!("❌ Failed to connect to peer {}: {}", device_info.name, e);
             }
         } else {
-            info!("⏭️ Skipping connection to peer {} (pairing required: {})", 
-                  device_info.name, self.settings.security.require_pairing);
+            info!(
+                "⏭️ Skipping connection to peer {} (pairing required: {})",
+                device_info.name, self.settings.security.require_pairing
+            );
         }
 
         Ok(())
@@ -266,12 +304,18 @@ impl PeerManager {
 
         match self.quic_manager.connect_to_peer(addr, peer_id).await {
             Ok(connection) => {
-                info!("✅ Successfully established QUIC connection to peer {} at {}", peer_id, addr);
+                info!(
+                    "✅ Successfully established QUIC connection to peer {} at {}",
+                    peer_id, addr
+                );
                 peer.connection_status = ConnectionStatus::Connected;
                 peer.last_seen = Instant::now();
 
                 // Create stream manager
-                let stream_manager = Arc::new(StreamManager::new(connection.clone(), self.message_tx.clone()));
+                let stream_manager = Arc::new(StreamManager::new(
+                    connection.clone(),
+                    self.message_tx.clone(),
+                ));
 
                 // Store stream manager
                 self.stream_managers.insert(peer_id, stream_manager.clone());
@@ -284,16 +328,22 @@ impl PeerManager {
                     Message::handshake(self.settings.device.id, self.settings.device.name.clone());
 
                 stream_manager.send_control_message(handshake).await?;
-                
-                info!("✅ Handshake sent to peer {}, waiting for response via main message handler", peer_id);
+
+                info!(
+                    "✅ Handshake sent to peer {}, waiting for response via main message handler",
+                    peer_id
+                );
                 // The handshake response will be handled by the main message handler in daemon_quic.rs
                 // which will call handle_message with the HandshakeResponse
             }
             Err(e) => {
-                error!("❌ Failed to establish QUIC connection to peer {}: {}", peer_id, e);
+                error!(
+                    "❌ Failed to establish QUIC connection to peer {}: {}",
+                    peer_id, e
+                );
                 peer.connection_status = ConnectionStatus::Error(e.to_string());
                 peer.reconnection_attempts += 1;
-                
+
                 // Don't return error immediately - let discovery continue working
                 warn!("⚠️ Will retry connection to peer {} later", peer_id);
             }
@@ -305,7 +355,7 @@ impl PeerManager {
     pub async fn send_message_to_peer(&mut self, peer_id: Uuid, message: Message) -> Result<()> {
         // Resolve the peer ID (map temporary to real ID if needed)
         let resolved_peer_id = self.resolve_peer_id(peer_id);
-        
+
         info!(
             "Attempting to send message to peer {} (resolved to {}): {:?}",
             peer_id, resolved_peer_id, message.message_type
@@ -313,10 +363,16 @@ impl PeerManager {
 
         if let Some(stream_manager) = self.stream_managers.get(&resolved_peer_id) {
             stream_manager.send_control_message(message).await?;
-            info!("✅ Successfully sent message to peer {} (resolved to {})", peer_id, resolved_peer_id);
+            info!(
+                "✅ Successfully sent message to peer {} (resolved to {})",
+                peer_id, resolved_peer_id
+            );
             Ok(())
         } else {
-            error!("❌ No active QUIC connection to peer {} (resolved to {})", peer_id, resolved_peer_id);
+            error!(
+                "❌ No active QUIC connection to peer {} (resolved to {})",
+                peer_id, resolved_peer_id
+            );
             Err(FileshareError::Transfer(format!(
                 "No active QUIC connection to peer {} (resolved to {})",
                 peer_id, resolved_peer_id
@@ -327,7 +383,7 @@ impl PeerManager {
     pub async fn send_direct_to_connection(&self, peer_id: Uuid, message: Message) -> Result<()> {
         // Resolve the peer ID (map temporary to real ID if needed)
         let resolved_peer_id = self.resolve_peer_id(peer_id);
-        
+
         if let Some(stream_manager) = self.stream_managers.get(&resolved_peer_id) {
             stream_manager.send_control_message(message).await?;
             Ok(())
@@ -358,27 +414,42 @@ impl PeerManager {
             ));
         }
 
-        // Get stream manager for this peer
-        let stream_manager = self
-            .stream_managers
-            .get(&peer_id)
-            .ok_or_else(|| FileshareError::Transfer("No stream manager for peer".to_string()))?
-            .clone();
+        let peer_addr = peer.device_info.addr;
 
-        // Use ultra-optimized transfer for maximum speed
-        tokio::spawn(async move {
-            if let Err(e) = UltraTransfer::transfer_file(
-                stream_manager,
-                file_path,
-                String::new(), // Target path will be determined by receiver
-                peer_id,
-            ).await {
-                error!("❌ ULTRA transfer failed, trying BLAZING fallback: {}", e);
-                // Could add blazing fallback here if needed
-            }
+        // Get file metadata for the message
+        let metadata = tokio::fs::metadata(&file_path).await?;
+        let file_size = metadata.len();
+        let filename = file_path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("unknown")
+            .to_string();
+
+        info!(
+            "📤 Preparing HTTP file transfer: {} ({:.1} MB) to peer {}",
+            filename,
+            file_size as f64 / (1024.0 * 1024.0),
+            peer_id
+        );
+
+        // Prepare file for HTTP transfer and get URL
+        let download_url = self
+            .http_transfer_manager
+            .prepare_file_transfer(file_path.clone(), peer_addr)
+            .await?;
+
+        // Send file offer message via QUIC with HTTP URL
+        let request_id = Uuid::new_v4();
+        let message = Message::new(MessageType::FileOfferHttp {
+            request_id,
+            filename,
+            file_size,
+            download_url,
         });
 
-        info!("Started ULTRA QUIC file transfer to peer {}", peer_id);
+        self.send_message_to_peer(peer_id, message).await?;
+
+        info!("✅ Sent HTTP file offer to peer {}", peer_id);
         Ok(())
     }
 
@@ -460,7 +531,8 @@ impl PeerManager {
                 self.stream_managers.remove(&peer_id);
 
                 // Clean up any temporary ID mappings pointing to this peer
-                self.temp_to_real_id_map.retain(|_temp_id, real_id| *real_id != peer_id);
+                self.temp_to_real_id_map
+                    .retain(|_temp_id, real_id| *real_id != peer_id);
 
                 // Remove from QUIC connections
                 self.quic_manager.remove_connection(peer_id).await;
@@ -548,7 +620,7 @@ impl PeerManager {
     ) -> Result<()> {
         // Resolve peer ID for peer lookups (temp -> real ID mapping)
         let resolved_peer_id = self.resolve_peer_id(peer_id);
-        
+
         // Update last seen timestamp (use resolved ID for peer lookups)
         if let Some(peer) = self.peers.get_mut(&resolved_peer_id) {
             peer.last_seen = Instant::now();
@@ -592,8 +664,7 @@ impl PeerManager {
                 clipboard.clear().await;
             }
 
-            // REMOVED: FileOffer/FileChunk/TransferComplete handling - we use direct QUIC streams now
-
+            // Note: Old QUIC-based file transfers have been removed - now using HTTP
             MessageType::Handshake {
                 device_id,
                 device_name,
@@ -621,7 +692,10 @@ impl PeerManager {
                 // Update or create peer entry
                 if let Some(peer) = self.peers.get_mut(device_id) {
                     // Update existing peer (from discovery)
-                    info!("✅ Updating existing peer {} from {:?} to Authenticated", device_id, peer.connection_status);
+                    info!(
+                        "✅ Updating existing peer {} from {:?} to Authenticated",
+                        device_id, peer.connection_status
+                    );
                     peer.device_info.name = device_name.clone();
                     peer.connection_status = ConnectionStatus::Authenticated;
                     peer.ping_failures = 0;
@@ -629,8 +703,11 @@ impl PeerManager {
                     peer.last_seen = Instant::now();
                 } else {
                     // Create new peer entry for incoming connection (before discovery)
-                    info!("🆕 Creating peer entry for incoming connection: {} ({})", device_name, device_id);
-                    
+                    info!(
+                        "🆕 Creating peer entry for incoming connection: {} ({})",
+                        device_name, device_id
+                    );
+
                     let device_info = DeviceInfo {
                         id: *device_id,
                         name: device_name.clone(),
@@ -641,7 +718,7 @@ impl PeerManager {
                             .as_secs(),
                         version: version.clone(),
                     };
-                    
+
                     let peer = Peer {
                         device_info,
                         connection_status: ConnectionStatus::Authenticated,
@@ -650,26 +727,33 @@ impl PeerManager {
                         ping_failures: 0,
                         reconnection_attempts: 0,
                     };
-                    
+
                     self.peers.insert(*device_id, peer);
                 }
-                
+
                 // Move stream manager if needed
                 if let Some(stream_manager) = stream_manager_to_move {
-                    info!("📝 Moving stream manager from temporary ID {} to real ID {}", peer_id, device_id);
-                    self.stream_managers.insert(*device_id, stream_manager.clone());
+                    info!(
+                        "📝 Moving stream manager from temporary ID {} to real ID {}",
+                        peer_id, device_id
+                    );
+                    self.stream_managers
+                        .insert(*device_id, stream_manager.clone());
                     self.temp_to_real_id_map.insert(peer_id, *device_id);
-                    
+
                     // Send handshake response immediately using the moved stream manager
                     let response = Message::new(MessageType::HandshakeResponse {
                         accepted: true,
                         reason: None,
                     });
-                    
+
                     if let Err(e) = stream_manager.send_control_message(response).await {
                         error!("❌ Failed to send handshake response: {}", e);
                     } else {
-                        info!("✅ Sent handshake response to peer {} successfully", device_id);
+                        info!(
+                            "✅ Sent handshake response to peer {} successfully",
+                            device_id
+                        );
                     }
                 } else if peer_id == *device_id {
                     // For outgoing connections where peer_id already matches device_id
@@ -678,11 +762,14 @@ impl PeerManager {
                             accepted: true,
                             reason: None,
                         });
-                        
+
                         if let Err(e) = stream_manager.send_control_message(response).await {
                             error!("❌ Failed to send handshake response: {}", e);
                         } else {
-                            info!("✅ Sent handshake response to peer {} successfully", device_id);
+                            info!(
+                                "✅ Sent handshake response to peer {} successfully",
+                                device_id
+                            );
                         }
                     }
                 }
@@ -691,43 +778,51 @@ impl PeerManager {
             MessageType::HandshakeResponse { accepted, reason } => {
                 if *accepted {
                     info!("✅ Handshake accepted by peer {}", peer_id);
-                    
+
                     // Find the peer by peer_id (could be temporary or real ID)
                     let mut found_peer = false;
-                    
+
                     // First try to find by the resolved peer_id
                     if let Some(peer) = self.peers.get_mut(&resolved_peer_id) {
                         peer.connection_status = ConnectionStatus::Authenticated;
                         peer.ping_failures = 0;
                         peer.reconnection_attempts = 0;
                         found_peer = true;
-                        info!("🔒 Peer {} (resolved to {}) authenticated via direct ID", peer_id, resolved_peer_id);
+                        info!(
+                            "🔒 Peer {} (resolved to {}) authenticated via direct ID",
+                            peer_id, resolved_peer_id
+                        );
                     } else {
                         // If not found, this might be a response where we need to find by stream manager
                         // Look through all peers to find one that matches this connection
                         for (real_peer_id, peer) in self.peers.iter_mut() {
-                            if self.stream_managers.contains_key(real_peer_id) && peer.connection_status == ConnectionStatus::Connected {
+                            if self.stream_managers.contains_key(real_peer_id)
+                                && peer.connection_status == ConnectionStatus::Connected
+                            {
                                 peer.connection_status = ConnectionStatus::Authenticated;
                                 peer.ping_failures = 0;
                                 peer.reconnection_attempts = 0;
                                 found_peer = true;
-                                info!("🔒 Peer {} authenticated via connection mapping", real_peer_id);
+                                info!(
+                                    "🔒 Peer {} authenticated via connection mapping",
+                                    real_peer_id
+                                );
                                 break;
                             }
                         }
                     }
-                    
+
                     if !found_peer {
                         warn!("⚠️ Could not find peer {} to authenticate", peer_id);
                     }
                 } else {
-                    warn!(
-                        "❌ Handshake rejected by peer {}: {:?}",
-                        peer_id, reason
-                    );
+                    warn!("❌ Handshake rejected by peer {}: {:?}", peer_id, reason);
                     if let Some(peer) = self.peers.get_mut(&peer_id) {
                         peer.connection_status = ConnectionStatus::Error(
-                            reason.as_deref().unwrap_or("Handshake rejected").to_string(),
+                            reason
+                                .as_deref()
+                                .unwrap_or("Handshake rejected")
+                                .to_string(),
                         );
                     }
                 }
@@ -745,22 +840,40 @@ impl PeerManager {
 
                 // Validate that the requested file exists
                 let source_path = PathBuf::from(file_path);
-                
+
                 if !source_path.exists() {
                     error!("❌ Requested file does not exist: {}", file_path);
-                    
+
                     // Send rejection response
                     let response = Message::new(MessageType::FileRequestResponse {
                         request_id: *request_id,
                         accepted: false,
                         reason: Some("File does not exist".to_string()),
                     });
-                    
+
                     if let Err(e) = self.send_message_to_peer(peer_id, response).await {
                         error!("Failed to send file request rejection: {}", e);
                     }
                     return Ok(());
                 }
+
+                // Get peer address for HTTP transfer
+                let peer_addr = self
+                    .peers
+                    .get(&resolved_peer_id)
+                    .map(|p| p.device_info.addr)
+                    .ok_or_else(|| FileshareError::Unknown("Peer not found".to_string()))?;
+
+                // Get file metadata
+                let metadata = tokio::fs::metadata(&source_path).await.map_err(|e| {
+                    FileshareError::FileOperation(format!("Failed to read metadata: {}", e))
+                })?;
+                let file_size = metadata.len();
+                let filename = source_path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("unknown")
+                    .to_string();
 
                 // Send acceptance response first
                 let response = Message::new(MessageType::FileRequestResponse {
@@ -768,37 +881,34 @@ impl PeerManager {
                     accepted: true,
                     reason: None,
                 });
-                
+
                 if let Err(e) = self.send_message_to_peer(peer_id, response).await {
                     error!("Failed to send file request acceptance: {}", e);
                     return Ok(());
                 }
 
-                // Use the new optimized transfer
-                let stream_manager_opt = self.stream_managers.get(&resolved_peer_id).cloned();
-                
-                if let Some(stream_manager) = stream_manager_opt {
-                    let source_path_clone = source_path.clone();
-                    let target_path_clone = target_path.clone();
-                    
-                    info!("⚡ Starting ULTRA QUIC transfer: {} -> {}", file_path, target_path);
-                    
-                    // Start ultra-optimized transfer
-                    tokio::spawn(async move {
-                        if let Err(e) = UltraTransfer::transfer_file(
-                            stream_manager,
-                            source_path_clone,
-                            target_path_clone,
-                            resolved_peer_id,
-                        ).await {
-                            error!("❌ ULTRA transfer failed: {}", e);
-                        }
-                    });
-                    
-                    info!("✅ ULTRA transfer initiated: {} -> {}", file_path, target_path);
-                } else {
-                    error!("❌ No stream manager found for peer {}", resolved_peer_id);
-                }
+                info!(
+                    "⚡ Using HTTP for file transfer: {} ({:.1} MB)",
+                    filename,
+                    file_size as f64 / (1024.0 * 1024.0)
+                );
+
+                // Prepare HTTP transfer
+                let download_url = self
+                    .http_transfer_manager
+                    .prepare_file_transfer(source_path, peer_addr)
+                    .await?;
+
+                // Send HTTP file offer
+                let offer_message = Message::new(MessageType::FileOfferHttp {
+                    request_id: *request_id,
+                    filename,
+                    file_size,
+                    download_url,
+                });
+
+                self.send_message_to_peer(peer_id, offer_message).await?;
+                info!("✅ Sent HTTP file offer for request {}", request_id);
             }
 
             MessageType::FileRequestResponse {
@@ -807,7 +917,10 @@ impl PeerManager {
                 reason,
             } => {
                 if *accepted {
-                    info!("✅ File request {} accepted by peer {}", request_id, peer_id);
+                    info!(
+                        "✅ File request {} accepted by peer {}",
+                        request_id, peer_id
+                    );
                     // File transfer will start automatically from the accepting peer
                 } else {
                     warn!(
@@ -819,6 +932,109 @@ impl PeerManager {
                 }
             }
 
+            MessageType::FileOfferHttp {
+                request_id,
+                filename,
+                file_size,
+                download_url,
+            } => {
+                info!(
+                    "📥 Received HTTP file offer from {}: {} ({:.1} MB)",
+                    peer_id,
+                    filename,
+                    *file_size as f64 / (1024.0 * 1024.0)
+                );
+
+                // Determine target path based on the clipboard's current target
+                let target_path = {
+                    let clipboard_state = clipboard.network_clipboard.read().await;
+                    if let Some(item) = &*clipboard_state {
+                        // Use the target path from clipboard paste operation
+                        PathBuf::from(&item.file_path)
+                            .parent()
+                            .unwrap_or(std::path::Path::new("."))
+                            .join(filename)
+                    } else {
+                        // Fallback to downloads directory
+                        dirs::download_dir()
+                            .unwrap_or_else(|| PathBuf::from("."))
+                            .join(filename)
+                    }
+                };
+
+                info!("⬇️ Starting HTTP download to: {:?}", target_path);
+
+                // Send acceptance response
+                let response = Message::new(MessageType::FileOfferHttpResponse {
+                    request_id: *request_id,
+                    accepted: true,
+                    reason: None,
+                });
+                self.send_message_to_peer(peer_id, response).await?;
+
+                // Start HTTP download
+                let http_client = self.http_transfer_manager.clone();
+                let download_url_clone = download_url.clone();
+                let filename_clone = filename.clone();
+                let file_size_val = *file_size;
+
+                tokio::spawn(async move {
+                    match http_client
+                        .download_file(
+                            download_url_clone.clone(),
+                            target_path.clone(),
+                            Some(file_size_val),
+                        )
+                        .await
+                    {
+                        Ok(()) => {
+                            info!("✅ HTTP download completed: {:?}", target_path);
+
+                            // Show success notification
+                            notify_rust::Notification::new()
+                                .summary("File Transfer Complete")
+                                .body(&format!("✅ {} downloaded successfully", filename_clone))
+                                .timeout(notify_rust::Timeout::Milliseconds(3000))
+                                .show()
+                                .ok();
+
+                            // Cleanup the HTTP transfer
+                            http_client.cleanup_transfer(&download_url_clone).await;
+                        }
+                        Err(e) => {
+                            error!("❌ HTTP download failed: {}", e);
+
+                            // Show error notification
+                            notify_rust::Notification::new()
+                                .summary("File Transfer Failed")
+                                .body(&format!("❌ Failed to download {}: {}", filename_clone, e))
+                                .timeout(notify_rust::Timeout::Milliseconds(5000))
+                                .show()
+                                .ok();
+                        }
+                    }
+                });
+            }
+
+            MessageType::FileOfferHttpResponse {
+                request_id,
+                accepted,
+                reason,
+            } => {
+                if *accepted {
+                    info!(
+                        "✅ HTTP file offer {} accepted by peer {}",
+                        request_id, peer_id
+                    );
+                } else {
+                    warn!(
+                        "❌ HTTP file offer {} rejected by peer {}: {}",
+                        request_id,
+                        peer_id,
+                        reason.as_deref().unwrap_or("No reason provided")
+                    );
+                }
+            }
 
             _ => {
                 debug!(

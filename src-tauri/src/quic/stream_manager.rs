@@ -1,7 +1,7 @@
 use crate::quic::connection::QuicConnection;
 use crate::quic::protocol::{QuicProtocol, StreamType};
 use crate::network::protocol::Message;
-use crate::{FileshareError, Result};
+use crate::Result;
 use quinn::{RecvStream, SendStream};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -127,11 +127,10 @@ impl StreamManager {
         
         match stream_type {
             StreamType::FileTransfer => {
-                // Try ultra transfer first, fall back to blazing if not ultra format
-                if let Err(e) = crate::quic::UltraReceiver::handle_incoming_transfer(recv).await {
-                    debug!("Transfer completed or failed: {}", e);
-                    // UltraReceiver will handle protocol detection and fallback internally
-                }
+                // File transfers now handled via HTTP, not QUIC streams
+                warn!("Received file transfer stream, but file transfers are now handled via HTTP");
+                // Just consume and ignore the stream
+                let _ = recv.read_to_end(0).await;
             }
             _ => {
                 warn!("Unexpected unidirectional stream type: {:?}", stream_type);
@@ -204,7 +203,9 @@ impl StreamManager {
         Err(crate::FileshareError::Transfer("Failed to create control stream".to_string()))
     }
     
-    // Open multiple file transfer streams for parallel chunk sending
+    // DEPRECATED: File transfers now use HTTP instead of QUIC streams
+    // This method is kept for backward compatibility but should not be used
+    #[deprecated(note = "Use HTTP file transfers instead")]
     pub async fn open_file_transfer_streams(&self, count: usize) -> Result<Vec<SendStream>> {
         let mut streams = Vec::with_capacity(count);
         
