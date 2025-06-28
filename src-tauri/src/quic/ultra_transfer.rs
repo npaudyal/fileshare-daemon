@@ -16,7 +16,7 @@ use dashmap::DashMap;
 const ULTRA_CHUNK_SIZE: u64 = 128 * 1024 * 1024; // 128MB chunks for maximum throughput
 const MAX_PARALLEL_STREAMS: usize = 256; // Much higher stream concurrency
 const STREAM_BUFFER_SIZE: usize = 16 * 1024 * 1024; // 16MB per-stream buffer
-const WRITE_CONCURRENCY: usize = 64; // Increased concurrent disk writes
+const WRITE_CONCURRENCY: usize = 8; // Reduced to prevent disk I/O contention
 
 pub struct UltraTransfer;
 
@@ -291,13 +291,13 @@ impl UltraTransfer {
         Ok(())
     }
     
-    /// Calculate optimal chunk size for maximum throughput
+    /// Calculate optimal chunk size for maximum throughput (smaller chunks for better disk I/O)
     fn calculate_optimal_chunk_size(file_size: u64) -> u64 {
         match file_size {
-            0..=100_000_000 => 32 * 1024 * 1024,           // <= 100MB: 32MB chunks
-            100_000_001..=500_000_000 => 64 * 1024 * 1024,  // 100-500MB: 64MB chunks
-            500_000_001..=2_000_000_000 => 128 * 1024 * 1024, // 500MB-2GB: 128MB chunks
-            _ => 256 * 1024 * 1024,                        // > 2GB: 256MB chunks
+            0..=100_000_000 => 16 * 1024 * 1024,           // <= 100MB: 16MB chunks
+            100_000_001..=500_000_000 => 32 * 1024 * 1024,  // 100-500MB: 32MB chunks
+            500_000_001..=2_000_000_000 => 64 * 1024 * 1024, // 500MB-2GB: 64MB chunks
+            _ => 128 * 1024 * 1024,                        // > 2GB: 128MB chunks
         }
     }
 }
@@ -445,8 +445,9 @@ impl UltraReceiver {
             }
         };
         
-        // Process chunks
-        let mut buffer = vec![0u8; state.chunk_size as usize];
+        // Process chunks with smaller buffer for better memory management
+        let buffer_size = std::cmp::min(state.chunk_size as usize, 32 * 1024 * 1024); // Max 32MB buffer
+        let mut buffer = vec![0u8; buffer_size];
         let mut chunks_received = 0u64;
         
         loop {
@@ -464,6 +465,11 @@ impl UltraReceiver {
             let chunk_size = u32::from_be_bytes([
                 chunk_header[8], chunk_header[9], chunk_header[10], chunk_header[11],
             ]) as usize;
+            
+            // Ensure we have enough buffer space
+            if chunk_size > buffer.len() {
+                buffer.resize(chunk_size, 0);
+            }
             
             // Read chunk data
             recv_stream.read_exact(&mut buffer[..chunk_size]).await
@@ -486,56 +492,70 @@ impl UltraReceiver {
         chunk_id: u64,
         data: &[u8],
     ) -> Result<()> {
-        // Acquire write permit
+        // Acquire write permit to control disk I/O concurrency
         let _permit = state.write_semaphore.acquire().await
             .map_err(|_| FileshareError::Transfer("Failed to acquire write permit".to_string()))?;
         
         let offset = chunk_id * state.chunk_size;
+        let data_len = data.len();
         
-        // Platform-specific write
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::FileExt;
-            state.file.write_at(data, offset)
-                .map_err(|e| FileshareError::Transfer(format!("Failed to write chunk {}: {}", chunk_id, e)))?;
-        }
+        // Use blocking task for I/O to avoid blocking async executor
+        let file = state.file.clone();
+        let data_owned = data.to_vec(); // Copy data for move into blocking task
+        let _write_result = tokio::task::spawn_blocking(move || {
+            // Platform-specific write with error handling
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::FileExt;
+                file.write_at(&data_owned, offset)
+                    .map_err(|e| FileshareError::Transfer(format!("Failed to write chunk {} (offset {}, {} bytes): {}", chunk_id, offset, data_len, e)))
+            }
+            
+            #[cfg(windows)]
+            {
+                use std::os::windows::fs::FileExt;
+                file.seek_write(&data_owned, offset)
+                    .map_err(|e| FileshareError::Transfer(format!("Failed to write chunk {} (offset {}, {} bytes): {}", chunk_id, offset, data_len, e)))
+            }
+        }).await
+        .map_err(|e| FileshareError::Transfer(format!("Write task failed: {}", e)))??;
         
-        #[cfg(windows)]
-        {
-            use std::os::windows::fs::FileExt;
-            let file = state.file.lock().await;
-            file.seek_write(data, offset)
-                .map_err(|e| FileshareError::Transfer(format!("Failed to write chunk {}: {}", chunk_id, e)))?;
-        }
+        debug!("Written chunk {} ({} bytes) at offset {}", chunk_id, data_len, offset);
         
         // Update progress
         let received = state.received_chunks.fetch_add(1, Ordering::Relaxed) + 1;
         
-        if received % 10 == 0 || received == state.total_chunks {
+        if received % 5 == 0 || received == state.total_chunks {
             let progress = (received as f64 / state.total_chunks as f64) * 100.0;
             info!("⚡ Progress: {:.1}% ({}/{})", progress, received, state.total_chunks);
         }
         
         // Check completion
         if received == state.total_chunks && !state.completed.swap(true, Ordering::Relaxed) {
-            // Sync file
-            #[cfg(unix)]
-            {
-                state.file.sync_all()
-                    .map_err(|e| FileshareError::Transfer(format!("Failed to sync file: {}", e)))?;
-            }
+            // Sync file in blocking task
+            let file = state.file.clone();
+            let filename = state.filename.clone();
+            let transfer_id = state.transfer_id.clone();
             
-            #[cfg(windows)]
-            {
-                let file = state.file.lock().await;
-                file.sync_all()
-                    .map_err(|e| FileshareError::Transfer(format!("Failed to sync file: {}", e)))?;
-            }
+            tokio::task::spawn_blocking(move || {
+                #[cfg(unix)]
+                {
+                    file.sync_all()
+                        .map_err(|e| FileshareError::Transfer(format!("Failed to sync file: {}", e)))
+                }
+                
+                #[cfg(windows)]
+                {
+                    file.sync_all()
+                        .map_err(|e| FileshareError::Transfer(format!("Failed to sync file: {}", e)))
+                }
+            }).await
+            .map_err(|e| FileshareError::Transfer(format!("Sync task failed: {}", e)))??;
             
-            info!("🎉 ULTRA transfer complete: {}", state.filename);
+            info!("🎉 ULTRA transfer complete: {}", filename);
             
             // Cleanup
-            ULTRA_TRANSFERS.remove(&state.transfer_id);
+            ULTRA_TRANSFERS.remove(&transfer_id);
         }
         
         Ok(())
