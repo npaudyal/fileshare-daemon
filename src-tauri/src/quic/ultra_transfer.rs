@@ -514,7 +514,10 @@ impl UltraReceiver {
             #[cfg(windows)]
             {
                 use std::os::windows::fs::FileExt;
-                file.seek_write(&data_owned, offset)
+                use std::io::{Seek, Write, SeekFrom};
+                let mut file_guard = file.lock().unwrap();
+                file_guard.seek(SeekFrom::Start(offset))
+                    .and_then(|_| file_guard.write_all(&data_owned))
                     .map_err(|e| FileshareError::Transfer(format!("Failed to write chunk {} (offset {}, {} bytes): {}", chunk_id, offset, data_len, e)))
             }
         }).await
@@ -546,7 +549,8 @@ impl UltraReceiver {
                 
                 #[cfg(windows)]
                 {
-                    file.sync_all()
+                    let file_guard = file.lock().unwrap();
+                    file_guard.sync_all()
                         .map_err(|e| FileshareError::Transfer(format!("Failed to sync file: {}", e)))
                 }
             }).await
