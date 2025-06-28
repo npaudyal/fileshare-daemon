@@ -195,29 +195,29 @@ impl QuicConnectionManager {
     }
 }
 
-// Create optimized transport config for high-throughput LAN transfers
+// Create ULTRA-optimized transport config for maximum LAN throughput
 fn create_optimized_transport_config() -> quinn::TransportConfig {
     let mut config = quinn::TransportConfig::default();
     
-    // Maximize flow control windows for LAN environments
-    config.stream_receive_window(quinn::VarInt::from_u32(128 * 1024 * 1024)); // 128MB per stream
-    config.receive_window(quinn::VarInt::from_u32(1024 * 1024 * 1024)); // 1GB connection window
-    config.send_window(1024 * 1024 * 1024); // 1GB send window
+    // MASSIVE flow control windows for ultra-high LAN speeds
+    config.stream_receive_window(quinn::VarInt::from_u32(512 * 1024 * 1024)); // 512MB per stream
+    config.receive_window(quinn::VarInt::from_u32(2048 * 1024 * 1024)); // 2GB connection window (max for u32)
+    config.send_window(2048 * 1024 * 1024); // 2GB send window
     
-    // Allow many concurrent streams
-    config.max_concurrent_bidi_streams(quinn::VarInt::from_u32(1024));
-    config.max_concurrent_uni_streams(quinn::VarInt::from_u32(1024));
+    // Maximum concurrent streams for parallel transfers
+    config.max_concurrent_bidi_streams(quinn::VarInt::from_u32(2048));
+    config.max_concurrent_uni_streams(quinn::VarInt::from_u32(2048));
     
-    // Increase datagram buffer for better throughput
-    config.datagram_receive_buffer_size(Some(64 * 1024 * 1024)); // 64MB
+    // Huge datagram buffer for maximum throughput
+    config.datagram_receive_buffer_size(Some(256 * 1024 * 1024)); // 256MB
     
-    // Set longer idle timeout for stable connections
-    config.max_idle_timeout(Some(quinn::VarInt::from_u32(300_000).into())); // 5 minutes
+    // Extended idle timeout for stable connections
+    config.max_idle_timeout(Some(quinn::VarInt::from_u32(600_000).into())); // 10 minutes
     
     // Disable keep-alive for LAN (unnecessary overhead)
     config.keep_alive_interval(None);
     
-    // Use BBR congestion control for better throughput
+    // Use BBR congestion control optimized for high bandwidth
     config.congestion_controller_factory(Arc::new(quinn::congestion::BbrConfig::default()));
     
     config

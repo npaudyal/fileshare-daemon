@@ -10,7 +10,7 @@ use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 use futures;
 
-const MAX_CONCURRENT_STREAMS: usize = 256; // Maximize concurrent streams for high throughput
+const MAX_CONCURRENT_STREAMS: usize = 512; // Massive concurrent streams for ultra-high throughput
 const STREAM_POOL_SIZE: usize = 8; // Pre-allocated stream pool size
 
 pub struct StreamManager {

@@ -12,11 +12,12 @@ use futures::future::join_all;
 // use bytes::BytesMut; // Not needed
 use dashmap::DashMap;
 
-// Ultra-optimized constants
+// Ultra-optimized constants for maximum network throughput
 const ULTRA_CHUNK_SIZE: u64 = 128 * 1024 * 1024; // 128MB chunks for maximum throughput
-const MAX_PARALLEL_STREAMS: usize = 256; // Much higher stream concurrency
-const STREAM_BUFFER_SIZE: usize = 16 * 1024 * 1024; // 16MB per-stream buffer
-const WRITE_CONCURRENCY: usize = 8; // Reduced to prevent disk I/O contention
+const MAX_PARALLEL_STREAMS: usize = 64; // Aggressive parallelism for LAN speeds
+const STREAM_BUFFER_SIZE: usize = 32 * 1024 * 1024; // 32MB per-stream buffer for better throughput
+const WRITE_CONCURRENCY: usize = 16; // Increased for faster parallel writes
+const NETWORK_SEND_BUFFER: usize = 64 * 1024 * 1024; // 64MB network send buffer
 
 pub struct UltraTransfer;
 
@@ -25,18 +26,18 @@ impl UltraTransfer {
     pub fn create_optimized_transport_config() -> TransportConfig {
         let mut config = TransportConfig::default();
         
-        // Maximize flow control windows
-        config.max_idle_timeout(Some(VarInt::from_u32(300_000).into())); // 5 minutes
-        config.stream_receive_window(VarInt::from_u32(256 * 1024 * 1024)); // 256MB per stream
-        config.receive_window(VarInt::from_u32(2048 * 1024 * 1024)); // 2GB connection window
+        // AGGRESSIVE flow control windows for LAN speeds
+        config.max_idle_timeout(Some(VarInt::from_u32(600_000).into())); // 10 minutes
+        config.stream_receive_window(VarInt::from_u32(512 * 1024 * 1024)); // 512MB per stream
+        config.receive_window(VarInt::from_u32(2048 * 1024 * 1024)); // 2GB connection window (max for u32)
         config.send_window(2048 * 1024 * 1024); // 2GB send window
         
-        // Optimize for throughput
-        config.max_concurrent_bidi_streams(VarInt::from_u32(1024));
-        config.max_concurrent_uni_streams(VarInt::from_u32(1024));
-        config.datagram_receive_buffer_size(Some(128 * 1024 * 1024)); // 128MB
+        // Maximum stream concurrency
+        config.max_concurrent_bidi_streams(VarInt::from_u32(2048));
+        config.max_concurrent_uni_streams(VarInt::from_u32(2048));
+        config.datagram_receive_buffer_size(Some(256 * 1024 * 1024)); // 256MB
         
-        // Disable features that add latency
+        // Optimize for LAN speeds
         config.keep_alive_interval(None);
         config.congestion_controller_factory(Arc::new(quinn::congestion::BbrConfig::default()));
         
@@ -61,10 +62,12 @@ impl UltraTransfer {
         info!("⚡ Starting ULTRA transfer: {} ({:.1} MB)", 
               filename, file_size as f64 / (1024.0 * 1024.0));
         
-        // Use ultra-optimized chunk size
+        // Use ultra-optimized chunk size with aggressive streaming
         let chunk_size = Self::calculate_optimal_chunk_size(file_size);
         let total_chunks = (file_size + chunk_size - 1) / chunk_size;
-        let stream_count = std::cmp::min(MAX_PARALLEL_STREAMS, total_chunks as usize).max(1);
+        
+        // Use more streams for better parallelism (minimum 8 streams even for small files)
+        let stream_count = std::cmp::min(MAX_PARALLEL_STREAMS, total_chunks as usize).max(8);
         
         info!("⚡ ULTRA config: {} streams, {} chunks of {:.1} MB each", 
               stream_count, total_chunks, chunk_size as f64 / (1024.0 * 1024.0));
@@ -77,8 +80,8 @@ impl UltraTransfer {
         
         Self::send_metadata(&mut metadata_stream, &filename, file_size, &target_path, chunk_size, total_chunks, &transfer_id).await?;
         
-        // Wait a bit for metadata to be processed on receiver side
-        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        // Minimal wait for metadata processing (reduced for speed)
+        tokio::time::sleep(tokio::time::Duration::from_millis(25)).await;
         
         // Open all data streams in parallel - KEY OPTIMIZATION!
         let stream_futures: Vec<_> = (0..stream_count)
@@ -248,11 +251,11 @@ impl UltraTransfer {
         stream.write_all(transfer_id.as_bytes()).await
             .map_err(|e| FileshareError::Transfer(format!("Failed to write transfer ID: {}", e)))?;
         
-        // Use buffered reader for better performance
+        // Use buffered reader with larger buffer for network throughput
         let file = tokio::fs::File::open(file_path.as_ref()).await?;
-        let mut file = tokio::io::BufReader::with_capacity(STREAM_BUFFER_SIZE, file);
+        let mut file = tokio::io::BufReader::with_capacity(NETWORK_SEND_BUFFER, file);
         
-        // Pre-allocate buffer
+        // Pre-allocate larger buffer for better network utilization
         let mut buffer = vec![0u8; chunk_size as usize];
         
         for chunk_idx in start_chunk..end_chunk {
@@ -279,7 +282,8 @@ impl UltraTransfer {
             
             bytes_sent.fetch_add(bytes_to_read as u64, Ordering::Relaxed);
             
-            if chunk_idx % 5 == 0 {
+            // Reduce logging overhead for speed
+            if chunk_idx % 10 == 0 {
                 debug!("Stream {} sent chunk {}/{}", stream_idx, chunk_idx - start_chunk + 1, end_chunk - start_chunk);
             }
         }
@@ -291,13 +295,13 @@ impl UltraTransfer {
         Ok(())
     }
     
-    /// Calculate optimal chunk size for maximum throughput (smaller chunks for better disk I/O)
+    /// Calculate optimal chunk size for maximum network throughput
     fn calculate_optimal_chunk_size(file_size: u64) -> u64 {
         match file_size {
-            0..=100_000_000 => 16 * 1024 * 1024,           // <= 100MB: 16MB chunks
-            100_000_001..=500_000_000 => 32 * 1024 * 1024,  // 100-500MB: 32MB chunks
-            500_000_001..=2_000_000_000 => 64 * 1024 * 1024, // 500MB-2GB: 64MB chunks
-            _ => 128 * 1024 * 1024,                        // > 2GB: 128MB chunks
+            0..=50_000_000 => 8 * 1024 * 1024,            // <= 50MB: 8MB chunks (more streams)
+            50_000_001..=200_000_000 => 16 * 1024 * 1024,   // 50-200MB: 16MB chunks
+            200_000_001..=1_000_000_000 => 32 * 1024 * 1024, // 200MB-1GB: 32MB chunks
+            _ => 64 * 1024 * 1024,                         // > 1GB: 64MB chunks (balance streams vs size)
         }
     }
 }
@@ -426,7 +430,7 @@ impl UltraReceiver {
         mut recv_stream: RecvStream,
         transfer_id: String,
     ) -> Result<()> {
-        // Wait for transfer to be registered (with timeout)
+        // Wait for transfer to be registered (optimized for speed)
         let state = {
             let mut attempts = 0;
             loop {
@@ -435,13 +439,13 @@ impl UltraReceiver {
                 }
                 
                 attempts += 1;
-                if attempts > 20 { // 2 seconds max wait
+                if attempts > 40 { // 2 seconds max wait with faster checks
                     error!("Transfer {} not found after {} attempts", transfer_id, attempts);
                     return Err(FileshareError::Transfer(format!("Transfer {} not found after timeout", transfer_id)));
                 }
                 
-                debug!("Waiting for transfer {} to be registered (attempt {})", transfer_id, attempts);
-                tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+                // Faster polling for reduced latency
+                tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
             }
         };
         
@@ -479,7 +483,8 @@ impl UltraReceiver {
             Self::write_chunk_ultra(state.clone(), chunk_id, &buffer[..chunk_size]).await?;
             
             chunks_received += 1;
-            if chunks_received % 10 == 0 {
+            // Reduce logging for speed
+            if chunks_received % 20 == 0 {
                 debug!("Received {} chunks for transfer {}", chunks_received, transfer_id);
             }
         }
@@ -528,7 +533,8 @@ impl UltraReceiver {
         // Update progress
         let received = state.received_chunks.fetch_add(1, Ordering::Relaxed) + 1;
         
-        if received % 5 == 0 || received == state.total_chunks {
+        // Less frequent progress updates for speed
+        if received % 2 == 0 || received == state.total_chunks {
             let progress = (received as f64 / state.total_chunks as f64) * 100.0;
             info!("⚡ Progress: {:.1}% ({}/{})", progress, received, state.total_chunks);
         }
