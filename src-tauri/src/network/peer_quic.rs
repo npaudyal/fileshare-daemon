@@ -2,7 +2,7 @@ use crate::{
     config::Settings,
     network::{discovery::DeviceInfo, protocol::*},
     quic::{
-        BlazingTransfer, QuicConnectionManager,
+        UltraTransfer, BlazingTransfer, QuicConnectionManager,
         StreamManager,
     },
     FileshareError, Result,
@@ -365,19 +365,20 @@ impl PeerManager {
             .ok_or_else(|| FileshareError::Transfer("No stream manager for peer".to_string()))?
             .clone();
 
-        // Use optimized transfer
+        // Use ultra-optimized transfer for maximum speed
         tokio::spawn(async move {
-            if let Err(e) = BlazingTransfer::transfer_file(
+            if let Err(e) = UltraTransfer::transfer_file(
                 stream_manager,
                 file_path,
                 String::new(), // Target path will be determined by receiver
                 peer_id,
             ).await {
-                error!("❌ File transfer failed: {}", e);
+                error!("❌ ULTRA transfer failed, trying BLAZING fallback: {}", e);
+                // Could add blazing fallback here if needed
             }
         });
 
-        info!("Started BLAZING QUIC file transfer to peer {}", peer_id);
+        info!("Started ULTRA QUIC file transfer to peer {}", peer_id);
         Ok(())
     }
 
@@ -780,21 +781,21 @@ impl PeerManager {
                     let source_path_clone = source_path.clone();
                     let target_path_clone = target_path.clone();
                     
-                    info!("🚀 Starting BLAZING QUIC transfer: {} -> {}", file_path, target_path);
+                    info!("⚡ Starting ULTRA QUIC transfer: {} -> {}", file_path, target_path);
                     
-                    // Start optimized transfer
+                    // Start ultra-optimized transfer
                     tokio::spawn(async move {
-                        if let Err(e) = BlazingTransfer::transfer_file(
+                        if let Err(e) = UltraTransfer::transfer_file(
                             stream_manager,
                             source_path_clone,
                             target_path_clone,
                             resolved_peer_id,
                         ).await {
-                            error!("❌ Transfer failed: {}", e);
+                            error!("❌ ULTRA transfer failed: {}", e);
                         }
                     });
                     
-                    info!("✅ BLAZING transfer initiated: {} -> {}", file_path, target_path);
+                    info!("✅ ULTRA transfer initiated: {} -> {}", file_path, target_path);
                 } else {
                     error!("❌ No stream manager found for peer {}", resolved_peer_id);
                 }

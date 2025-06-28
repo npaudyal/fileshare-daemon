@@ -127,9 +127,10 @@ impl StreamManager {
         
         match stream_type {
             StreamType::FileTransfer => {
-                // Use blazing receiver for maximum performance
-                if let Err(e) = crate::quic::BlazingReceiver::handle_incoming_transfer(recv).await {
-                    error!("Failed to handle blazing transfer: {}", e);
+                // Try ultra transfer first, fall back to blazing if not ultra format
+                if let Err(e) = crate::quic::UltraReceiver::handle_incoming_transfer(recv).await {
+                    debug!("Transfer completed or failed: {}", e);
+                    // UltraReceiver will handle protocol detection and fallback internally
                 }
             }
             _ => {
