@@ -499,29 +499,29 @@ impl UltraReceiver {
         let offset = chunk_id * state.chunk_size;
         let data_len = data.len();
         
-        // Use blocking task for I/O to avoid blocking async executor
-        let file = state.file.clone();
-        let data_owned = data.to_vec(); // Copy data for move into blocking task
-        let _write_result = tokio::task::spawn_blocking(move || {
-            // Platform-specific write with error handling
-            #[cfg(unix)]
-            {
+        // Platform-specific write with proper async handling
+        #[cfg(unix)]
+        {
+            // Use blocking task for I/O to avoid blocking async executor
+            let file = state.file.clone();
+            let data_owned = data.to_vec();
+            let _write_result = tokio::task::spawn_blocking(move || {
                 use std::os::unix::fs::FileExt;
                 file.write_at(&data_owned, offset)
                     .map_err(|e| FileshareError::Transfer(format!("Failed to write chunk {} (offset {}, {} bytes): {}", chunk_id, offset, data_len, e)))
-            }
-            
-            #[cfg(windows)]
-            {
-                use std::os::windows::fs::FileExt;
-                use std::io::{Seek, Write, SeekFrom};
-                let mut file_guard = file.lock().unwrap();
-                file_guard.seek(SeekFrom::Start(offset))
-                    .and_then(|_| file_guard.write_all(&data_owned))
-                    .map_err(|e| FileshareError::Transfer(format!("Failed to write chunk {} (offset {}, {} bytes): {}", chunk_id, offset, data_len, e)))
-            }
-        }).await
-        .map_err(|e| FileshareError::Transfer(format!("Write task failed: {}", e)))??;
+            }).await
+            .map_err(|e| FileshareError::Transfer(format!("Write task failed: {}", e)))??;
+        }
+        
+        #[cfg(windows)]
+        {
+            // On Windows, use async mutex properly
+            use std::io::{Seek, Write, SeekFrom};
+            let mut file_guard = state.file.lock().await;
+            file_guard.seek(SeekFrom::Start(offset))
+                .and_then(|_| file_guard.write_all(data))
+                .map_err(|e| FileshareError::Transfer(format!("Failed to write chunk {} (offset {}, {} bytes): {}", chunk_id, offset, data_len, e)))?;
+        }
         
         debug!("Written chunk {} ({} bytes) at offset {}", chunk_id, data_len, offset);
         
@@ -540,21 +540,23 @@ impl UltraReceiver {
             let filename = state.filename.clone();
             let transfer_id = state.transfer_id.clone();
             
-            tokio::task::spawn_blocking(move || {
-                #[cfg(unix)]
-                {
-                    file.sync_all()
+            // Platform-specific file sync
+            #[cfg(unix)]
+            {
+                let file_clone = file.clone();
+                tokio::task::spawn_blocking(move || {
+                    file_clone.sync_all()
                         .map_err(|e| FileshareError::Transfer(format!("Failed to sync file: {}", e)))
-                }
-                
-                #[cfg(windows)]
-                {
-                    let file_guard = file.lock().unwrap();
-                    file_guard.sync_all()
-                        .map_err(|e| FileshareError::Transfer(format!("Failed to sync file: {}", e)))
-                }
-            }).await
-            .map_err(|e| FileshareError::Transfer(format!("Sync task failed: {}", e)))??;
+                }).await
+                .map_err(|e| FileshareError::Transfer(format!("Sync task failed: {}", e)))??;
+            }
+            
+            #[cfg(windows)]
+            {
+                let file_guard = file.lock().await;
+                file_guard.sync_all()
+                    .map_err(|e| FileshareError::Transfer(format!("Failed to sync file: {}", e)))?;
+            }
             
             info!("🎉 ULTRA transfer complete: {}", filename);
             
