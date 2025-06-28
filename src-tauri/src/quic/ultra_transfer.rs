@@ -69,13 +69,16 @@ impl UltraTransfer {
         info!("⚡ ULTRA config: {} streams, {} chunks of {:.1} MB each", 
               stream_count, total_chunks, chunk_size as f64 / (1024.0 * 1024.0));
         
-        // Send metadata first
+        // Send metadata first and wait for it to be processed
         let transfer_id = Uuid::new_v4();
         let mut metadata_stream = stream_manager.open_file_transfer_streams(1).await?
             .into_iter().next()
             .ok_or_else(|| FileshareError::Transfer("Failed to create metadata stream".to_string()))?;
         
         Self::send_metadata(&mut metadata_stream, &filename, file_size, &target_path, chunk_size, total_chunks, &transfer_id).await?;
+        
+        // Wait a bit for metadata to be processed on receiver side
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
         
         // Open all data streams in parallel - KEY OPTIMIZATION!
         let stream_futures: Vec<_> = (0..stream_count)
@@ -173,10 +176,26 @@ impl UltraTransfer {
             }
         });
         
-        // Wait for all transfers
-        for handle in handles {
-            handle.await
-                .map_err(|e| FileshareError::Transfer(format!("Task failed: {}", e)))??;
+        // Wait for all transfers with better error handling
+        let mut transfer_failed = false;
+        for (idx, handle) in handles.into_iter().enumerate() {
+            match handle.await {
+                Ok(Ok(())) => {
+                    debug!("Stream {} completed successfully", idx);
+                },
+                Ok(Err(e)) => {
+                    error!("Stream {} failed: {}", idx, e);
+                    transfer_failed = true;
+                },
+                Err(e) => {
+                    error!("Stream {} task panicked: {}", idx, e);
+                    transfer_failed = true;
+                }
+            }
+        }
+        
+        if transfer_failed {
+            return Err(FileshareError::Transfer("One or more streams failed".to_string()));
         }
         
         monitor_handle.abort();
@@ -250,13 +269,13 @@ impl UltraTransfer {
             file.read_exact(&mut buffer[..bytes_to_read]).await
                 .map_err(|e| FileshareError::FileOperation(format!("Read failed: {}", e)))?;
             
-            // Send chunk header and data
+            // Send chunk header and data with detailed error info
             stream.write_all(&chunk_idx.to_be_bytes()).await
-                .map_err(|e| FileshareError::Transfer(format!("Failed to write chunk ID: {}", e)))?;
+                .map_err(|e| FileshareError::Transfer(format!("Failed to write chunk ID {} on stream {}: {}", chunk_idx, stream_idx, e)))?;
             stream.write_all(&(bytes_to_read as u32).to_be_bytes()).await
-                .map_err(|e| FileshareError::Transfer(format!("Failed to write chunk size: {}", e)))?;
+                .map_err(|e| FileshareError::Transfer(format!("Failed to write chunk size {} on stream {}: {}", bytes_to_read, stream_idx, e)))?;
             stream.write_all(&buffer[..bytes_to_read]).await
-                .map_err(|e| FileshareError::Transfer(format!("Failed to write chunk data: {}", e)))?;
+                .map_err(|e| FileshareError::Transfer(format!("Failed to write chunk data {} bytes on stream {}: {}", bytes_to_read, stream_idx, e)))?;
             
             bytes_sent.fetch_add(bytes_to_read as u64, Ordering::Relaxed);
             
@@ -407,11 +426,22 @@ impl UltraReceiver {
         mut recv_stream: RecvStream,
         transfer_id: String,
     ) -> Result<()> {
-        let state = match ULTRA_TRANSFERS.get(&transfer_id) {
-            Some(state) => state.clone(),
-            None => {
-                error!("Transfer {} not found", transfer_id);
-                return Err(FileshareError::Transfer(format!("Transfer {} not found", transfer_id)));
+        // Wait for transfer to be registered (with timeout)
+        let state = {
+            let mut attempts = 0;
+            loop {
+                if let Some(state) = ULTRA_TRANSFERS.get(&transfer_id) {
+                    break state.clone();
+                }
+                
+                attempts += 1;
+                if attempts > 20 { // 2 seconds max wait
+                    error!("Transfer {} not found after {} attempts", transfer_id, attempts);
+                    return Err(FileshareError::Transfer(format!("Transfer {} not found after timeout", transfer_id)));
+                }
+                
+                debug!("Waiting for transfer {} to be registered (attempt {})", transfer_id, attempts);
+                tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
             }
         };
         
