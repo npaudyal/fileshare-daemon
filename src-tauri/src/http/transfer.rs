@@ -1,5 +1,5 @@
 use crate::{FileshareError, Result};
-use crate::http::{OptimizedHttpServer, OptimizedHttpClient};
+use crate::http::{HttpFileServer, HttpFileClient};
 use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -25,8 +25,8 @@ pub struct TransferStats {
 }
 
 pub struct HttpTransferManager {
-    http_server: Arc<OptimizedHttpServer>,
-    http_client: OptimizedHttpClient,
+    http_server: Arc<HttpFileServer>,
+    http_client: HttpFileClient,
     http_port: u16,
     local_ip: Option<IpAddr>,
     active_transfers: Arc<RwLock<dashmap::DashMap<Uuid, TransferStats>>>,
@@ -34,12 +34,12 @@ pub struct HttpTransferManager {
 
 impl HttpTransferManager {
     pub async fn new(http_port: u16) -> Result<Self> {
-        let http_server = Arc::new(OptimizedHttpServer::new(http_port));
-        let http_client = OptimizedHttpClient::new();
+        let http_server = Arc::new(HttpFileServer::new(http_port));
+        let http_client = HttpFileClient::new();
         
         // Try to detect local IP
         let local_ip = Self::detect_local_ip().await;
-        info!("🚀 OPTIMIZED HTTP Transfer Manager initialized on port {} with ultra-fast profiles (IP: {:?})", http_port, local_ip);
+        info!("🌐 HTTP Transfer Manager initialized on port {} (IP: {:?})", http_port, local_ip);
         
         Ok(Self {
             http_server,
@@ -59,7 +59,7 @@ impl HttpTransferManager {
         info!("🚀 Starting optimized HTTP file server on port {}", self.http_port);
         
         tokio::spawn(async move {
-            if let Err(e) = server_for_spawn.start_optimized().await {
+            if let Err(e) = server_for_spawn.start().await {
                 error!("❌ HTTP server failed: {}", e);
             }
         });
@@ -95,7 +95,7 @@ impl HttpTransferManager {
         }
 
         // Register file and get token
-        let token = self.http_server.register_file(file_path.clone()).await?;
+        let token = self.http_server.register_file(file_path.clone());
         
         // Determine the best IP to use
         let server_ip = if peer_addr.ip().is_loopback() {
@@ -142,8 +142,8 @@ impl HttpTransferManager {
                 .map_err(|e| FileshareError::FileOperation(format!("Failed to create directory: {}", e)))?;
         }
 
-        // Use optimized client with dynamic profiles for maximum speed
-        let result = self.http_client.download_file_optimized(url.clone(), target_path, expected_size).await;
+        // Use optimized client with parallel downloads for large files
+        let result = self.http_client.download_file(url.clone(), target_path, expected_size).await;
         
         // Remove from active transfers
         {

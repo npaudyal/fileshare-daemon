@@ -1,28 +1,29 @@
 use bytes::Bytes;
+use futures::future::join_all;
+use http_body_util::BodyExt;
 use hyper::{Method, Request, Uri};
 use hyper_util::client::legacy::Client;
 use hyper_util::rt::TokioExecutor;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::fs::OpenOptions;
-use tokio::io::{AsyncWriteExt, AsyncSeekExt};
+use tokio::io::{AsyncSeekExt, AsyncWriteExt};
 use tokio::sync::Semaphore;
-use tracing::{info, debug};
-use http_body_util::BodyExt;
-use futures::future::join_all;
+use tracing::{debug, info};
 
 use crate::{FileshareError, Result};
 
 // Optimized buffer sizes for LAN transfers
-const DOWNLOAD_BUFFER_SIZE: usize = 8 * 1024 * 1024; // 8MB buffer for optimal performance
+const DOWNLOAD_BUFFER_SIZE: usize = 16 * 1024 * 1024; // 8MB buffer for optimal performance
 const WRITE_THRESHOLD: usize = 2 * 1024 * 1024; // Write every 2MB for continuous streaming
-const PARALLEL_CONNECTIONS: usize = 4; // Number of parallel connections for large files
-const LARGE_FILE_THRESHOLD: u64 = 50 * 1024 * 1024; // Files > 50MB use parallel downloads
+const PARALLEL_CONNECTIONS: usize = 16; // Number of parallel connections for large files
+const LARGE_FILE_THRESHOLD: u64 = 20 * 1024 * 1024; // Files > 50MB use parallel downloads
 
 pub struct HttpFileClient {
-    client: Client<hyper_util::client::legacy::connect::HttpConnector, http_body_util::Empty<Bytes>>,
+    client:
+        Client<hyper_util::client::legacy::connect::HttpConnector, http_body_util::Empty<Bytes>>,
     parallel_semaphore: Arc<Semaphore>,
 }
 
@@ -36,8 +37,8 @@ impl HttpFileClient {
             .http1_title_case_headers(false)
             .http1_preserve_header_case(false)
             .build_http();
-        
-        Self { 
+
+        Self {
             client,
             parallel_semaphore: Arc::new(Semaphore::new(PARALLEL_CONNECTIONS)),
         }
@@ -59,17 +60,22 @@ impl HttpFileClient {
 
         // Decide whether to use parallel downloads based on file size
         if file_size > LARGE_FILE_THRESHOLD {
-            info!("📊 Large file detected ({:.1} MB), using parallel downloads", 
-                  file_size as f64 / (1024.0 * 1024.0));
-            self.download_file_parallel(url, target_path, file_size).await
+            info!(
+                "📊 Large file detected ({:.1} MB), using parallel downloads",
+                file_size as f64 / (1024.0 * 1024.0)
+            );
+            self.download_file_parallel(url, target_path, file_size)
+                .await
         } else {
-            self.download_file_single(url, target_path, Some(file_size)).await
+            self.download_file_single(url, target_path, Some(file_size))
+                .await
         }
     }
 
     /// Get file size from HTTP HEAD request
     async fn get_file_size(&self, url: &str) -> Result<u64> {
-        let uri: Uri = url.parse()
+        let uri: Uri = url
+            .parse()
             .map_err(|e| FileshareError::Transfer(format!("Invalid URL: {}", e)))?;
 
         let req = Request::builder()
@@ -79,10 +85,14 @@ impl HttpFileClient {
             .body(http_body_util::Empty::<Bytes>::new())
             .map_err(|e| FileshareError::Transfer(format!("Failed to build request: {}", e)))?;
 
-        let res = self.client.request(req).await
+        let res = self
+            .client
+            .request(req)
+            .await
             .map_err(|e| FileshareError::Transfer(format!("HEAD request failed: {}", e)))?;
 
-        let content_length = res.headers()
+        let content_length = res
+            .headers()
             .get("content-length")
             .and_then(|v| v.to_str().ok())
             .and_then(|v| v.parse::<u64>().ok())
@@ -99,7 +109,10 @@ impl HttpFileClient {
         file_size: u64,
     ) -> Result<()> {
         let start_time = Instant::now();
-        info!("⚡ Starting parallel HTTP download with {} connections", PARALLEL_CONNECTIONS);
+        info!(
+            "⚡ Starting parallel HTTP download with {} connections",
+            PARALLEL_CONNECTIONS
+        );
 
         // Create target file and pre-allocate space
         let mut file = OpenOptions::new()
@@ -139,20 +152,24 @@ impl HttpFileClient {
         let monitor_handle = tokio::spawn(async move {
             let mut last_bytes = 0u64;
             let mut last_time = Instant::now();
-            
+
             while !download_complete_monitor.load(Ordering::Relaxed) {
                 tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
                 let current_bytes = bytes_downloaded_monitor.load(Ordering::Relaxed);
                 let current_time = Instant::now();
                 let elapsed = current_time.duration_since(last_time).as_secs_f64();
-                
+
                 if elapsed > 0.0 && file_size > 0 {
-                    let speed_mbps = ((current_bytes - last_bytes) as f64 * 8.0) / (elapsed * 1_000_000.0);
+                    let speed_mbps =
+                        ((current_bytes - last_bytes) as f64 * 8.0) / (elapsed * 1_000_000.0);
                     let progress = (current_bytes as f64 / file_size as f64) * 100.0;
-                    
-                    info!("⬇️ Progress: {:.1}% - Speed: {:.1} Mbps", progress, speed_mbps);
+
+                    info!(
+                        "⬇️ Progress: {:.1}% - Speed: {:.1} Mbps",
+                        progress, speed_mbps
+                    );
                 }
-                
+
                 last_bytes = current_bytes;
                 last_time = current_time;
             }
@@ -175,15 +192,18 @@ impl HttpFileClient {
             let semaphore = self.parallel_semaphore.clone();
 
             let task = tokio::spawn(async move {
-                let _permit = semaphore.acquire().await
-                    .map_err(|_| FileshareError::Transfer("Failed to acquire semaphore".to_string()))?;
-                client.download_range(
-                    url_clone,
-                    target_path_clone,
-                    start,
-                    end,
-                    bytes_downloaded_clone,
-                ).await
+                let _permit = semaphore.acquire().await.map_err(|_| {
+                    FileshareError::Transfer("Failed to acquire semaphore".to_string())
+                })?;
+                client
+                    .download_range(
+                        url_clone,
+                        target_path_clone,
+                        start,
+                        end,
+                        bytes_downloaded_clone,
+                    )
+                    .await
             });
 
             tasks.push(task);
@@ -197,23 +217,26 @@ impl HttpFileClient {
         // Check for errors
         for result in results {
             match result {
-                Ok(Ok(())) => {},
+                Ok(Ok(())) => {}
                 Ok(Err(e)) => return Err(e),
                 Err(e) => return Err(FileshareError::Transfer(format!("Task failed: {}", e))),
             }
         }
 
         // Ensure all data is written
-        file.sync_all().await
+        file.sync_all()
+            .await
             .map_err(|e| FileshareError::FileOperation(format!("Failed to sync: {}", e)))?;
 
         let duration = start_time.elapsed();
         let throughput_mbps = (file_size as f64 * 8.0) / (duration.as_secs_f64() * 1_000_000.0);
-        
-        info!("✅ Parallel HTTP download complete: {:.1} MB in {:.2}s ({:.1} Mbps)", 
-              file_size as f64 / (1024.0 * 1024.0), 
-              duration.as_secs_f64(), 
-              throughput_mbps);
+
+        info!(
+            "✅ Parallel HTTP download complete: {:.1} MB in {:.2}s ({:.1} Mbps)",
+            file_size as f64 / (1024.0 * 1024.0),
+            duration.as_secs_f64(),
+            throughput_mbps
+        );
 
         Ok(())
     }
@@ -229,7 +252,8 @@ impl HttpFileClient {
     ) -> Result<()> {
         debug!("Downloading range {}-{}", start, end);
 
-        let uri: Uri = url.parse()
+        let uri: Uri = url
+            .parse()
             .map_err(|e| FileshareError::Transfer(format!("Invalid URL: {}", e)))?;
 
         // Create HTTP request with Range header
@@ -241,11 +265,17 @@ impl HttpFileClient {
             .body(http_body_util::Empty::<Bytes>::new())
             .map_err(|e| FileshareError::Transfer(format!("Failed to build request: {}", e)))?;
 
-        let res = self.client.request(req).await
+        let res = self
+            .client
+            .request(req)
+            .await
             .map_err(|e| FileshareError::Transfer(format!("Request failed: {}", e)))?;
 
         if !res.status().is_success() && res.status().as_u16() != 206 {
-            return Err(FileshareError::Transfer(format!("HTTP error: {}", res.status())));
+            return Err(FileshareError::Transfer(format!(
+                "HTTP error: {}",
+                res.status()
+            )));
         }
 
         // Open file for writing at specific offset
@@ -255,7 +285,8 @@ impl HttpFileClient {
             .await
             .map_err(|e| FileshareError::FileOperation(format!("Failed to open file: {}", e)))?;
 
-        file.seek(std::io::SeekFrom::Start(start)).await
+        file.seek(std::io::SeekFrom::Start(start))
+            .await
             .map_err(|e| FileshareError::FileOperation(format!("Failed to seek: {}", e)))?;
 
         // Stream body to file with optimized buffering
@@ -263,16 +294,18 @@ impl HttpFileClient {
         let mut buffer = Vec::with_capacity(DOWNLOAD_BUFFER_SIZE);
 
         while let Some(chunk) = body.frame().await {
-            let chunk = chunk.map_err(|e| FileshareError::Transfer(format!("Failed to read chunk: {}", e)))?;
-            
+            let chunk = chunk
+                .map_err(|e| FileshareError::Transfer(format!("Failed to read chunk: {}", e)))?;
+
             if let Some(data) = chunk.data_ref() {
                 buffer.extend_from_slice(data);
-                
+
                 // Write when buffer reaches threshold
                 if buffer.len() >= WRITE_THRESHOLD {
-                    file.write_all(&buffer).await
-                        .map_err(|e| FileshareError::FileOperation(format!("Failed to write: {}", e)))?;
-                    
+                    file.write_all(&buffer).await.map_err(|e| {
+                        FileshareError::FileOperation(format!("Failed to write: {}", e))
+                    })?;
+
                     let written = buffer.len() as u64;
                     bytes_counter.fetch_add(written, Ordering::Relaxed);
                     buffer.clear();
@@ -282,13 +315,15 @@ impl HttpFileClient {
 
         // Write remaining data
         if !buffer.is_empty() {
-            file.write_all(&buffer).await
-                .map_err(|e| FileshareError::FileOperation(format!("Failed to write final chunk: {}", e)))?;
+            file.write_all(&buffer).await.map_err(|e| {
+                FileshareError::FileOperation(format!("Failed to write final chunk: {}", e))
+            })?;
             bytes_counter.fetch_add(buffer.len() as u64, Ordering::Relaxed);
         }
 
         // Ensure data is written for this range
-        file.flush().await
+        file.flush()
+            .await
             .map_err(|e| FileshareError::FileOperation(format!("Failed to flush: {}", e)))?;
 
         Ok(())
@@ -304,7 +339,8 @@ impl HttpFileClient {
         let start_time = Instant::now();
         info!("⬇️ Starting HTTP download from: {}", url);
 
-        let uri: Uri = url.parse()
+        let uri: Uri = url
+            .parse()
             .map_err(|e| FileshareError::Transfer(format!("Invalid URL: {}", e)))?;
 
         let req = Request::builder()
@@ -314,20 +350,30 @@ impl HttpFileClient {
             .body(http_body_util::Empty::<Bytes>::new())
             .map_err(|e| FileshareError::Transfer(format!("Failed to build request: {}", e)))?;
 
-        let res = self.client.request(req).await
+        let res = self
+            .client
+            .request(req)
+            .await
             .map_err(|e| FileshareError::Transfer(format!("Request failed: {}", e)))?;
 
         if !res.status().is_success() {
-            return Err(FileshareError::Transfer(format!("HTTP error: {}", res.status())));
+            return Err(FileshareError::Transfer(format!(
+                "HTTP error: {}",
+                res.status()
+            )));
         }
 
-        let content_length = res.headers()
+        let content_length = res
+            .headers()
             .get("content-length")
             .and_then(|v| v.to_str().ok())
             .and_then(|v| v.parse::<u64>().ok());
 
         let file_size = content_length.or(expected_size).unwrap_or(0);
-        info!("📊 Downloading {:.1} MB", file_size as f64 / (1024.0 * 1024.0));
+        info!(
+            "📊 Downloading {:.1} MB",
+            file_size as f64 / (1024.0 * 1024.0)
+        );
 
         // Create target file
         let mut file = OpenOptions::new()
@@ -366,25 +412,29 @@ impl HttpFileClient {
         let monitor_handle = tokio::spawn(async move {
             let mut last_bytes = 0u64;
             let mut last_time = Instant::now();
-            
+
             loop {
                 tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
                 let current_bytes = bytes_downloaded_monitor.load(Ordering::Relaxed);
                 let current_time = Instant::now();
                 let elapsed = current_time.duration_since(last_time).as_secs_f64();
-                
+
                 if elapsed > 0.0 && file_size > 0 {
-                    let speed_mbps = ((current_bytes - last_bytes) as f64 * 8.0) / (elapsed * 1_000_000.0);
+                    let speed_mbps =
+                        ((current_bytes - last_bytes) as f64 * 8.0) / (elapsed * 1_000_000.0);
                     let progress = (current_bytes as f64 / file_size as f64) * 100.0;
-                    
+
                     if current_bytes < file_size {
-                        info!("⬇️ Progress: {:.1}% - Speed: {:.1} Mbps", progress, speed_mbps);
+                        info!(
+                            "⬇️ Progress: {:.1}% - Speed: {:.1} Mbps",
+                            progress, speed_mbps
+                        );
                     }
                 }
-                
+
                 last_bytes = current_bytes;
                 last_time = current_time;
-                
+
                 if current_bytes >= file_size && file_size > 0 {
                     break;
                 }
@@ -397,16 +447,18 @@ impl HttpFileClient {
         let mut total_written = 0u64;
 
         while let Some(chunk) = body.frame().await {
-            let chunk = chunk.map_err(|e| FileshareError::Transfer(format!("Failed to read chunk: {}", e)))?;
-            
+            let chunk = chunk
+                .map_err(|e| FileshareError::Transfer(format!("Failed to read chunk: {}", e)))?;
+
             if let Some(data) = chunk.data_ref() {
                 buffer.extend_from_slice(data);
-                
+
                 // Write more frequently for continuous streaming
                 if buffer.len() >= WRITE_THRESHOLD {
-                    file.write_all(&buffer).await
-                        .map_err(|e| FileshareError::FileOperation(format!("Failed to write: {}", e)))?;
-                    
+                    file.write_all(&buffer).await.map_err(|e| {
+                        FileshareError::FileOperation(format!("Failed to write: {}", e))
+                    })?;
+
                     total_written += buffer.len() as u64;
                     bytes_downloaded.store(total_written, Ordering::Relaxed);
                     buffer.clear();
@@ -416,26 +468,31 @@ impl HttpFileClient {
 
         // Write any remaining data
         if !buffer.is_empty() {
-            file.write_all(&buffer).await
-                .map_err(|e| FileshareError::FileOperation(format!("Failed to write final chunk: {}", e)))?;
+            file.write_all(&buffer).await.map_err(|e| {
+                FileshareError::FileOperation(format!("Failed to write final chunk: {}", e))
+            })?;
             total_written += buffer.len() as u64;
         }
 
         // Ensure all data is written
-        file.flush().await
+        file.flush()
+            .await
             .map_err(|e| FileshareError::FileOperation(format!("Failed to flush: {}", e)))?;
-        file.sync_all().await
+        file.sync_all()
+            .await
             .map_err(|e| FileshareError::FileOperation(format!("Failed to sync: {}", e)))?;
 
         monitor_handle.abort();
 
         let duration = start_time.elapsed();
         let throughput_mbps = (total_written as f64 * 8.0) / (duration.as_secs_f64() * 1_000_000.0);
-        
-        info!("✅ HTTP download complete: {:.1} MB in {:.2}s ({:.1} Mbps)", 
-              total_written as f64 / (1024.0 * 1024.0), 
-              duration.as_secs_f64(), 
-              throughput_mbps);
+
+        info!(
+            "✅ HTTP download complete: {:.1} MB in {:.2}s ({:.1} Mbps)",
+            total_written as f64 / (1024.0 * 1024.0),
+            duration.as_secs_f64(),
+            throughput_mbps
+        );
 
         Ok(())
     }

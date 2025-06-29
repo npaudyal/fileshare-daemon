@@ -1,9 +1,7 @@
 // Prevents additional console window on Windows in release
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-use fileshare_daemon::{
-    config::Settings, http::test_optimized_transfers, service::FileshareDaemon,
-};
+use fileshare_daemon::{config::Settings, service::FileshareDaemon};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tauri::{
@@ -230,7 +228,8 @@ async fn test_file_transfer(state: tauri::State<'_, AppState>) -> Result<String,
             "📊 Transfer System Status:\n\
             Connections: {} total ({} healthy)\n\
             System: Ready with optimized QUIC streaming (unlimited file size)",
-            stats.total, stats.authenticated
+            stats.total,
+            stats.authenticated
         ))
     } else {
         Err("Daemon not ready".to_string())
@@ -1044,9 +1043,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             toggle_transfer_pause,
             cancel_transfer,
             quit_app,
-            hide_window,
-            test_http_optimizations,
-            get_optimization_status
+            hide_window
         ])
         .setup(|app| {
             let _main_window = WebviewWindowBuilder::new(app, "main", WebviewUrl::default())
@@ -1165,32 +1162,4 @@ async fn start_daemon(app_handle: tauri::AppHandle) -> Result<(), Box<dyn std::e
 
     info!("✅ Background daemon started successfully with shared ownership");
     Ok(())
-}
-
-// HTTP Transfer Optimization Commands
-#[tauri::command]
-async fn test_http_optimizations() -> Result<String, String> {
-    test_optimized_transfers()
-        .await
-        .map_err(|e| format!("Optimization test failed: {}", e))
-}
-
-#[tauri::command]
-async fn get_optimization_status() -> Result<String, String> {
-    Ok(format!(
-        "🚀 HTTP Transfer Optimizations Available\n\
-         \n\
-         📊 File Size Categories:\n\
-         • Tiny (<1MB): 1 connection, HTTP/2, 64KB buffers\n\
-         • Small (1-10MB): 2 connections, HTTP/2, 256KB buffers\n\
-         • Medium (10-100MB): 4 connections, HTTP/1.1, 2MB buffers\n\
-         • Large (100MB-1GB): 8 connections, HTTP/1.1, 8MB buffers\n\
-         • Huge (>1GB): 16 connections, HTTP/1.1, 16MB buffers\n\
-         \n\
-         ⚡ Expected Performance:\n\
-         • Current: 354 Mbps\n\
-         • With optimizations: 600-950 Mbps (2-3x improvement)\n\
-         \n\
-         🎯 Ready to deploy!"
-    ))
 }

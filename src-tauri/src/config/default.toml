@@ -9,11 +9,11 @@ service_name = "_fileshare._tcp.local."
 timeout_seconds = 30
 
 [transfer]
-chunk_size = 1048576  # 1MB default chunk size
-max_concurrent_transfers = 5
+chunk_size = 524288  # 1MB default chunk size
+max_concurrent_transfers = 10
 adaptive_chunk_size = true  # Auto-adjust chunk size based on file size
 compression_enabled = false  # Enable compression for better bandwidth (only for uncompressed files > 1MB)
-parallel_chunks = 8  # Number of chunks to send in parallel (OPTIMIZED)
+parallel_chunks = 16  # Number of chunks to send in parallel (OPTIMIZED)
 resume_enabled = true  # Enable resume capability
 # bandwidth_limit_mbps = 100  # Optional bandwidth limit
 # temp_dir = "/path/to/temp"  # Optional custom temp directory

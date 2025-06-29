@@ -25,8 +25,8 @@ use uuid::Uuid;
 use crate::{FileshareError, Result};
 
 // Optimized buffer size for streaming - tuned for LAN speeds
-const STREAM_BUFFER_SIZE: usize = 8 * 1024 * 1024; // 8MB chunks for optimal streaming
-const TCP_BUFFER_SIZE: u32 = 4 * 1024 * 1024; // 4MB TCP buffer
+const STREAM_BUFFER_SIZE: usize = 16 * 1024 * 1024; // 8MB chunks for optimal streaming
+const TCP_BUFFER_SIZE: u32 = 16 * 1024 * 1024; // 4MB TCP buffer
 
 #[derive(Clone)]
 pub struct HttpFileServer {
