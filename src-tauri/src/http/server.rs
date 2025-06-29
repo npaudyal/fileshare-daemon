@@ -6,27 +6,27 @@ use axum::{
     routing::get,
     Router,
 };
-use futures::stream::StreamExt;
-use http_body_util::StreamBody;
-use hyper::body::Frame;
-use std::io::SeekFrom;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::fs::File;
-use tokio::io::{AsyncReadExt, AsyncSeekExt};
 use tokio_util::io::ReaderStream;
 use tower::ServiceBuilder;
 use tower_http::cors::CorsLayer;
 use tower_http::trace::TraceLayer;
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
+use http_body_util::StreamBody;
+use hyper::body::Frame;
+use futures::stream::StreamExt;
+use std::io::SeekFrom;
+use tokio::io::{AsyncSeekExt, AsyncReadExt};
 
 use crate::{FileshareError, Result};
 
 // Optimized buffer size for streaming - tuned for LAN speeds
-const STREAM_BUFFER_SIZE: usize = 16 * 1024 * 1024; // 8MB chunks for optimal streaming
-const TCP_BUFFER_SIZE: u32 = 16 * 1024 * 1024; // 4MB TCP buffer
+const STREAM_BUFFER_SIZE: usize = 8 * 1024 * 1024; // 8MB chunks for optimal streaming
+const TCP_BUFFER_SIZE: u32 = 4 * 1024 * 1024; // 4MB TCP buffer
 
 #[derive(Clone)]
 pub struct HttpFileServer {
@@ -59,22 +59,21 @@ impl HttpFileServer {
     /// Start the HTTP server with optimizations
     pub async fn start(&self) -> Result<()> {
         let addr = SocketAddr::from(([0, 0, 0, 0], self.port));
-
+        
         let app = Router::new()
             .route("/file/:token", get(Self::serve_file))
             .route("/health", get(|| async { "OK" }))
             .layer(
                 ServiceBuilder::new()
                     .layer(TraceLayer::new_for_http())
-                    .layer(CorsLayer::permissive()),
+                    .layer(CorsLayer::permissive())
             )
             .with_state(self.clone());
 
         // Create TCP listener with optimized settings
-        let listener = tokio::net::TcpListener::bind(addr)
-            .await
+        let listener = tokio::net::TcpListener::bind(addr).await
             .map_err(|e| FileshareError::Network(e))?;
-
+        
         // Configure socket options for better performance
         #[cfg(unix)]
         {
@@ -90,7 +89,7 @@ impl HttpFileServer {
                     &send_buf_size as *const _ as *const libc::c_void,
                     std::mem::size_of::<libc::c_int>() as libc::socklen_t,
                 );
-
+                
                 // Set receive buffer size
                 let recv_buf_size = TCP_BUFFER_SIZE as libc::c_int;
                 libc::setsockopt(
@@ -102,18 +101,14 @@ impl HttpFileServer {
                 );
             }
         }
+        
+        info!("🌐 HTTP file server listening on {} with optimized settings", addr);
 
-        info!(
-            "🌐 HTTP file server listening on {} with optimized settings",
-            addr
-        );
-
-        axum::serve(listener, app).await.map_err(|e| {
-            FileshareError::Network(std::io::Error::new(
+        axum::serve(listener, app).await
+            .map_err(|e| FileshareError::Network(std::io::Error::new(
                 std::io::ErrorKind::Other,
-                format!("HTTP server error: {}", e),
-            ))
-        })?;
+                format!("HTTP server error: {}", e)
+            )))?;
 
         Ok(())
     }
@@ -143,8 +138,7 @@ impl HttpFileServer {
         };
 
         let file_size = metadata.len();
-        let filename = file_path
-            .file_name()
+        let filename = file_path.file_name()
             .and_then(|n| n.to_str())
             .unwrap_or("unknown");
 
@@ -162,14 +156,9 @@ impl HttpFileServer {
         };
 
         let content_length = end - start + 1;
-
-        info!(
-            "📤 Serving file via HTTP: {} ({:.1} MB) - Range: {}-{}",
-            filename,
-            file_size as f64 / (1024.0 * 1024.0),
-            start,
-            end
-        );
+        
+        info!("📤 Serving file via HTTP: {} ({:.1} MB) - Range: {}-{}", 
+              filename, file_size as f64 / (1024.0 * 1024.0), start, end);
 
         // Open file for streaming
         let mut file = match File::open(&file_path).await {
@@ -192,118 +181,94 @@ impl HttpFileServer {
         let reader = Self::create_zero_copy_reader(file, content_length).await;
 
         let stream = ReaderStream::with_capacity(reader, STREAM_BUFFER_SIZE);
-
+        
         // Convert to hyper body stream
         let body_stream = stream.map(|result| {
-            result
-                .map(|bytes| Frame::data(bytes))
-                .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)
+            result.map(|bytes| Frame::data(bytes))
+                  .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)
         });
-
+        
         let body = StreamBody::new(body_stream);
 
         // Set headers for optimal transfer
         let mut headers = HeaderMap::new();
-
+        
         if range_header.is_some() {
-            headers.insert(
-                header::CONTENT_RANGE,
-                HeaderValue::from_str(&format!("bytes {}-{}/{}", start, end, file_size)).unwrap(),
-            );
-            headers.insert(
-                header::CONTENT_LENGTH,
-                content_length.to_string().parse().unwrap(),
-            );
+            headers.insert(header::CONTENT_RANGE, 
+                HeaderValue::from_str(&format!("bytes {}-{}/{}", start, end, file_size)).unwrap());
+            headers.insert(header::CONTENT_LENGTH, content_length.to_string().parse().unwrap());
         } else {
-            headers.insert(
-                header::CONTENT_LENGTH,
-                file_size.to_string().parse().unwrap(),
-            );
+            headers.insert(header::CONTENT_LENGTH, file_size.to_string().parse().unwrap());
         }
-
-        headers.insert(
-            header::CONTENT_TYPE,
-            "application/octet-stream".parse().unwrap(),
-        );
+        
+        headers.insert(header::CONTENT_TYPE, "application/octet-stream".parse().unwrap());
         headers.insert(
             header::CONTENT_DISPOSITION,
-            format!("attachment; filename=\"{}\"", filename)
-                .parse()
-                .unwrap(),
+            format!("attachment; filename=\"{}\"", filename).parse().unwrap()
         );
-
+        
         // Add headers for better performance
         headers.insert(header::CACHE_CONTROL, "no-cache, no-store".parse().unwrap());
         headers.insert(header::ACCEPT_RANGES, "bytes".parse().unwrap());
-
+        
         // Enable TCP_NODELAY for low latency
         headers.insert("X-Accel-Buffering", "no".parse().unwrap());
-
+        
         let status = if range_header.is_some() {
             StatusCode::PARTIAL_CONTENT
         } else {
             StatusCode::OK
         };
-
+        
         (status, headers, Body::new(body)).into_response()
     }
 
     /// Parse HTTP Range header
     fn parse_range_header(range_value: &HeaderValue, file_size: u64) -> Result<(u64, u64)> {
-        let range_str = range_value
-            .to_str()
+        let range_str = range_value.to_str()
             .map_err(|_| FileshareError::Transfer("Invalid range header".to_string()))?;
-
+        
         if !range_str.starts_with("bytes=") {
             return Err(FileshareError::Transfer("Invalid range format".to_string()));
         }
-
+        
         let range_spec = &range_str[6..];
         let parts: Vec<&str> = range_spec.split('-').collect();
-
+        
         if parts.len() != 2 {
             return Err(FileshareError::Transfer("Invalid range format".to_string()));
         }
-
+        
         let start = if parts[0].is_empty() {
             // Suffix range (e.g., "-500" means last 500 bytes)
-            let suffix_length: u64 = parts[1]
-                .parse()
+            let suffix_length: u64 = parts[1].parse()
                 .map_err(|_| FileshareError::Transfer("Invalid range".to_string()))?;
             file_size.saturating_sub(suffix_length)
         } else {
-            parts[0]
-                .parse()
+            parts[0].parse()
                 .map_err(|_| FileshareError::Transfer("Invalid range start".to_string()))?
         };
-
+        
         let end = if parts[1].is_empty() {
             // Open-ended range (e.g., "500-" means from 500 to end)
             file_size - 1
         } else {
-            parts[1]
-                .parse::<u64>()
+            parts[1].parse::<u64>()
                 .map_err(|_| FileshareError::Transfer("Invalid range end".to_string()))?
                 .min(file_size - 1)
         };
-
+        
         if start > end || start >= file_size {
             return Err(FileshareError::Transfer("Range out of bounds".to_string()));
         }
-
+        
         Ok((start, end))
     }
 
     /// Create optimized reader for streaming
-    async fn create_zero_copy_reader(
-        file: File,
-        content_length: u64,
-    ) -> Box<dyn tokio::io::AsyncRead + Send + Unpin> {
+    async fn create_zero_copy_reader(file: File, content_length: u64) -> Box<dyn tokio::io::AsyncRead + Send + Unpin> {
         // Use buffered reader with large buffer for optimal streaming
-        Box::new(tokio::io::BufReader::with_capacity(
-            STREAM_BUFFER_SIZE,
-            file.take(content_length),
-        ))
+        Box::new(tokio::io::BufReader::with_capacity(STREAM_BUFFER_SIZE, file.take(content_length)))
     }
 
     /// Get server URL for a given token
