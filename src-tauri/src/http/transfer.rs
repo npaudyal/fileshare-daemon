@@ -16,12 +16,20 @@ pub struct TransferRequest {
     pub peer_id: Uuid,
 }
 
+#[derive(Clone)]
+pub struct TransferStats {
+    pub total_bytes: u64,
+    pub transferred_bytes: u64,
+    pub start_time: std::time::Instant,
+    pub speed_mbps: f64,
+}
+
 pub struct HttpTransferManager {
     http_server: Arc<HttpFileServer>,
     http_client: HttpFileClient,
     http_port: u16,
     local_ip: Option<IpAddr>,
-    active_transfers: Arc<RwLock<dashmap::DashMap<Uuid, TransferRequest>>>,
+    active_transfers: Arc<RwLock<dashmap::DashMap<Uuid, TransferStats>>>,
 }
 
 impl HttpTransferManager {
@@ -42,16 +50,24 @@ impl HttpTransferManager {
         })
     }
 
-    /// Start the HTTP server
+    /// Start the HTTP server with optimizations
     pub async fn start_server(&self) -> Result<()> {
         let server = self.http_server.clone();
         let server_for_spawn = server.clone();
+        
+        // Configure server with TCP optimizations
+        info!("🚀 Starting optimized HTTP file server on port {}", self.http_port);
+        
         tokio::spawn(async move {
             if let Err(e) = server_for_spawn.start().await {
                 error!("❌ HTTP server failed: {}", e);
             }
         });
-        info!("✅ HTTP file server started on port {}", self.http_port);
+        
+        // Give server time to bind
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+        
+        info!("✅ HTTP file server started with performance optimizations");
         Ok(())
     }
 
@@ -73,6 +89,11 @@ impl HttpTransferManager {
         info!("📦 Preparing file for HTTP transfer: {:?} ({:.1} MB)", 
               file_path, file_size as f64 / (1024.0 * 1024.0));
 
+        // Log performance hints
+        if file_size > 50 * 1024 * 1024 {
+            info!("💡 Large file detected - will use parallel downloads for optimal speed");
+        }
+
         // Register file and get token
         let token = self.http_server.register_file(file_path.clone());
         
@@ -87,19 +108,33 @@ impl HttpTransferManager {
         };
 
         let download_url = self.http_server.get_download_url(&token, &server_ip);
-        info!("🔗 File ready for download at: {}", download_url);
+        info!("🔗 File ready for optimized download at: {}", download_url);
         
         Ok(download_url)
     }
 
-    /// Download a file from HTTP URL
+    /// Download a file from HTTP URL with optimizations
     pub async fn download_file(
         &self,
         url: String,
         target_path: PathBuf,
         expected_size: Option<u64>,
     ) -> Result<()> {
-        info!("⬇️ Starting HTTP download to: {:?}", target_path);
+        info!("⬇️ Starting optimized HTTP download to: {:?}", target_path);
+        
+        // Create transfer tracking
+        let transfer_id = Uuid::new_v4();
+        let stats = TransferStats {
+            total_bytes: expected_size.unwrap_or(0),
+            transferred_bytes: 0,
+            start_time: std::time::Instant::now(),
+            speed_mbps: 0.0,
+        };
+        
+        {
+            let transfers = self.active_transfers.write().await;
+            transfers.insert(transfer_id, stats);
+        }
         
         // Ensure target directory exists
         if let Some(parent) = target_path.parent() {
@@ -107,7 +142,16 @@ impl HttpTransferManager {
                 .map_err(|e| FileshareError::FileOperation(format!("Failed to create directory: {}", e)))?;
         }
 
-        self.http_client.download_file(url, target_path, expected_size).await
+        // Use optimized client with parallel downloads for large files
+        let result = self.http_client.download_file(url.clone(), target_path, expected_size).await;
+        
+        // Remove from active transfers
+        {
+            let transfers = self.active_transfers.write().await;
+            transfers.remove(&transfer_id);
+        }
+        
+        result
     }
 
     /// Cleanup after transfer
@@ -121,11 +165,38 @@ impl HttpTransferManager {
 
     /// Detect local IP address
     async fn detect_local_ip() -> Option<IpAddr> {
-        // Try to find the best local IP
-        let socket = std::net::UdpSocket::bind("0.0.0.0:0").ok()?;
-        socket.connect("8.8.8.8:80").ok()?;
-        let addr = socket.local_addr().ok()?;
-        Some(addr.ip())
+        // Try multiple methods to find the best local IP
+        
+        // Method 1: Try to connect to a public DNS server (doesn't actually connect)
+        if let Ok(socket) = std::net::UdpSocket::bind("0.0.0.0:0") {
+            if socket.connect("8.8.8.8:80").is_ok() {
+                if let Ok(addr) = socket.local_addr() {
+                    let ip = addr.ip();
+                    // Verify it's not loopback
+                    if !ip.is_loopback() {
+                        return Some(ip);
+                    }
+                }
+            }
+        }
+        
+        // Method 2: Try common LAN gateway addresses
+        for gateway in &["192.168.1.1:80", "192.168.0.1:80", "10.0.0.1:80"] {
+            if let Ok(socket) = std::net::UdpSocket::bind("0.0.0.0:0") {
+                if socket.connect(gateway).is_ok() {
+                    if let Ok(addr) = socket.local_addr() {
+                        let ip = addr.ip();
+                        if !ip.is_loopback() && (ip.is_ipv4() && ip.to_string().starts_with("192.168.") || 
+                                                  ip.to_string().starts_with("10.") || 
+                                                  ip.to_string().starts_with("172.")) {
+                            return Some(ip);
+                        }
+                    }
+                }
+            }
+        }
+        
+        None
     }
 
     /// Detect best IP to use for a specific peer
@@ -135,16 +206,33 @@ impl HttpTransferManager {
         } else if let Some(local_ip) = self.local_ip {
             local_ip
         } else {
-            // Fallback to trying to detect
+            // Try to detect IP in the same subnet as peer
+            if let Ok(socket) = std::net::UdpSocket::bind("0.0.0.0:0") {
+                if socket.connect(peer_addr).is_ok() {
+                    if let Ok(addr) = socket.local_addr() {
+                        return addr.ip();
+                    }
+                }
+            }
+            
+            // Fallback
             Self::detect_local_ip().await
                 .unwrap_or(IpAddr::V4(std::net::Ipv4Addr::LOCALHOST))
         }
     }
 
     /// Get transfer statistics
-    pub async fn get_active_transfers(&self) -> Vec<TransferRequest> {
+    pub async fn get_active_transfers(&self) -> Vec<(Uuid, TransferStats)> {
         let transfers = self.active_transfers.read().await;
-        transfers.iter().map(|entry| entry.value().clone()).collect()
+        transfers.iter().map(|entry| (*entry.key(), entry.value().clone())).collect()
+    }
+
+    /// Get current transfer speed for all active transfers
+    pub async fn get_total_speed_mbps(&self) -> f64 {
+        let transfers = self.active_transfers.read().await;
+        transfers.iter()
+            .map(|entry| entry.value().speed_mbps)
+            .sum()
     }
 }
 

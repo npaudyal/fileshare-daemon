@@ -55,6 +55,8 @@ tower = { version = "0.4", features = ["full"] }
 tower-http = { version = "0.5", features = ["fs", "trace", "cors", "limit"] }
 bytes = "1.5"
 http-body-util = "0.1"
+# Additional dependencies for optimizations
+libc = "0.2"
 
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.52", features = [
