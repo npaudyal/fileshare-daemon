@@ -59,10 +59,35 @@ impl ClipboardManager {
         if let Some(file_path) = selected_file {
             info!("Copying file to network clipboard: {:?}", file_path);
 
-            // Get file info
+            // Get file info and validate
             let metadata = tokio::fs::metadata(&file_path).await.map_err(|e| {
                 crate::FileshareError::FileOperation(format!("Cannot access file: {}", e))
             })?;
+            
+            // Validate file permissions and properties
+            if metadata.is_dir() {
+                return Err(crate::FileshareError::FileOperation(
+                    "Cannot copy directories to clipboard".to_string()
+                ));
+            }
+            
+            if metadata.len() == 0 {
+                return Err(crate::FileshareError::FileOperation(
+                    "Cannot copy empty files".to_string()
+                ));
+            }
+            
+            // Check if file is readable
+            match tokio::fs::File::open(&file_path).await {
+                Ok(_) => {},
+                Err(e) => {
+                    return Err(crate::FileshareError::FileOperation(
+                        format!("File is not readable: {}", e)
+                    ));
+                }
+            }
+            
+            info!("File validation passed: {} bytes", metadata.len());
 
             let clipboard_item = NetworkClipboardItem {
                 file_path: file_path.clone(),

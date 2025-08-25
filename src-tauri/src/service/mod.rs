@@ -1,5 +1,3 @@
-pub mod daemon;
-pub mod file_transfer;
+pub mod daemon_quic;
 
-pub use daemon::FileshareDaemon;
-pub use file_transfer::{TransferDirection, TransferStatus};
+pub use daemon_quic::FileshareDaemon;

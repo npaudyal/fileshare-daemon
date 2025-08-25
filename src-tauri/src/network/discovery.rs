@@ -1,4 +1,4 @@
-use crate::{config::Settings, network::peer::PeerManager, Result};
+use crate::{config::Settings, network::peer_quic::PeerManager, Result};
 use serde::{Deserialize, Serialize};
 use serde_json;
 use std::collections::HashMap;
@@ -161,7 +161,8 @@ impl DiscoveryService {
     async fn broadcast_presence(settings: &Settings) -> Result<()> {
         use tokio::net::UdpSocket;
 
-        debug!("Broadcasting presence...");
+        debug!("🔊 Broadcasting presence for device {} on port {}...", 
+               settings.device.name, settings.network.port);
 
         // Create broadcast socket
         let socket = UdpSocket::bind("0.0.0.0:0")
@@ -264,21 +265,27 @@ impl DiscoveryService {
         };
 
         info!(
-            "🎯 Discovered device: {} ({}) at {}",
+            "🎯 Discovered device: {} ({}) at {} - attempting QUIC connection",
             device_info.name, device_info.id, device_info.addr
         );
 
         // Update discovered devices
+        info!("📥 Updating discovered devices map for: {}", device_info.name);
         {
             let mut devices = discovered_devices.write().await;
             devices.insert(device_id, device_info.clone());
+            info!("✅ Device {} added to discovered devices map", device_info.name);
         }
 
         // Notify peer manager
+        info!("🔄 About to notify peer manager about device: {}", device_info.name);
         {
             let mut pm = peer_manager.write().await;
-            if let Err(e) = pm.on_device_discovered(device_info).await {
-                warn!("Failed to notify peer manager: {}", e);
+            info!("🔄 Notifying peer manager about device: {}", device_info.name);
+            if let Err(e) = pm.on_device_discovered(device_info.clone()).await {
+                error!("❌ Failed to notify peer manager about discovered device: {}", e);
+            } else {
+                info!("✅ Successfully notified peer manager about device discovery: {}", device_info.name);
             }
         }
 

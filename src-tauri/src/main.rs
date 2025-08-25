@@ -224,17 +224,12 @@ async fn test_file_transfer(state: tauri::State<'_, AppState>) -> Result<String,
         let pm = daemon_ref.peer_manager.read().await;
         let stats = pm.get_connection_stats();
 
-        let ft = pm.file_transfer.read().await;
-        let active_transfers = ft.get_active_transfers();
-
         Ok(format!(
             "📊 Transfer System Status:\n\
             Connections: {} total ({} healthy)\n\
-            Active Transfers: {}\n\
-            System: Ready for Phase 1 (100MB limit)",
+            System: Ready with optimized QUIC streaming (unlimited file size)",
             stats.total,
-            stats.authenticated,
-            active_transfers.len()
+            stats.authenticated
         ))
     } else {
         Err("Daemon not ready".to_string())
@@ -270,6 +265,57 @@ async fn test_connection_health(state: tauri::State<'_, AppState>) -> Result<Str
 }
 
 #[tauri::command]
+async fn test_discovery_status(state: tauri::State<'_, AppState>) -> Result<String, String> {
+    info!("🔍 Testing discovery system status");
+
+    if let Some(daemon_ref) = state.daemon_ref.lock().await.as_ref() {
+        let discovered_devices = daemon_ref.get_discovered_devices().await;
+        let pm = daemon_ref.peer_manager.read().await;
+        let peers: Vec<_> = pm.peers.values().collect();
+
+        let settings = daemon_ref.get_settings();
+        let mut result = format!(
+            "🔍 Discovery Status:\n\
+            Device: {} ({})\n\
+            QUIC Port: {}\n\
+            Discovery Port: {}\n\
+            Discovered Devices: {}\n\
+            Active Peers: {}\n\n",
+            settings.device.name,
+            settings.device.id,
+            settings.network.port,
+            settings.network.discovery_port,
+            discovered_devices.len(),
+            peers.len()
+        );
+
+        if !discovered_devices.is_empty() {
+            result.push_str("📱 Discovered Devices:\n");
+            for device in discovered_devices.iter().take(5) {
+                result.push_str(&format!(
+                    "  • {} ({}) at {}\n",
+                    device.name, device.id, device.addr
+                ));
+            }
+        }
+
+        if !peers.is_empty() {
+            result.push_str("\n🔗 Peer Connections:\n");
+            for peer in peers.iter().take(5) {
+                result.push_str(&format!(
+                    "  • {} - {:?}\n",
+                    peer.device_info.name, peer.connection_status
+                ));
+            }
+        }
+
+        Ok(result)
+    } else {
+        Err("Daemon not ready".to_string())
+    }
+}
+
+#[tauri::command]
 async fn get_network_metrics(_state: tauri::State<'_, AppState>) -> Result<NetworkMetrics, String> {
     // Mock data - implement real metrics collection
     Ok(NetworkMetrics {
@@ -295,6 +341,11 @@ async fn update_app_settings(
     app_settings.transfer.max_concurrent_transfers = settings.max_concurrent_transfers;
     app_settings.security.require_pairing = settings.require_pairing;
     app_settings.security.encryption_enabled = settings.encryption_enabled;
+
+    // Validate settings before saving
+    app_settings
+        .validate_transfer_settings()
+        .map_err(|e| format!("Invalid settings: {}", e))?;
 
     // Save to file
     app_settings
@@ -852,6 +903,34 @@ async fn refresh_devices(_state: tauri::State<'_, AppState>) -> Result<(), Strin
     Ok(())
 }
 
+// Transfer progress and control commands
+#[tauri::command]
+async fn get_active_transfers(
+    _state: tauri::State<'_, AppState>,
+) -> Result<Vec<serde_json::Value>, String> {
+    // With optimized QUIC transfers, we don't track transfers in the old way
+    // Transfers are handled directly by stream managers
+    Ok(Vec::new())
+}
+
+#[tauri::command]
+async fn toggle_transfer_pause(
+    _transfer_id: String,
+    _state: tauri::State<'_, AppState>,
+) -> Result<(), String> {
+    // Optimized QUIC transfers don't support pause/resume yet
+    Err("Transfer pause/resume not supported with optimized QUIC transfers".to_string())
+}
+
+#[tauri::command]
+async fn cancel_transfer(
+    _transfer_id: String,
+    _state: tauri::State<'_, AppState>,
+) -> Result<(), String> {
+    // Optimized QUIC transfers don't support cancellation yet
+    Err("Transfer cancellation not supported with optimized QUIC transfers".to_string())
+}
+
 #[tauri::command]
 async fn quit_app(app: tauri::AppHandle) -> Result<(), String> {
     info!("🚪 UI requested app quit");
@@ -955,10 +1034,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             pair_device_enhanced,
             test_file_transfer,
             test_connection_health,
+            test_discovery_status,
             export_settings,
             import_settings,
             test_hotkey_system,
             test_isolated_hotkey,
+            get_active_transfers,
+            toggle_transfer_pause,
+            cancel_transfer,
             quit_app,
             hide_window
         ])

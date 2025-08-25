@@ -12,3 +12,5 @@ node_modules/
 /src-tauri/target/
 /src-tauri/gen/schemas/
 /src-tauri/gen/
+/claude.md
+/Claude-progress.md

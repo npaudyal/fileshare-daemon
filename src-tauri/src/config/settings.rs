@@ -25,6 +25,7 @@ pub struct DeviceSettings {
 pub struct NetworkSettings {
     pub port: u16,
     pub discovery_port: u16,
+    pub http_port: u16,
     pub service_name: String,
     pub timeout_seconds: u64,
 }
@@ -35,6 +36,10 @@ pub struct TransferSettings {
     pub max_concurrent_transfers: usize,
     pub bandwidth_limit_mbps: Option<u32>,
     pub temp_dir: Option<PathBuf>,
+    pub adaptive_chunk_size: bool,
+    pub compression_enabled: bool,
+    pub parallel_chunks: usize,
+    pub resume_enabled: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -55,14 +60,19 @@ impl Default for Settings {
             network: NetworkSettings {
                 port: 9876,
                 discovery_port: 9877,
+                http_port: 9878,
                 service_name: "_fileshare._tcp.local.".to_string(),
                 timeout_seconds: 30,
             },
             transfer: TransferSettings {
-                chunk_size: 64 * 1024, // 64KB chunks
+                chunk_size: 1024 * 1024, // 1MB default chunk size
                 max_concurrent_transfers: 5,
                 bandwidth_limit_mbps: None,
                 temp_dir: None,
+                adaptive_chunk_size: true,
+                compression_enabled: false,
+                parallel_chunks: 8, // OPTIMIZED: Increased from 4
+                resume_enabled: true,
             },
             security: SecuritySettings {
                 require_pairing: false,
@@ -74,6 +84,37 @@ impl Default for Settings {
 }
 
 impl Settings {
+    pub fn validate_transfer_settings(&self) -> Result<()> {
+        let transfer = &self.transfer;
+
+        // Validate chunk size (64KB to 16MB)
+        if transfer.chunk_size < 64 * 1024 {
+            return Err(FileshareError::Config(
+                "Chunk size must be at least 64KB".to_string(),
+            ));
+        }
+        if transfer.chunk_size > 16 * 1024 * 1024 {
+            return Err(FileshareError::Config(
+                "Chunk size must not exceed 16MB".to_string(),
+            ));
+        }
+
+        // Validate max concurrent transfers (1-10)
+        if transfer.max_concurrent_transfers == 0 || transfer.max_concurrent_transfers > 10 {
+            return Err(FileshareError::Config(
+                "Max concurrent transfers must be between 1 and 10".to_string(),
+            ));
+        }
+
+        // Validate parallel chunks (1-16)
+        if transfer.parallel_chunks == 0 || transfer.parallel_chunks > 16 {
+            return Err(FileshareError::Config(
+                "Parallel chunks must be between 1 and 16".to_string(),
+            ));
+        }
+
+        Ok(())
+    }
     pub fn load(config_path: Option<&str>) -> Result<Self> {
         let path = match config_path {
             Some(path) => PathBuf::from(path),
@@ -86,6 +127,9 @@ impl Settings {
 
             let settings: Settings = toml::from_str(&content)
                 .map_err(|e| FileshareError::Config(format!("Failed to parse config: {}", e)))?;
+
+            // Validate settings before returning
+            settings.validate_transfer_settings()?;
 
             Ok(settings)
         } else {

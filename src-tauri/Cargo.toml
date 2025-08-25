@@ -32,14 +32,31 @@ rand = "0.8"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 thiserror = "1.0"
-anyhow = "1.0"
 directories = "5.0"
 dirs = "5.0"
-clap = { version = "4.0", features = ["derive"] }
-auto-launch = "0.5"
 gethostname = "1.0.2"
 global-hotkey = "0.5"
 crossbeam-channel = "0.5"
+dashmap = "5.5"
+# Network optimization
+# QUIC support - using ring crypto backend for Windows compatibility
+quinn = "0.11"
+rustls = { version = "0.23", default-features = false, features = ["ring"] }
+rustls-pki-types = "1.0"
+rustls-pemfile = "2.0"
+rcgen = "0.13"
+futures = "0.3"
+ring = "0.17"
+# HTTP support for fast file transfers
+hyper = { version = "1.0", features = ["full"] }
+hyper-util = { version = "0.1", features = ["full"] }
+axum = { version = "0.7", features = ["multipart", "tokio"] }
+tower = { version = "0.4", features = ["full"] }
+tower-http = { version = "0.5", features = ["fs", "trace", "cors", "limit"] }
+bytes = "1.5"
+http-body-util = "0.1"
+# Additional dependencies for optimizations
+libc = "0.2"
 
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.52", features = [

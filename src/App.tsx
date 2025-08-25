@@ -347,8 +347,10 @@ function App() {
                     lastUpdate={lastUpdate}
                     filteredDevicesCount={filteredDevices.length}
                     deviceName={settings?.device_name}
+                    showTransferProgress={showTransferProgress}
                     onRefresh={handleRefresh}
                     onSelectAll={handleSelectAll}
+                    onToggleTransferProgress={() => setShowTransferProgress(!showTransferProgress)}
                 />
             </FadeIn>
 
