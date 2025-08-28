@@ -156,6 +156,15 @@ impl FastPairingManager {
         self.completion_callback = Some(callback);
     }
 
+    /// Send message to fast pairing processor (for external routing)
+    pub fn send_message(&self, peer_id: Uuid, message: Message) -> Result<()> {
+        if let Err(_) = self.message_tx.send((peer_id, message)) {
+            warn!("⚠️ Failed to send message to FastPairingManager - channel closed");
+            return Err(FileshareError::Unknown("FastPairingManager message channel closed".to_string()));
+        }
+        Ok(())
+    }
+
     /// Handle pairing result (fast, lockless)
     async fn handle_pairing_result(
         peer_id: Uuid,

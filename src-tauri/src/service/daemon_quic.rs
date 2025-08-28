@@ -2,20 +2,22 @@ use crate::{
     clipboard::ClipboardManager,
     config::Settings,
     hotkeys::{HotkeyEvent, HotkeyManager},
-    network::{DiscoveryService, PeerManager},
-    pairing::PairingManager,
+    network::{DiscoveryService, PeerManager, protocol::{Message, MessageType}},
+    pairing::{PairingManager, FastPairingManager},
     Result,
 };
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{broadcast, RwLock};
 use tracing::{error, info, warn};
+use uuid::Uuid;
 
 pub struct FileshareDaemon {
     settings: Arc<Settings>,
     pub discovery: Option<DiscoveryService>,
     pub peer_manager: Arc<RwLock<PeerManager>>,
     pub pairing_manager: Arc<PairingManager>,
+    pub fast_pairing_manager: Arc<RwLock<Option<Arc<FastPairingManager>>>>,
     hotkey_manager: Option<HotkeyManager>,
     clipboard: ClipboardManager,
     shutdown_tx: broadcast::Sender<()>,
@@ -55,6 +57,7 @@ impl FileshareDaemon {
             discovery: Some(discovery),
             peer_manager,
             pairing_manager,
+            fast_pairing_manager: Arc::new(RwLock::new(None)),
             hotkey_manager: Some(hotkey_manager),
             clipboard,
             shutdown_tx,
@@ -71,6 +74,98 @@ impl FileshareDaemon {
     // Getter for settings (for UI access)
     pub fn get_settings(&self) -> &Arc<Settings> {
         &self.settings
+    }
+
+    // Set fast pairing manager (called from main.rs after initialization)  
+    pub async fn set_fast_pairing_manager(&self, fpm: Arc<FastPairingManager>) {
+        let mut fpm_guard = self.fast_pairing_manager.write().await;
+        *fpm_guard = Some(fpm);
+        info!("⚡ FastPairingManager set on daemon");
+    }
+
+    // Check if message should be handled by FastPairingManager
+    fn is_fast_pairing_message(&self, message_type: &MessageType) -> bool {
+        matches!(message_type, 
+            MessageType::PairingRequest { .. } | 
+            MessageType::PairingResult { .. }
+        )
+    }
+
+    // Route message to appropriate handler
+    async fn route_message(&self, peer_id: Uuid, message: Message, clipboard: &ClipboardManager) -> Result<()> {
+        // Check if this should go to FastPairingManager
+        if self.is_fast_pairing_message(&message.message_type) {
+            let fpm_guard = self.fast_pairing_manager.read().await;
+            if let Some(ref fpm) = *fpm_guard {
+                info!("⚡ Routing pairing message to FastPairingManager: {:?}", message.message_type);
+                
+                // Send to FastPairingManager directly
+                if let Err(e) = fpm.send_message(peer_id, message) {
+                    error!("❌ Failed to route message to FastPairingManager: {}", e);
+                    return Err(e);
+                }
+                
+                info!("✅ Successfully routed pairing message to FastPairingManager");
+                return Ok(());
+            } else {
+                warn!("⚠️ FastPairingManager not available for pairing message, falling back to PeerManager");
+            }
+        }
+
+        // Route non-pairing messages to PeerManager
+        let peer_manager = self.peer_manager.clone();
+        let lock_start = std::time::Instant::now();
+        let lock_result = tokio::time::timeout(
+            std::time::Duration::from_millis(100), 
+            peer_manager.write()
+        ).await;
+        
+        match lock_result {
+            Ok(mut pm) => {
+                let lock_acquired_at = std::time::Instant::now();
+                let lock_wait_time = lock_acquired_at - lock_start;
+                info!("🔒 Acquired peer manager lock in {:?} for message: {:?}", 
+                     lock_wait_time, message.message_type);
+                
+                if let Err(e) = pm.handle_message(peer_id, message, clipboard).await {
+                    error!("❌ Failed to handle message from {}: {}", peer_id, e);
+                }
+                
+                let processing_time = std::time::Instant::now() - lock_acquired_at;
+                info!("✅ Message processing completed in {:?}", processing_time);
+            }
+            Err(_) => {
+                return Err(crate::FileshareError::Unknown("Lock timeout".to_string()));
+            }
+        }
+        
+        Ok(())
+    }
+
+    // Legacy QUIC message handler (without FastPairingManager routing)
+    async fn run_quic_message_handler_legacy(
+        peer_manager: Arc<RwLock<PeerManager>>,
+        clipboard: ClipboardManager,
+    ) -> Result<()> {
+        info!("🚀 Starting legacy QUIC message handler...");
+        
+        // Get message receiver from peer manager
+        let mut message_rx = {
+            let mut pm = peer_manager.write().await;
+            std::mem::replace(&mut pm.message_rx, tokio::sync::mpsc::unbounded_channel().1)
+        };
+
+        // Simple message processing loop (old behavior)
+        while let Some((peer_id, message)) = message_rx.recv().await {
+            info!("📨 Received legacy message from {}: {:?}", peer_id, message.message_type);
+
+            let mut pm = peer_manager.write().await;
+            if let Err(e) = pm.handle_message(peer_id, message, &clipboard).await {
+                error!("❌ Failed to handle legacy message from {}: {}", peer_id, e);
+            }
+        }
+
+        Ok(())
     }
 
     // Enhanced daemon startup with health monitoring
@@ -113,10 +208,11 @@ impl FileshareDaemon {
         }
 
         // Start peer manager message handler
+        let daemon_clone = self.clone();
         let peer_manager = self.peer_manager.clone();
         let clipboard = self.clipboard.clone();
         tokio::spawn(async move {
-            if let Err(e) = Self::run_quic_message_handler(peer_manager, clipboard).await {
+            if let Err(e) = Self::run_quic_message_handler(daemon_clone, peer_manager, clipboard).await {
                 error!("❌ QUIC message handler error: {}", e);
             }
         });
@@ -127,6 +223,7 @@ impl FileshareDaemon {
 
     // QUIC message handler
     async fn run_quic_message_handler(
+        daemon: Arc<FileshareDaemon>,
         peer_manager: Arc<RwLock<PeerManager>>,
         clipboard: ClipboardManager,
     ) -> Result<()> {
@@ -173,48 +270,13 @@ impl FileshareDaemon {
             let message_received_at = std::time::Instant::now();
             info!("📨 Received message from {}: {:?}", peer_id, message.message_type);
 
-            // Try to acquire the lock with a timeout to avoid blocking message processing
-            let lock_start = std::time::Instant::now();
-            let lock_result = tokio::time::timeout(
-                std::time::Duration::from_millis(100), 
-                peer_manager.write()
-            ).await;
-            
-            match lock_result {
-                Ok(mut pm) => {
-                    let lock_acquired_at = std::time::Instant::now();
-                    let lock_wait_time = lock_acquired_at - lock_start;
-                    info!("🔒 Acquired peer manager lock in {:?} for message: {:?}", 
-                         lock_wait_time, message.message_type);
-                    
-                    if let Err(e) = pm.handle_message(peer_id, message, &clipboard).await {
-                        error!("❌ Failed to handle message from {}: {}", peer_id, e);
-                    }
-                    
-                    let processing_time = std::time::Instant::now() - lock_acquired_at;
-                    info!("✅ Message processing completed in {:?}", processing_time);
-                }
-                Err(_) => {
-                    warn!("⚠️ Could not acquire peer manager lock within 100ms, message may be delayed");
-                    // Fall back to blocking acquisition for critical messages like PairingResult
-                    if matches!(message.message_type, crate::network::protocol::MessageType::PairingResult { .. }) {
-                        warn!("🔄 PairingResult message - using blocking lock acquisition");
-                        let blocking_start = std::time::Instant::now();
-                        let mut pm = peer_manager.write().await;
-                        let blocking_wait = std::time::Instant::now() - blocking_start;
-                        warn!("🔒 Blocking lock acquired after {:?} for PairingResult", blocking_wait);
-                        
-                        if let Err(e) = pm.handle_message(peer_id, message, &clipboard).await {
-                            error!("❌ Failed to handle PairingResult from {}: {}", peer_id, e);
-                        }
-                        
-                        let total_time = std::time::Instant::now() - message_received_at;
-                        warn!("⏱️ Total PairingResult processing time: {:?}", total_time);
-                    } else {
-                        error!("❌ Dropping non-critical message due to lock contention: {:?}", message.message_type);
-                    }
-                }
+            // Route message to appropriate handler (FastPairingManager or PeerManager)
+            if let Err(e) = daemon.route_message(peer_id, message, &clipboard).await {
+                error!("❌ Failed to route message from {}: {}", peer_id, e);
             }
+            
+            let total_time = std::time::Instant::now() - message_received_at;
+            info!("⏱️ Total message processing time: {:?}", total_time);
         }
 
         // Clean up
@@ -254,7 +316,7 @@ impl FileshareDaemon {
             ));
         };
 
-        // Start QUIC message handler
+        // Start QUIC message handler  
         let message_handle = {
             let peer_manager = self.peer_manager.clone();
             let clipboard = self.clipboard.clone();
@@ -262,7 +324,7 @@ impl FileshareDaemon {
 
             tokio::spawn(async move {
                 tokio::select! {
-                    result = Self::run_quic_message_handler(peer_manager, clipboard) => {
+                    result = Self::run_quic_message_handler_legacy(peer_manager, clipboard) => {
                         if let Err(e) = result {
                             error!("❌ QUIC message handler error: {}", e);
                         }

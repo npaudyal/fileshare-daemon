@@ -1471,10 +1471,22 @@ async fn start_daemon(app_handle: tauri::AppHandle) -> Result<(), Box<dyn std::e
             info!("⚡ Fast pairing message processor started");
         }
 
-        // Store the fast pairing manager
+        let fpm_arc = Arc::new(fast_pairing_manager);
+        
+        // Store the fast pairing manager in app state
         {
             let mut fpm_guard = state.fast_pairing_manager.write().await;
-            *fpm_guard = Some(Arc::new(fast_pairing_manager));
+            *fpm_guard = Some(fpm_arc.clone());
+        }
+
+        // Also set it on the daemon for message routing
+        {
+            let daemon_ref = state.daemon_ref.lock().await;
+            if let Some(ref daemon) = *daemon_ref {
+                daemon.set_fast_pairing_manager(fpm_arc).await;
+            } else {
+                warn!("⚠️ Daemon not available to set FastPairingManager");
+            }
         }
 
         info!("⚡ FastPairingManager initialized and stored");
