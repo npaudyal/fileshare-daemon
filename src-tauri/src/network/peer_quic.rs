@@ -489,6 +489,7 @@ impl PeerManager {
         let (response_tx, response_rx) = oneshot::channel();
         
         // Store the response channel for this pairing request
+        info!("🔍 Storing pending pairing request for device_id: {}", device_id);
         self.pending_pairings.insert(device_id, response_tx);
         
         // Establish connection to the target device for pairing (bypass pairing requirement)
@@ -1319,14 +1320,18 @@ impl PeerManager {
                 device_name: remote_device_name,
                 reason,
             } => {
-                // Notify any waiting pairing request
-                let device_to_notify = remote_device_id.unwrap_or(peer_id);
-                if let Some(response_tx) = self.pending_pairings.remove(&device_to_notify) {
+                info!("🔍 Received PairingResult: success={}, peer_id={}, remote_device_id={:?}", 
+                      success, peer_id, remote_device_id);
+                info!("🔍 Current pending_pairings keys: {:?}", 
+                      self.pending_pairings.keys().collect::<Vec<_>>());
+                
+                // Notify any waiting pairing request using peer_id (connection ID)
+                if let Some(response_tx) = self.pending_pairings.remove(&peer_id) {
                     let result = if *success {
                         info!(
                             "🎉 Pairing result: SUCCESS with {} ({})",
                             remote_device_name.as_deref().unwrap_or("Unknown"),
-                            device_to_notify
+                            peer_id
                         );
                         Ok(())
                     } else {
@@ -1346,7 +1351,7 @@ impl PeerManager {
                         info!(
                             "🎉 Pairing result: SUCCESS with {} ({})",
                             remote_device_name.as_deref().unwrap_or("Unknown"),
-                            device_to_notify
+                            peer_id
                         );
                     } else {
                         warn!(
