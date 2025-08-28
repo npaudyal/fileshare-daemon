@@ -93,11 +93,59 @@ impl FileshareDaemon {
 
     // Route message to appropriate handler
     async fn route_message(&self, peer_id: Uuid, message: Message, clipboard: &ClipboardManager) -> Result<()> {
-        // Check if this should go to FastPairingManager
+        // Handle incoming PairingRequest specially 
+        if let MessageType::PairingRequest { device_id, device_name, pin_hash, platform } = &message.message_type {
+            info!("🔐 Processing incoming pairing request from {} ({})", device_name, device_id);
+            
+            // For now, just accept all pairing requests (TODO: validate PIN)
+            let success = true;
+            let reason = if success { None } else { Some("PIN validation failed".to_string()) };
+            
+            // Create response message
+            let response = Message::new(MessageType::PairingResult {
+                success,
+                device_id: Some(*device_id),
+                device_name: Some(device_name.clone()),
+                reason,
+            });
+            
+            // Send response through PeerManager which has the actual connection
+            let peer_manager = self.peer_manager.clone();
+            let lock_start = std::time::Instant::now();
+            match tokio::time::timeout(
+                std::time::Duration::from_millis(100),
+                peer_manager.write()
+            ).await {
+                Ok(mut pm) => {
+                    let lock_time = lock_start.elapsed();
+                    info!("🔒 Acquired peer manager lock in {:?} for pairing response", lock_time);
+                    
+                    // Send the response back to the requesting device
+                    if let Err(e) = pm.send_message_to_peer(peer_id, response).await {
+                        error!("❌ Failed to send pairing response to peer {}: {}", peer_id, e);
+                    } else {
+                        info!("✅ Pairing response sent successfully to {}", device_name);
+                        
+                        if success {
+                            info!("🎉 Successfully paired with {} ({})", device_name, device_id);
+                            // TODO: Add device to paired devices list
+                        }
+                    }
+                }
+                Err(_) => {
+                    error!("❌ Could not acquire peer manager lock for pairing response");
+                    return Err(crate::FileshareError::Unknown("Lock timeout for pairing response".to_string()));
+                }
+            }
+            
+            return Ok(());
+        }
+        
+        // Check if this should go to FastPairingManager (PairingResult messages)
         if self.is_fast_pairing_message(&message.message_type) {
             let fpm_guard = self.fast_pairing_manager.read().await;
             if let Some(ref fpm) = *fpm_guard {
-                info!("⚡ Routing pairing message to FastPairingManager: {:?}", message.message_type);
+                info!("⚡ Routing pairing result to FastPairingManager: {:?}", message.message_type);
                 
                 // Send to FastPairingManager directly
                 if let Err(e) = fpm.send_message(peer_id, message) {
@@ -105,7 +153,7 @@ impl FileshareDaemon {
                     return Err(e);
                 }
                 
-                info!("✅ Successfully routed pairing message to FastPairingManager");
+                info!("✅ Successfully routed pairing result to FastPairingManager");
                 return Ok(());
             } else {
                 warn!("⚠️ FastPairingManager not available for pairing message, falling back to PeerManager");
