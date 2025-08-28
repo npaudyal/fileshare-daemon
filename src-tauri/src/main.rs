@@ -1,7 +1,7 @@
 // Prevents additional console window on Windows in release
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-use fileshare_daemon::{config::Settings, service::FileshareDaemon};
+use fileshare_daemon::{config::Settings, service::FileshareDaemon, network::peer_quic::PairingCompletionCallback, FileshareError};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tauri::{
@@ -1120,6 +1120,52 @@ async fn unpair_device_new(
     }
 }
 
+// Helper function to update paired device settings
+async fn add_device_to_allowed_settings(
+    device_uuid: Uuid,
+    settings: &Arc<RwLock<Settings>>,
+) -> Result<(), String> {
+    let mut settings = settings.write().await;
+    if !settings.security.allowed_devices.contains(&device_uuid) {
+        settings.security.allowed_devices.push(device_uuid);
+
+        if let Err(e) = settings.save(None) {
+            error!("Failed to save settings after pairing: {}", e);
+            return Err(format!("Failed to save settings: {}", e));
+        }
+        
+        info!("✅ Device {} added to allowed_devices and saved to config", device_uuid);
+    } else {
+        info!("ℹ️ Device {} already in allowed_devices", device_uuid);
+    }
+    Ok(())
+}
+
+// Create a pairing completion callback that can be passed to PeerManager
+fn create_pairing_completion_callback(
+    settings: Arc<RwLock<Settings>>,
+) -> PairingCompletionCallback {
+    Arc::new(move |device_id: Uuid| {
+        let settings = settings.clone();
+        Box::pin(async move {
+            add_device_to_allowed_settings(device_id, &settings)
+                .await
+                .map_err(|e| FileshareError::Config(e))
+        })
+    })
+}
+
+#[tauri::command]
+async fn update_paired_device_settings(
+    device_id: String,
+    state: tauri::State<'_, AppState>,
+) -> Result<(), String> {
+    info!("🔧 Updating settings for paired device: {}", device_id);
+    
+    let device_uuid = Uuid::parse_str(&device_id).map_err(|e| format!("Invalid device ID: {}", e))?;
+    add_device_to_allowed_settings(device_uuid, &state.settings).await
+}
+
 // Enhanced device type detection
 fn determine_device_type_and_platform(device_name: &str) -> (String, Option<String>) {
     let name_lower = device_name.to_lowercase();
@@ -1224,7 +1270,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             initiate_pairing,
             get_paired_devices,
             get_unpaired_devices,
-            unpair_device_new
+            unpair_device_new,
+            update_paired_device_settings
         ])
         .setup(|app| {
             let _main_window = WebviewWindowBuilder::new(app, "main", WebviewUrl::default())
@@ -1318,9 +1365,12 @@ async fn start_daemon(app_handle: tauri::AppHandle) -> Result<(), Box<dyn std::e
         settings_lock.clone()
     };
 
+    // Create pairing completion callback
+    let pairing_callback = create_pairing_completion_callback(state.settings.clone());
+    
     // Create the daemon wrapped in Arc for shared ownership
     let daemon = Arc::new(
-        FileshareDaemon::new(settings)
+        FileshareDaemon::new_with_callback(settings, Some(pairing_callback))
             .await
             .map_err(|e| format!("Failed to create daemon: {}", e))?,
     );

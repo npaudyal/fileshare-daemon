@@ -16,6 +16,9 @@ use tokio::sync::{mpsc, RwLock};
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
+// Callback type for handling pairing completion
+pub type PairingCompletionCallback = Arc<dyn Fn(Uuid) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send>> + Send + Sync>;
+
 // Constants for connection health monitoring
 const PING_INTERVAL_SECONDS: u64 = 30;
 const PING_TIMEOUT_SECONDS: u64 = 10;
@@ -73,6 +76,8 @@ pub struct PeerManager {
     http_transfer_manager: Arc<HttpTransferManager>,
     // Pairing manager for secure device pairing
     pub pairing_manager: Option<Arc<PairingManager>>,
+    // Callback for when pairing is completed
+    pairing_completion_callback: Option<PairingCompletionCallback>,
 }
 
 impl PeerManager {
@@ -83,6 +88,14 @@ impl PeerManager {
     pub async fn new_with_pairing(
         settings: Arc<Settings>,
         _pairing_manager: Option<Arc<PairingManager>>,
+    ) -> Result<Self> {
+        Self::new_with_pairing_and_callback(settings, _pairing_manager, None).await
+    }
+
+    pub async fn new_with_pairing_and_callback(
+        settings: Arc<Settings>,
+        _pairing_manager: Option<Arc<PairingManager>>,
+        pairing_completion_callback: Option<PairingCompletionCallback>,
     ) -> Result<Self> {
         let (message_tx, message_rx) = mpsc::unbounded_channel();
 
@@ -111,7 +124,8 @@ impl PeerManager {
             temp_to_real_id_map: HashMap::new(),
             incoming_stream_managers: Arc::new(RwLock::new(HashMap::new())),
             http_transfer_manager,
-            pairing_manager: None,
+            pairing_manager: _pairing_manager,
+            pairing_completion_callback,
         };
 
         // Start accepting QUIC connections
@@ -443,6 +457,11 @@ impl PeerManager {
         let mut hasher = Sha256::new();
         hasher.update(pin.as_bytes());
         let pin_hash = format!("{:x}", hasher.finalize());
+        
+        // Debug: Log PIN hashing details
+        info!("🔍 Pairing Initiation Debug:");
+        info!("  Input PIN: {}", pin);
+        info!("  PIN hash: {}", pin_hash);
         
         // Get our device info
         let platform = if cfg!(target_os = "macos") {
@@ -1139,10 +1158,17 @@ impl PeerManager {
                     let our_pin_hash = sha2::Sha256::digest(current_pin.code.as_bytes());
                     let our_pin_hash_str = format!("{:x}", our_pin_hash);
                     
+                    // Debug: Log PIN comparison details
+                    info!("🔍 PIN Validation Debug:");
+                    info!("  Our PIN: {}", current_pin.code);
+                    info!("  Our PIN hash: {}", our_pin_hash_str);
+                    info!("  Received PIN hash: {}", pin_hash);
+                    info!("  Hash match: {}", pin_hash == &our_pin_hash_str);
+                    
                     let success = pin_hash == &our_pin_hash_str;
                     
                     if success {
-                        // Complete the pairing
+                        // Complete the pairing in PairingManager
                         if let Err(e) = pairing_manager.complete_pairing(
                             *device_id,
                             device_name.clone(),
@@ -1158,6 +1184,21 @@ impl PeerManager {
                             self.send_message_to_peer(peer_id, response).await?;
                         } else {
                             info!("✅ Pairing successful with {} ({})", device_name, device_id);
+                            
+                            // Call pairing completion callback to update persistent settings
+                            if let Some(callback) = &self.pairing_completion_callback {
+                                let callback = callback.clone();
+                                let device_id_owned = *device_id; // Extract value before async move
+                                tokio::spawn(async move {
+                                    if let Err(e) = callback(device_id_owned).await {
+                                        error!("Failed to update settings after pairing: {}", e);
+                                    } else {
+                                        info!("✅ Device {} added to persistent allowed_devices", device_id_owned);
+                                    }
+                                });
+                            } else {
+                                warn!("⚠️ No pairing completion callback configured - device {} will be lost on restart!", device_id);
+                            }
                             
                             // Send success response with our device info
                             let response = Message::new(MessageType::PairingResult {
@@ -1213,6 +1254,21 @@ impl PeerManager {
                             None,
                         ).await {
                             error!("Failed to save pairing locally: {}", e);
+                        } else {
+                            // Call pairing completion callback to update persistent settings
+                            if let Some(callback) = &self.pairing_completion_callback {
+                                let callback = callback.clone();
+                                let device_id_owned = *device_id; // Extract value before async move
+                                tokio::spawn(async move {
+                                    if let Err(e) = callback(device_id_owned).await {
+                                        error!("Failed to update settings after pairing: {}", e);
+                                    } else {
+                                        info!("✅ Device {} added to persistent allowed_devices", device_id_owned);
+                                    }
+                                });
+                            } else {
+                                warn!("⚠️ No pairing completion callback configured - device {} will be lost on restart!", device_id);
+                            }
                         }
                     }
                 } else {
