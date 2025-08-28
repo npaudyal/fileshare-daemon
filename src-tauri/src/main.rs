@@ -454,10 +454,16 @@ async fn get_discovered_devices(
 
         let mut devices = Vec::new();
 
-        for device in discovered {
+        for device in &discovered {
             let device_id_str = device.id.to_string();
             let is_paired = paired_ids.contains(&device.id)
                 || settings.security.allowed_devices.contains(&device.id);
+            
+            // Skip this device if it's not paired (DEVICES tab should only show paired devices)
+            if !is_paired {
+                continue;
+            }
+            
             let is_blocked = device_manager.blocked_devices.contains(&device_id_str);
             let is_connected = false; // Would need to check actual connection status
 
@@ -480,7 +486,7 @@ async fn get_discovered_devices(
 
             devices.push(DeviceInfo {
                 id: device_id_str,
-                name: device.name,
+                name: device.name.clone(),
                 display_name,
                 device_type,
                 is_paired,
@@ -491,7 +497,7 @@ async fn get_discovered_devices(
                 first_seen,
                 connection_count,
                 address: device.addr.to_string(),
-                version: device.version,
+                version: device.version.clone(),
                 platform,
                 last_transfer_time,
                 total_transfers,
@@ -499,8 +505,8 @@ async fn get_discovered_devices(
         }
 
         info!(
-            "📱 Returning {} discovered devices with metadata",
-            devices.len()
+            "📱 Returning {} PAIRED devices with metadata (filtered from {} total discovered)",
+            devices.len(), discovered.len()
         );
         Ok(devices)
     } else {

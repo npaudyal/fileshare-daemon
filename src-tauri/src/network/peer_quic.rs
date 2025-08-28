@@ -305,7 +305,16 @@ impl PeerManager {
         }
     }
 
+    /// Connect to peer for pairing purposes (bypasses pairing requirement)
+    pub async fn connect_to_peer_for_pairing(&mut self, peer_id: Uuid) -> Result<()> {
+        self.connect_to_peer_internal(peer_id, true).await
+    }
+    
     pub async fn connect_to_peer(&mut self, peer_id: Uuid) -> Result<()> {
+        self.connect_to_peer_internal(peer_id, false).await
+    }
+    
+    async fn connect_to_peer_internal(&mut self, peer_id: Uuid, _bypass_pairing_check: bool) -> Result<()> {
         let peer = self
             .peers
             .get_mut(&peer_id)
@@ -454,7 +463,30 @@ impl PeerManager {
             platform,
         });
         
-        // Send to the target device
+        // First, check if the peer exists in our discovered devices
+        if !self.peers.contains_key(&device_id) {
+            return Err(FileshareError::Unknown(format!(
+                "Device {} not found in discovered devices. Make sure the device is on the network.",
+                device_id
+            )));
+        }
+        
+        // Establish connection to the target device for pairing (bypass pairing requirement)
+        info!("🔗 Establishing connection to device {} for pairing...", device_id);
+        match self.connect_to_peer_for_pairing(device_id).await {
+            Ok(()) => {
+                info!("✅ Connection established to device {} for pairing", device_id);
+            }
+            Err(e) => {
+                error!("❌ Failed to establish connection for pairing: {}", e);
+                return Err(FileshareError::Transfer(format!(
+                    "Failed to establish connection for pairing: {}",
+                    e
+                )));
+            }
+        }
+        
+        // Now send the pairing message over the established connection
         self.send_message_to_peer(device_id, message).await?;
         
         info!("✅ Pairing request sent to device {}", device_id);
