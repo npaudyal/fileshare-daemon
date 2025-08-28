@@ -454,7 +454,7 @@ impl PeerManager {
         device_id: Uuid,
         pin: String,
     ) -> Result<()> {
-        info!("🔐 Initiating pairing with device {}", device_id);
+        info!("🔐 Initiating pairing with device {} - WE are the INITIATING device", device_id);
         
         // Hash the PIN
         let mut hasher = Sha256::new();
@@ -1231,7 +1231,7 @@ impl PeerManager {
                 platform,
             } => {
                 info!(
-                    "🔐 Received pairing request from {} ({})",
+                    "🔐 Received pairing request from {} ({}) - WE are the RECEIVING device",
                     device_name, device_id
                 );
                 
@@ -1320,13 +1320,12 @@ impl PeerManager {
                 device_name: remote_device_name,
                 reason,
             } => {
-                info!("🔍 Received PairingResult: success={}, peer_id={}, remote_device_id={:?}", 
-                      success, peer_id, remote_device_id);
-                info!("🔍 Current pending_pairings keys: {:?}", 
-                      self.pending_pairings.keys().collect::<Vec<_>>());
-                
-                // Notify any waiting pairing request using peer_id (connection ID)
+                // Check if we have a pending pairing request for this peer
                 if let Some(response_tx) = self.pending_pairings.remove(&peer_id) {
+                    // We initiated this pairing request, so notify the waiting channel
+                    info!("📨 Received PairingResult for OUR initiated request: success={}, peer_id={}", 
+                          success, peer_id);
+                    
                     let result = if *success {
                         info!(
                             "🎉 Pairing result: SUCCESS with {} ({})",
@@ -1346,16 +1345,21 @@ impl PeerManager {
                     // Send result to waiting channel (ignore if receiver dropped)
                     let _ = response_tx.send(result);
                 } else {
-                    // Log result even if no one is waiting
+                    // We didn't initiate this pairing - this is a result from a pairing WE processed
+                    info!("📨 Received PairingResult acknowledgment (we were the receiving device): success={}, peer_id={}", 
+                          success, peer_id);
+                    
+                    // Just log the result - no need to notify anyone since we weren't waiting
                     if *success {
                         info!(
-                            "🎉 Pairing result: SUCCESS with {} ({})",
+                            "✅ Pairing acknowledgment: SUCCESS with {} ({})",
                             remote_device_name.as_deref().unwrap_or("Unknown"),
                             peer_id
                         );
                     } else {
-                        warn!(
-                            "❌ Pairing result: FAILED - {}",
+                        info!(
+                            "ℹ️ Pairing acknowledgment: FAILED with {} - {}",
+                            peer_id,
                             reason.as_deref().unwrap_or("No reason provided")
                         );
                     }
