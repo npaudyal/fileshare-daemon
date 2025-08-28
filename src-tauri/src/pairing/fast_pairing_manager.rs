@@ -111,7 +111,7 @@ impl FastPairingManager {
     async fn process_fast_pairing_messages(
         mut message_rx: mpsc::UnboundedReceiver<(Uuid, Message)>,
         pending_pairings: Arc<RwLock<HashMap<Uuid, PendingPairing>>>,
-        _active_connections: Arc<RwLock<HashMap<Uuid, Arc<StreamManager>>>>,
+        active_connections: Arc<RwLock<HashMap<Uuid, Arc<StreamManager>>>>,
         completion_callback: Option<PairingCompletedCallback>,
     ) {
         info!("⚡ Fast pairing message processor started");
@@ -121,6 +121,16 @@ impl FastPairingManager {
             info!("📨 Fast pairing received: {:?} from {}", message.message_type, peer_id);
             
             match message.message_type {
+                MessageType::PairingRequest { device_id, device_name, pin_hash, platform } => {
+                    Self::handle_incoming_pairing_request(
+                        peer_id,
+                        device_id,
+                        device_name,
+                        pin_hash,
+                        platform,
+                        &active_connections,
+                    ).await;
+                }
                 MessageType::PairingResult { success, device_id, device_name, reason } => {
                     Self::handle_pairing_result(
                         peer_id,
@@ -163,6 +173,53 @@ impl FastPairingManager {
             return Err(FileshareError::Unknown("FastPairingManager message channel closed".to_string()));
         }
         Ok(())
+    }
+
+    /// Handle incoming pairing request (receiving device side)
+    async fn handle_incoming_pairing_request(
+        _peer_id: Uuid,
+        device_id: Uuid,
+        device_name: String,
+        _pin_hash: String,
+        _platform: Option<String>,
+        active_connections: &Arc<RwLock<HashMap<Uuid, Arc<StreamManager>>>>,
+    ) {
+        info!("🔐 Handling incoming pairing request from {} ({})", device_name, device_id);
+        
+        // For now, let's implement a simple acceptance (we'll need to get current PIN from pairing manager)
+        // TODO: Get actual current PIN and validate
+        let success = true; // Temporary - always accept for now
+        let reason = if success { None } else { Some("PIN validation failed".to_string()) };
+        
+        // Create pairing result message
+        let pairing_result = Message::new(MessageType::PairingResult {
+            success,
+            device_id: Some(device_id),
+            device_name: Some(device_name.clone()),
+            reason,
+        });
+        
+        // Send response back to requesting device
+        {
+            let connections = active_connections.read().await;
+            if let Some(stream_manager) = connections.get(&device_id) {
+                info!("📤 Sending pairing result to {}: success={}", device_name, success);
+                if let Err(e) = stream_manager.send_control_message(pairing_result).await {
+                    error!("❌ Failed to send pairing result to {}: {}", device_name, e);
+                } else {
+                    info!("✅ Pairing result sent successfully to {}", device_name);
+                }
+            } else {
+                warn!("⚠️ No active connection found for device {} to send pairing result", device_name);
+            }
+        }
+        
+        if success {
+            info!("🎉 Successfully paired with {} ({})", device_name, device_id);
+            // TODO: Add device to paired devices list
+        } else {
+            warn!("❌ Pairing failed with {} ({})", device_name, device_id);
+        }
     }
 
     /// Handle pairing result (fast, lockless)
