@@ -496,8 +496,12 @@ impl PeerManager {
         info!("🔍 Current peers in manager: {:?}", self.peers.keys().collect::<Vec<_>>());
         info!("🔍 Current ID mappings - temp_to_real: {:?}, real_to_temp: {:?}", 
              self.temp_to_real_id_map, self.real_to_temp_id_map);
+        info!("🔍 Current stream managers: {:?}", self.stream_managers.keys().collect::<Vec<_>>());
         
+        // Store under the device ID we're trying to pair with
         self.pending_pairings.insert(device_id, response_tx);
+        info!("📝 Stored pending pairing under device_id: {}", device_id);
+        info!("📝 Current pending_pairings keys: {:?}", self.pending_pairings.keys().collect::<Vec<_>>());
         
         // Establish connection to the target device for pairing (bypass pairing requirement)
         info!("🔗 Establishing connection to device {} for pairing...", device_id);
@@ -525,15 +529,20 @@ impl PeerManager {
         });
         
         // Send the pairing message over the established connection
+        info!("📨 Sending PairingRequest to device_id: {}", device_id);
         if let Err(e) = self.send_message_to_peer(device_id, message).await {
+            error!("❌ Failed to send pairing request: {}", e);
             // Clean up pending pairing on send failure
+            info!("🧹 Cleaning up pending pairing for {} due to send failure", device_id);
             self.pending_pairings.remove(&device_id);
             return Err(e);
         }
         
         info!("📤 Pairing request sent to device {}, waiting for validation result...", device_id);
+        info!("📝 Pending pairings after send: {:?}", self.pending_pairings.keys().collect::<Vec<_>>());
         
         // Wait for the pairing result with timeout
+        info!("⏳ Waiting for pairing response (timeout: 30s)...");
         match tokio::time::timeout(Duration::from_secs(30), response_rx).await {
             Ok(Ok(result)) => {
                 info!("✅ Pairing validation completed for device {}", device_id);
@@ -541,11 +550,16 @@ impl PeerManager {
             }
             Ok(Err(_)) => {
                 error!("❌ Pairing response channel closed unexpectedly for device {}", device_id);
+                info!("📝 Pending pairings at channel close: {:?}", self.pending_pairings.keys().collect::<Vec<_>>());
+                // Clean up any remaining pending pairing
+                self.pending_pairings.remove(&device_id);
                 Err(FileshareError::Unknown("Pairing response channel closed unexpectedly".to_string()))
             }
             Err(_) => {
                 error!("⏰ Pairing request timed out for device {}", device_id);
+                info!("📝 Pending pairings at timeout: {:?}", self.pending_pairings.keys().collect::<Vec<_>>());
                 // Clean up pending pairing on timeout
+                info!("🧹 Cleaning up pending pairing for {} due to timeout", device_id);
                 self.pending_pairings.remove(&device_id);
                 Err(FileshareError::Unknown("Pairing request timed out after 30 seconds".to_string()))
             }
@@ -929,6 +943,11 @@ impl PeerManager {
                         .insert(*device_id, stream_manager.clone());
                     self.temp_to_real_id_map.insert(peer_id, *device_id);
                     self.real_to_temp_id_map.insert(*device_id, peer_id);
+                    
+                    info!("📝 ID Mapping established:");
+                    info!("  temp_id (peer_id): {} -> real_id (device_id): {}", peer_id, device_id);
+                    info!("  Updated temp_to_real_id_map: {:?}", self.temp_to_real_id_map);
+                    info!("  Updated real_to_temp_id_map: {:?}", self.real_to_temp_id_map);
 
                     // Send handshake response immediately using the moved stream manager
                     let response = Message::new(MessageType::HandshakeResponse {
@@ -1329,21 +1348,69 @@ impl PeerManager {
                 device_name: remote_device_name,
                 reason,
             } => {
+                info!("🎯 === PairingResult Received ===");
+                info!("  peer_id (who sent this): {}", peer_id);
+                info!("  remote_device_id (sender's device ID): {:?}", remote_device_id);
+                info!("  remote_device_name: {:?}", remote_device_name);
+                info!("  success: {}", success);
+                info!("  reason: {:?}", reason);
+                
                 // Resolve peer_id to actual device_id in case there's ID mapping
                 let resolved_peer_id = self.resolve_peer_id(peer_id);
-                info!("🔍 PairingResult received: peer_id={}, resolved_peer_id={}, remote_device_id={:?}", 
-                     peer_id, resolved_peer_id, remote_device_id);
+                info!("🔍 ID Resolution:");
+                info!("  peer_id: {}", peer_id);
+                info!("  resolved_peer_id: {}", resolved_peer_id);
+                info!("  temp_to_real_id_map: {:?}", self.temp_to_real_id_map);
+                info!("  real_to_temp_id_map: {:?}", self.real_to_temp_id_map);
                 
                 // Log current pending pairings for debugging
-                info!("🔍 Current pending pairings: {:?}", self.pending_pairings.keys().collect::<Vec<_>>());
+                info!("📝 Current pending pairings keys: {:?}", self.pending_pairings.keys().collect::<Vec<_>>());
                 
                 // Try to find the pending pairing under various IDs
-                // 1. First try the resolved peer ID
-                // 2. Then try the original peer ID  
-                // 3. Then try the remote_device_id if provided (this is the actual device ID from the response)
-                let response_tx = self.pending_pairings.remove(&resolved_peer_id)
-                    .or_else(|| self.pending_pairings.remove(&peer_id))
-                    .or_else(|| remote_device_id.and_then(|id| self.pending_pairings.remove(&id)));
+                // The key insight: When we initiate pairing with device B, we store it under B's device ID
+                // When B responds, the peer_id is the connection ID, but we need to find our stored entry
+                
+                // Try different ID combinations
+                info!("🔍 Attempting to find pending pairing:");
+                
+                // WAIT! The key insight: remote_device_id is Device B's ID (the responder's ID)
+                // We (Device A) initiated pairing with Device B, so we stored pending under Device B's ID
+                // remote_device_id should be the key we're looking for!
+                
+                let mut response_tx = None;
+                
+                if let Some(remote_id) = remote_device_id {
+                    info!("  Try 1 - remote_device_id (the device we paired with): {}", remote_id);
+                    response_tx = self.pending_pairings.remove(&remote_id);
+                    
+                    if response_tx.is_some() {
+                        info!("    ✅ Found pending pairing using remote_device_id!");
+                    }
+                }
+                
+                if response_tx.is_none() {
+                    info!("  Try 2 - resolved_peer_id: {}", resolved_peer_id);
+                    response_tx = self.pending_pairings.remove(&resolved_peer_id);
+                }
+                
+                if response_tx.is_none() {
+                    info!("  Try 3 - peer_id: {}", peer_id);
+                    response_tx = self.pending_pairings.remove(&peer_id);
+                }
+                
+                if response_tx.is_none() {
+                    info!("  Try 4 - Looking through all pending pairings for any match");
+                    // Last resort: if we only have one pending pairing, it's probably this one
+                    if self.pending_pairings.len() == 1 {
+                        let (&only_key, _) = self.pending_pairings.iter().next().unwrap();
+                        info!("    Only one pending pairing found for: {}, assuming it's this one", only_key);
+                        response_tx = self.pending_pairings.remove(&only_key);
+                    } else if !self.pending_pairings.is_empty() {
+                        info!("    Multiple pending pairings, cannot determine which one: {:?}", self.pending_pairings.keys().collect::<Vec<_>>());
+                    }
+                }
+                
+                info!("📝 Result of pending pairing lookup: {}", if response_tx.is_some() { "FOUND" } else { "NOT FOUND" });
                 
                 if let Some(response_tx) = response_tx {
                     // We initiated this pairing request, so notify the waiting channel
@@ -1367,7 +1434,11 @@ impl PeerManager {
                     };
                     
                     // Send result to waiting channel (ignore if receiver dropped)
-                    let _ = response_tx.send(result);
+                    info!("📤 Sending result to waiting channel: {:?}", result);
+                    match response_tx.send(result) {
+                        Ok(()) => info!("✅ Successfully notified waiting channel"),
+                        Err(_) => warn!("⚠️ Failed to send result - receiver may have been dropped"),
+                    }
                 } else {
                     // We didn't initiate this pairing - this is a result from a pairing WE processed
                     info!("📨 Received PairingResult acknowledgment (we were the receiving device): success={}, peer_id={}", 
