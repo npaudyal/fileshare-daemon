@@ -1,7 +1,11 @@
 // Prevents additional console window on Windows in release
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-use fileshare_daemon::{config::Settings, service::FileshareDaemon, network::peer_quic::PairingCompletionCallback, FileshareError};
+use fileshare_daemon::{
+    config::Settings, 
+    service::FileshareDaemon, 
+    pairing::{FastPairingManager, fast_pairing_manager::PairingCompletedCallback}
+};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tauri::{
@@ -433,6 +437,7 @@ struct AppState {
     settings: Arc<RwLock<Settings>>,
     daemon_ref: Arc<Mutex<Option<Arc<FileshareDaemon>>>>,
     device_manager: Arc<RwLock<DeviceManager>>,
+    fast_pairing_manager: Arc<RwLock<Option<Arc<FastPairingManager>>>>,
 }
 
 // Enhanced device discovery with metadata
@@ -993,27 +998,73 @@ async fn refresh_pin(state: tauri::State<'_, AppState>) -> Result<serde_json::Va
 
 #[tauri::command]
 async fn initiate_pairing(
+    _device_id: String,
+    _pin: String,
+    _state: tauri::State<'_, AppState>,
+) -> Result<(), String> {
+    // Legacy pairing method removed - use fast_pairing command instead
+    Err("Please use fast_pairing command instead of initiate_pairing".to_string())
+}
+
+// FAST PAIRING COMMAND (Bluetooth-style)
+#[tauri::command]
+async fn fast_pairing(
     device_id: String,
     pin: String,
     state: tauri::State<'_, AppState>,
-) -> Result<(), String> {
+) -> Result<serde_json::Value, String> {
     info!(
-        "🔗 UI requested pairing with device: {} using PIN",
+        "⚡ UI requested FAST pairing with device: {} using PIN",
         device_id
     );
 
     let device_uuid =
         Uuid::parse_str(&device_id).map_err(|e| format!("Invalid device ID: {}", e))?;
 
-    if let Some(daemon_ref) = state.daemon_ref.lock().await.as_ref() {
-        let mut pm = daemon_ref.peer_manager.write().await;
-        pm.initiate_pairing(device_uuid, pin)
-            .await
-            .map_err(|e| format!("Failed to initiate pairing: {}", e))?;
-        Ok(())
-    } else {
-        Err("Daemon not ready".to_string())
-    }
+    // Get the fast pairing manager
+    let fast_pairing_manager = {
+        let fpm_guard = state.fast_pairing_manager.read().await;
+        fpm_guard
+            .as_ref()
+            .ok_or_else(|| "Fast pairing manager not ready".to_string())?
+            .clone()
+    };
+
+    // Get device address from discovered devices
+    let device_info = {
+        let daemon_guard = state.daemon_ref.lock().await;
+        let daemon = daemon_guard
+            .as_ref()
+            .ok_or_else(|| "Daemon not ready".to_string())?;
+        
+        // Get discovered devices to find the address
+        let discovered_devices = daemon.get_discovered_devices().await;
+            
+        discovered_devices
+            .into_iter()
+            .find(|dev| dev.id == device_uuid)
+            .ok_or_else(|| format!("Device {} not found in discovered devices", device_uuid))?
+    };
+
+    // Extract address (DeviceInfo.addr already contains IP:port)
+    let device_address = device_info.addr;
+
+    // Initiate fast pairing
+    info!("⚡ Starting fast pairing to {} at {}", device_uuid, device_address);
+    let result = fast_pairing_manager
+        .initiate_pairing(device_uuid, device_address, pin)
+        .await
+        .map_err(|e| format!("Fast pairing failed: {}", e))?;
+
+    info!("⚡ Fast pairing completed: success={}", result.success);
+    
+    // Convert to JSON for Tauri compatibility
+    Ok(serde_json::json!({
+        "success": result.success,
+        "remote_device_id": result.remote_device_id,
+        "remote_device_name": result.remote_device_name,
+        "error_message": result.error_message
+    }))
 }
 
 #[tauri::command]
@@ -1141,19 +1192,7 @@ async fn add_device_to_allowed_settings(
     Ok(())
 }
 
-// Create a pairing completion callback that can be passed to PeerManager
-fn create_pairing_completion_callback(
-    settings: Arc<RwLock<Settings>>,
-) -> PairingCompletionCallback {
-    Arc::new(move |device_id: Uuid| {
-        let settings = settings.clone();
-        Box::pin(async move {
-            add_device_to_allowed_settings(device_id, &settings)
-                .await
-                .map_err(|e| FileshareError::Config(e))
-        })
-    })
-}
+// Legacy pairing completion callback removed - FastPairingManager handles this directly
 
 #[tauri::command]
 async fn update_paired_device_settings(
@@ -1226,6 +1265,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         settings: Arc::new(RwLock::new(settings)),
         daemon_ref: Arc::new(Mutex::new(None)),
         device_manager: Arc::new(RwLock::new(DeviceManager::default())),
+        fast_pairing_manager: Arc::new(RwLock::new(None)),
     };
 
     tauri::Builder::default()
@@ -1268,6 +1308,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             get_current_pin,
             refresh_pin,
             initiate_pairing,
+            fast_pairing,  // NEW: Fast Bluetooth-style pairing
             get_paired_devices,
             get_unpaired_devices,
             unpair_device_new,
@@ -1365,12 +1406,9 @@ async fn start_daemon(app_handle: tauri::AppHandle) -> Result<(), Box<dyn std::e
         settings_lock.clone()
     };
 
-    // Create pairing completion callback
-    let pairing_callback = create_pairing_completion_callback(state.settings.clone());
-    
     // Create the daemon wrapped in Arc for shared ownership
     let daemon = Arc::new(
-        FileshareDaemon::new_with_callback(settings, Some(pairing_callback))
+        FileshareDaemon::new(settings)
             .await
             .map_err(|e| format!("Failed to create daemon: {}", e))?,
     );
@@ -1384,6 +1422,63 @@ async fn start_daemon(app_handle: tauri::AppHandle) -> Result<(), Box<dyn std::e
     }
 
     info!("✅ Daemon reference stored for UI access");
+
+    // Create and initialize FastPairingManager (Bluetooth-style)
+    {
+        let settings_guard = state.settings.read().await;
+        let device_id = settings_guard.device.id;
+        let device_name = settings_guard.device.name.clone();
+        let quic_manager = daemon.peer_manager.read().await.quic_manager.clone();
+        
+        info!("⚡ Creating FastPairingManager");
+        let mut fast_pairing_manager = FastPairingManager::new(
+            device_id,
+            device_name,
+            quic_manager,
+        );
+
+        // Create completion callback for fast pairing
+        let settings_for_callback = state.settings.clone();
+        let daemon_for_callback = daemon.clone();
+        let fast_completion_callback: PairingCompletedCallback =
+            Arc::new(move |event| {
+                let settings = settings_for_callback.clone();
+                let _daemon = daemon_for_callback.clone();
+                Box::pin(async move {
+                    if event.result.success {
+                        if let Some(device_id) = event.result.remote_device_id {
+                            info!("⚡ Fast pairing completed successfully for device {}", device_id);
+                            
+                            // Add to persistent settings
+                            if let Err(e) = add_device_to_allowed_settings(device_id, &settings).await {
+                                error!("❌ Failed to save fast paired device to settings: {}", e);
+                            } else {
+                                info!("✅ Fast paired device {} saved to settings", device_id);
+                            }
+                        }
+                    } else {
+                        info!("⚡ Fast pairing failed: {:?}", event.result.error_message);
+                    }
+                })
+            });
+
+        fast_pairing_manager.set_completion_callback(fast_completion_callback);
+
+        // Start the message processor
+        if let Err(e) = fast_pairing_manager.start_message_processor().await {
+            error!("❌ Failed to start fast pairing message processor: {}", e);
+        } else {
+            info!("⚡ Fast pairing message processor started");
+        }
+
+        // Store the fast pairing manager
+        {
+            let mut fpm_guard = state.fast_pairing_manager.write().await;
+            *fpm_guard = Some(Arc::new(fast_pairing_manager));
+        }
+
+        info!("⚡ FastPairingManager initialized and stored");
+    }
 
     // Start background services using shared ownership
     daemon

@@ -11,6 +11,9 @@ use tokio::time;
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
+pub mod fast_pairing_manager;
+pub use fast_pairing_manager::{FastPairingManager, PairingCompletedEvent, PairingResult as FastPairingResult};
+
 const PIN_LENGTH: usize = 6;
 const PIN_LIFETIME_SECONDS: u64 = 120; // 2 minutes
 const MAX_PIN_ATTEMPTS: u32 = 3;

@@ -2,22 +2,20 @@ use crate::{
     config::Settings,
     http::HttpTransferManager,
     network::{discovery::DeviceInfo, protocol::*},
-    pairing::PairingManager,
     quic::{QuicConnectionManager, StreamManager},
     FileshareError, Result,
 };
-use sha2::{Digest, Sha256};
+// Removed sha2 imports - pairing now handled by FastPairingManager
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::sync::{mpsc, RwLock, oneshot};
+use tokio::sync::{mpsc, RwLock};
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
-// Callback type for handling pairing completion
-pub type PairingCompletionCallback = Arc<dyn Fn(Uuid) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send>> + Send + Sync>;
+// Removed pairing logic - now handled by dedicated FastPairingManager
 
 // Constants for connection health monitoring
 const PING_INTERVAL_SECONDS: u64 = 30;
@@ -66,7 +64,7 @@ pub struct PeerManager {
     pub message_tx: mpsc::UnboundedSender<(Uuid, Message)>,
     pub message_rx: mpsc::UnboundedReceiver<(Uuid, Message)>,
     // QUIC components
-    quic_manager: Arc<QuicConnectionManager>,
+    pub quic_manager: Arc<QuicConnectionManager>,
     stream_managers: HashMap<Uuid, Arc<StreamManager>>,
     // Mapping from temporary connection IDs to real device IDs
     temp_to_real_id_map: HashMap<Uuid, Uuid>,
@@ -76,30 +74,16 @@ pub struct PeerManager {
     incoming_stream_managers: Arc<RwLock<HashMap<Uuid, Arc<StreamManager>>>>,
     // HTTP transfer manager for file transfers
     http_transfer_manager: Arc<HttpTransferManager>,
-    // Pairing manager for secure device pairing
-    pub pairing_manager: Option<Arc<PairingManager>>,
-    // Callback for when pairing is completed
-    pairing_completion_callback: Option<PairingCompletionCallback>,
-    // Track pending pairing requests waiting for responses
-    pending_pairings: HashMap<Uuid, oneshot::Sender<std::result::Result<(), String>>>,
+    // Pairing now handled by dedicated FastPairingManager
 }
 
 impl PeerManager {
     pub async fn new(settings: Arc<Settings>) -> Result<Self> {
-        Self::new_with_pairing(settings, None).await
+        Self::new_internal(settings).await
     }
 
-    pub async fn new_with_pairing(
+    async fn new_internal(
         settings: Arc<Settings>,
-        _pairing_manager: Option<Arc<PairingManager>>,
-    ) -> Result<Self> {
-        Self::new_with_pairing_and_callback(settings, _pairing_manager, None).await
-    }
-
-    pub async fn new_with_pairing_and_callback(
-        settings: Arc<Settings>,
-        _pairing_manager: Option<Arc<PairingManager>>,
-        pairing_completion_callback: Option<PairingCompletionCallback>,
     ) -> Result<Self> {
         let (message_tx, message_rx) = mpsc::unbounded_channel();
 
@@ -129,9 +113,6 @@ impl PeerManager {
             real_to_temp_id_map: HashMap::new(),
             incoming_stream_managers: Arc::new(RwLock::new(HashMap::new())),
             http_transfer_manager,
-            pairing_manager: _pairing_manager,
-            pairing_completion_callback,
-            pending_pairings: HashMap::new(),
         };
 
         // Start accepting QUIC connections
@@ -306,29 +287,18 @@ impl PeerManager {
 
     fn should_connect_to_peer(&self, device_info: &DeviceInfo) -> bool {
         if self.settings.security.require_pairing {
-            // Check if device is in the paired devices list
-            if let Some(_pairing_manager) = &self.pairing_manager {
-                // We'll need to make this async or cache the paired devices
-                // For now, fallback to allowed_devices
-                self.settings
-                    .security
-                    .allowed_devices
-                    .contains(&device_info.id)
-            } else {
-                self.settings
-                    .security
-                    .allowed_devices
-                    .contains(&device_info.id)
-            }
+            // Check if device is in the allowed devices list (paired devices)
+            self.settings
+                .security
+                .allowed_devices
+                .contains(&device_info.id)
         } else {
+            // No pairing required, connect to all devices
             true
         }
     }
 
-    /// Connect to peer for pairing purposes (bypasses pairing requirement)
-    pub async fn connect_to_peer_for_pairing(&mut self, peer_id: Uuid) -> Result<()> {
-        self.connect_to_peer_internal(peer_id, true).await
-    }
+    // Removed connect_to_peer_for_pairing - pairing now handled by FastPairingManager
     
     pub async fn connect_to_peer(&mut self, peer_id: Uuid) -> Result<()> {
         self.connect_to_peer_internal(peer_id, false).await
@@ -452,140 +422,14 @@ impl PeerManager {
         Ok(())
     }
 
-    pub async fn initiate_pairing(
-        &mut self,
-        device_id: Uuid,
-        pin: String,
-    ) -> Result<()> {
-        info!("🔐 Initiating pairing with device {} - WE are the INITIATING device", device_id);
-        
-        // Hash the PIN
-        let mut hasher = Sha256::new();
-        hasher.update(pin.as_bytes());
-        let pin_hash = format!("{:x}", hasher.finalize());
-        
-        // Debug: Log PIN hashing details
-        info!("🔍 Pairing Initiation Debug:");
-        info!("  Input PIN: {}", pin);
-        info!("  PIN hash: {}", pin_hash);
-        
-        // Get our device info
-        let platform = if cfg!(target_os = "macos") {
-            Some("macOS".to_string())
-        } else if cfg!(target_os = "windows") {
-            Some("Windows".to_string())
-        } else if cfg!(target_os = "linux") {
-            Some("Linux".to_string())
-        } else {
-            None
-        };
-        
-        // First, check if the peer exists in our discovered devices
-        if !self.peers.contains_key(&device_id) {
-            return Err(FileshareError::Unknown(format!(
-                "Device {} not found in discovered devices. Make sure the device is on the network.",
-                device_id
-            )));
-        }
-        
-        // Create a response channel to wait for the pairing result
-        let (response_tx, response_rx) = oneshot::channel();
-        
-        // Store the response channel for this pairing request  
-        info!("🔍 Storing pending pairing request for device_id: {}", device_id);
-        info!("🔍 Current peers in manager: {:?}", self.peers.keys().collect::<Vec<_>>());
-        info!("🔍 Current ID mappings - temp_to_real: {:?}, real_to_temp: {:?}", 
-             self.temp_to_real_id_map, self.real_to_temp_id_map);
-        info!("🔍 Current stream managers: {:?}", self.stream_managers.keys().collect::<Vec<_>>());
-        
-        // Store under the device ID we're trying to pair with
-        self.pending_pairings.insert(device_id, response_tx);
-        info!("📝 Stored pending pairing under device_id: {}", device_id);
-        info!("📝 Current pending_pairings keys: {:?}", self.pending_pairings.keys().collect::<Vec<_>>());
-        
-        // Establish connection to the target device for pairing (bypass pairing requirement)
-        info!("🔗 Establishing connection to device {} for pairing...", device_id);
-        match self.connect_to_peer_for_pairing(device_id).await {
-            Ok(()) => {
-                info!("✅ Connection established to device {} for pairing", device_id);
-            }
-            Err(e) => {
-                error!("❌ Failed to establish connection for pairing: {}", e);
-                // Clean up pending pairing on connection failure
-                self.pending_pairings.remove(&device_id);
-                return Err(FileshareError::Transfer(format!(
-                    "Failed to establish connection for pairing: {}",
-                    e
-                )));
-            }
-        }
-        
-        // Create pairing request message
-        let message = Message::new(MessageType::PairingRequest {
-            device_id: self.settings.device.id,
-            device_name: self.settings.device.name.clone(),
-            pin_hash,
-            platform,
-        });
-        
-        // Send the pairing message over the established connection
-        info!("📨 Sending PairingRequest to device_id: {}", device_id);
-        if let Err(e) = self.send_message_to_peer(device_id, message).await {
-            error!("❌ Failed to send pairing request: {}", e);
-            // Clean up pending pairing on send failure
-            info!("🧹 Cleaning up pending pairing for {} due to send failure", device_id);
-            self.pending_pairings.remove(&device_id);
-            return Err(e);
-        }
-        
-        info!("📤 Pairing request sent to device {}, waiting for validation result...", device_id);
-        info!("📝 Pending pairings after send: {:?}", self.pending_pairings.keys().collect::<Vec<_>>());
-        
-        // Wait for the pairing result with timeout
-        info!("⏳ Waiting for pairing response (timeout: 30s)...");
-        match tokio::time::timeout(Duration::from_secs(30), response_rx).await {
-            Ok(Ok(result)) => {
-                info!("✅ Pairing validation completed for device {}", device_id);
-                result.map_err(|e| FileshareError::Unknown(e))
-            }
-            Ok(Err(_)) => {
-                error!("❌ Pairing response channel closed unexpectedly for device {}", device_id);
-                info!("📝 Pending pairings at channel close: {:?}", self.pending_pairings.keys().collect::<Vec<_>>());
-                // Clean up any remaining pending pairing
-                self.pending_pairings.remove(&device_id);
-                Err(FileshareError::Unknown("Pairing response channel closed unexpectedly".to_string()))
-            }
-            Err(_) => {
-                error!("⏰ Pairing request timed out for device {}", device_id);
-                info!("📝 Pending pairings at timeout: {:?}", self.pending_pairings.keys().collect::<Vec<_>>());
-                // Clean up pending pairing on timeout
-                info!("🧹 Cleaning up pending pairing for {} due to timeout", device_id);
-                self.pending_pairings.remove(&device_id);
-                Err(FileshareError::Unknown("Pairing request timed out after 30 seconds".to_string()))
-            }
-        }
-    }
+    // Removed initiate_pairing method - pairing now handled by dedicated FastPairingManager
     
-    // Helper function to check if a device is properly paired
-    fn is_device_paired(&self, device_id: Uuid) -> bool {
-        // Check both the PairingManager (in-memory paired devices) and settings.security.allowed_devices
-        let in_pairing_manager = if let Some(_pairing_manager) = &self.pairing_manager {
-            // TODO: Add method to check if device is in pairing manager
-            // For now, always check settings as the authoritative source
-            false
-        } else {
-            false
-        };
-        
-        let in_allowed_devices = self.settings.security.allowed_devices.contains(&device_id);
-        
-        // Device is considered paired if it's in either location
-        in_pairing_manager || in_allowed_devices
-    }
+    // Device pairing status now checked through settings.security.allowed_devices
+    // Legacy pairing logic removed - handled by FastPairingManager
 
     pub async fn send_file_to_peer(&mut self, peer_id: Uuid, file_path: PathBuf) -> Result<()> {
         // First check if the device is actually paired
-        if !self.is_device_paired(peer_id) {
+        if !self.settings.security.allowed_devices.contains(&peer_id) {
             return Err(FileshareError::Transfer(
                 "File transfer denied: Device is not paired. Please pair the device first.".to_string(),
             ));
@@ -838,7 +682,7 @@ impl PeerManager {
                 file_size,
             } => {
                 // Verify device is paired before accepting clipboard data
-                if !self.is_device_paired(peer_id) {
+                if !self.settings.security.allowed_devices.contains(&peer_id) {
                     warn!("🚫 Clipboard update denied from unpaired device {}", peer_id);
                     return Ok(()); // Silently ignore clipboard updates from unpaired devices
                 }
@@ -857,7 +701,7 @@ impl PeerManager {
 
             MessageType::ClipboardClear => {
                 // Verify device is paired before accepting clipboard clear command
-                if !self.is_device_paired(peer_id) {
+                if !self.settings.security.allowed_devices.contains(&peer_id) {
                     warn!("🚫 Clipboard clear denied from unpaired device {}", peer_id);
                     return Ok(()); // Silently ignore clipboard clear from unpaired devices
                 }
@@ -1042,7 +886,7 @@ impl PeerManager {
                 target_path,
             } => {
                 // Verify device is paired before processing file requests
-                if !self.is_device_paired(peer_id) {
+                if !self.settings.security.allowed_devices.contains(&peer_id) {
                     warn!("🚫 File request denied from unpaired device {}", peer_id);
                     
                     // Send rejection response for unpaired devices
@@ -1252,249 +1096,19 @@ impl PeerManager {
                 }
             }
 
-            MessageType::PairingRequest {
-                device_id,
-                device_name,
-                pin_hash,
-                platform,
-            } => {
-                info!(
-                    "🔐 Received pairing request from {} ({}) - WE are the RECEIVING device",
-                    device_name, device_id
-                );
-                
-                if let Some(pairing_manager) = &self.pairing_manager {
-                    // Verify the PIN hash matches our current PIN
-                    let current_pin = pairing_manager.get_current_pin().await;
-                    let our_pin_hash = sha2::Sha256::digest(current_pin.code.as_bytes());
-                    let our_pin_hash_str = format!("{:x}", our_pin_hash);
-                    
-                    // Debug: Log PIN comparison details
-                    info!("🔍 PIN Validation Debug:");
-                    info!("  Our PIN: {}", current_pin.code);
-                    info!("  Our PIN hash: {}", our_pin_hash_str);
-                    info!("  Received PIN hash: {}", pin_hash);
-                    info!("  Hash match: {}", pin_hash == &our_pin_hash_str);
-                    
-                    let success = pin_hash == &our_pin_hash_str;
-                    
-                    if success {
-                        // Complete the pairing in PairingManager
-                        if let Err(e) = pairing_manager.complete_pairing(
-                            *device_id,
-                            device_name.clone(),
-                            platform.clone(),
-                        ).await {
-                            error!("Failed to complete pairing: {}", e);
-                            let response = Message::new(MessageType::PairingResult {
-                                success: false,
-                                device_id: None,
-                                device_name: None,
-                                reason: Some("Failed to save pairing".to_string()),
-                            });
-                            self.send_message_to_peer(peer_id, response).await?;
-                        } else {
-                            info!("✅ Pairing successful with {} ({})", device_name, device_id);
-                            
-                            // Call pairing completion callback to update persistent settings
-                            if let Some(callback) = &self.pairing_completion_callback {
-                                let callback = callback.clone();
-                                let device_id_owned = *device_id; // Extract value before async move
-                                tokio::spawn(async move {
-                                    if let Err(e) = callback(device_id_owned).await {
-                                        error!("Failed to update settings after pairing: {}", e);
-                                    } else {
-                                        info!("✅ Device {} added to persistent allowed_devices", device_id_owned);
-                                    }
-                                });
-                            } else {
-                                warn!("⚠️ No pairing completion callback configured - device {} will be lost on restart!", device_id);
-                            }
-                            
-                            // Send success response with our device info
-                            let response = Message::new(MessageType::PairingResult {
-                                success: true,
-                                device_id: Some(self.settings.device.id),
-                                device_name: Some(self.settings.device.name.clone()),
-                                reason: None,
-                            });
-                            self.send_message_to_peer(peer_id, response).await?;
-                        }
-                    } else {
-                        warn!("❌ Invalid PIN from {} ({})", device_name, device_id);
-                        let response = Message::new(MessageType::PairingResult {
-                            success: false,
-                            device_id: None,
-                            device_name: None,
-                            reason: Some("Invalid PIN".to_string()),
-                        });
-                        self.send_message_to_peer(peer_id, response).await?;
-                    }
-                } else {
-                    // Pairing not configured
-                    let response = Message::new(MessageType::PairingResult {
-                        success: false,
-                        device_id: None,
-                        device_name: None,
-                        reason: Some("Pairing not enabled".to_string()),
-                    });
-                    self.send_message_to_peer(peer_id, response).await?;
-                }
+            // Pairing requests now handled by dedicated FastPairingManager
+            MessageType::PairingRequest { .. } => {
+                info!("🔐 Received legacy pairing request - ignoring (FastPairingManager handles pairing now)");
             }
             
-            MessageType::PairingResult {
-                success,
-                device_id: remote_device_id,
-                device_name: remote_device_name,
-                reason,
-            } => {
-                info!("🎯 === PairingResult Received ===");
-                info!("  peer_id (who sent this): {}", peer_id);
-                info!("  remote_device_id (sender's device ID): {:?}", remote_device_id);
-                info!("  remote_device_name: {:?}", remote_device_name);
-                info!("  success: {}", success);
-                info!("  reason: {:?}", reason);
-                
-                // Resolve peer_id to actual device_id in case there's ID mapping
-                let resolved_peer_id = self.resolve_peer_id(peer_id);
-                info!("🔍 ID Resolution:");
-                info!("  peer_id: {}", peer_id);
-                info!("  resolved_peer_id: {}", resolved_peer_id);
-                info!("  temp_to_real_id_map: {:?}", self.temp_to_real_id_map);
-                info!("  real_to_temp_id_map: {:?}", self.real_to_temp_id_map);
-                
-                // Log current pending pairings for debugging
-                info!("📝 Current pending pairings keys: {:?}", self.pending_pairings.keys().collect::<Vec<_>>());
-                
-                // Try to find the pending pairing under various IDs
-                // The key insight: When we initiate pairing with device B, we store it under B's device ID
-                // When B responds, the peer_id is the connection ID, but we need to find our stored entry
-                
-                // Try different ID combinations
-                info!("🔍 Attempting to find pending pairing:");
-                
-                // WAIT! The key insight: remote_device_id is Device B's ID (the responder's ID)
-                // We (Device A) initiated pairing with Device B, so we stored pending under Device B's ID
-                // remote_device_id should be the key we're looking for!
-                
-                let mut response_tx = None;
-                
-                if let Some(remote_id) = remote_device_id {
-                    info!("  Try 1 - remote_device_id (the device we paired with): {}", remote_id);
-                    response_tx = self.pending_pairings.remove(&remote_id);
-                    
-                    if response_tx.is_some() {
-                        info!("    ✅ Found pending pairing using remote_device_id!");
-                    }
-                }
-                
-                if response_tx.is_none() {
-                    info!("  Try 2 - resolved_peer_id: {}", resolved_peer_id);
-                    response_tx = self.pending_pairings.remove(&resolved_peer_id);
-                }
-                
-                if response_tx.is_none() {
-                    info!("  Try 3 - peer_id: {}", peer_id);
-                    response_tx = self.pending_pairings.remove(&peer_id);
-                }
-                
-                if response_tx.is_none() {
-                    info!("  Try 4 - Looking through all pending pairings for any match");
-                    // Last resort: if we only have one pending pairing, it's probably this one
-                    if self.pending_pairings.len() == 1 {
-                        let (&only_key, _) = self.pending_pairings.iter().next().unwrap();
-                        info!("    Only one pending pairing found for: {}, assuming it's this one", only_key);
-                        response_tx = self.pending_pairings.remove(&only_key);
-                    } else if !self.pending_pairings.is_empty() {
-                        info!("    Multiple pending pairings, cannot determine which one: {:?}", self.pending_pairings.keys().collect::<Vec<_>>());
-                    }
-                }
-                
-                info!("📝 Result of pending pairing lookup: {}", if response_tx.is_some() { "FOUND" } else { "NOT FOUND" });
-                
-                if let Some(response_tx) = response_tx {
-                    // We initiated this pairing request, so notify the waiting channel
-                    info!("📨 Received PairingResult for OUR initiated request: success={}, peer_id={}", 
-                          success, peer_id);
-                    
-                    let result = if *success {
-                        info!(
-                            "🎉 Pairing result: SUCCESS with {} ({})",
-                            remote_device_name.as_deref().unwrap_or("Unknown"),
-                            peer_id
-                        );
-                        Ok(())
-                    } else {
-                        let error_msg = reason.as_deref().unwrap_or("Pairing failed");
-                        warn!(
-                            "❌ Pairing result: FAILED - {}",
-                            error_msg
-                        );
-                        Err(format!("Pairing failed: {}", error_msg))
-                    };
-                    
-                    // Send result to waiting channel (ignore if receiver dropped)
-                    info!("📤 Sending result to waiting channel: {:?}", result);
-                    match response_tx.send(result) {
-                        Ok(()) => info!("✅ Successfully notified waiting channel"),
-                        Err(_) => warn!("⚠️ Failed to send result - receiver may have been dropped"),
-                    }
-                } else {
-                    // We didn't initiate this pairing - this is a result from a pairing WE processed
-                    info!("📨 Received PairingResult acknowledgment (we were the receiving device): success={}, peer_id={}", 
-                          success, peer_id);
-                    
-                    // Just log the result - no need to notify anyone since we weren't waiting
-                    if *success {
-                        info!(
-                            "✅ Pairing acknowledgment: SUCCESS with {} ({})",
-                            remote_device_name.as_deref().unwrap_or("Unknown"),
-                            peer_id
-                        );
-                    } else {
-                        info!(
-                            "ℹ️ Pairing acknowledgment: FAILED with {} - {}",
-                            peer_id,
-                            reason.as_deref().unwrap_or("No reason provided")
-                        );
-                    }
-                }
-                
-                if *success {
-                    // Update our pairing manager if needed
-                    if let (Some(pairing_manager), Some(device_id), Some(device_name)) = 
-                        (&self.pairing_manager, remote_device_id, remote_device_name) {
-                        
-                        if let Err(e) = pairing_manager.complete_pairing(
-                            *device_id,
-                            device_name.clone(),
-                            None,
-                        ).await {
-                            error!("Failed to save pairing locally: {}", e);
-                        } else {
-                            // Call pairing completion callback to update persistent settings
-                            if let Some(callback) = &self.pairing_completion_callback {
-                                let callback = callback.clone();
-                                let device_id_owned = *device_id; // Extract value before async move
-                                tokio::spawn(async move {
-                                    if let Err(e) = callback(device_id_owned).await {
-                                        error!("Failed to update settings after pairing: {}", e);
-                                    } else {
-                                        info!("✅ Device {} added to persistent allowed_devices", device_id_owned);
-                                    }
-                                });
-                            } else {
-                                warn!("⚠️ No pairing completion callback configured - device {} will be lost on restart!", device_id);
-                            }
-                        }
-                    }
-                }
+            // Pairing results now handled by dedicated FastPairingManager
+            MessageType::PairingResult { .. } => {
+                info!("🎯 Received legacy pairing result - ignoring (FastPairingManager handles pairing now)");
             }
             
+            // Legacy advanced pairing messages - no longer supported
             MessageType::PairingChallenge { .. } | MessageType::PairingResponse { .. } => {
-                // These messages would be used for more complex challenge-response auth
-                // For now, we're using simple PIN verification
-                debug!("Received advanced pairing message, not implemented yet");
+                debug!("Received legacy advanced pairing message - no longer supported");
             }
             
             _ => {

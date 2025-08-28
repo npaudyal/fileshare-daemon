@@ -2,7 +2,7 @@ use crate::{
     clipboard::ClipboardManager,
     config::Settings,
     hotkeys::{HotkeyEvent, HotkeyManager},
-    network::{DiscoveryService, PeerManager, peer_quic::PairingCompletionCallback},
+    network::{DiscoveryService, PeerManager},
     pairing::PairingManager,
     Result,
 };
@@ -24,13 +24,6 @@ pub struct FileshareDaemon {
 
 impl FileshareDaemon {
     pub async fn new(settings: Settings) -> Result<Self> {
-        Self::new_with_callback(settings, None).await
-    }
-
-    pub async fn new_with_callback(
-        settings: Settings,
-        pairing_completion_callback: Option<PairingCompletionCallback>,
-    ) -> Result<Self> {
         let settings = Arc::new(settings);
         let (shutdown_tx, shutdown_rx) = broadcast::channel(1);
 
@@ -39,12 +32,8 @@ impl FileshareDaemon {
         pairing_manager.start().await?;
         let pairing_manager = Arc::new(pairing_manager);
 
-        // Initialize peer manager with QUIC and pairing support
-        let peer_manager = PeerManager::new_with_pairing_and_callback(
-            settings.clone(), 
-            Some(pairing_manager.clone()),
-            pairing_completion_callback,
-        ).await?;
+        // Initialize peer manager with QUIC support (pairing now handled by FastPairingManager)
+        let peer_manager = PeerManager::new(settings.clone()).await?;
         let peer_manager = Arc::new(RwLock::new(peer_manager));
 
         // Initialize discovery service
