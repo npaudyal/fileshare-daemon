@@ -1043,9 +1043,18 @@ async fn get_unpaired_devices(
     info!("🔍 UI requesting unpaired devices");
 
     if let Some(daemon_ref) = state.daemon_ref.lock().await.as_ref() {
-        let all_devices = daemon_ref.get_discovered_devices().await;
+        // Get ALL discovered devices from the discovery service, not just connected peers
+        let all_devices = daemon_ref.get_all_discovered_devices_from_discovery().await;
         let paired_devices = daemon_ref.pairing_manager.get_paired_devices().await;
         let paired_ids: Vec<Uuid> = paired_devices.iter().map(|d| d.id).collect();
+
+        info!("📊 Discovery stats - Total devices: {}, Paired devices: {}", 
+              all_devices.len(), paired_devices.len());
+        
+        for device in &all_devices {
+            info!("🔍 Discovered device: {} ({}) at {}", 
+                  device.name, device.id, device.addr);
+        }
 
         let unpaired: Vec<DeviceInfo> = all_devices
             .into_iter()

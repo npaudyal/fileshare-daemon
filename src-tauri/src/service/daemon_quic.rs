@@ -65,10 +65,19 @@ impl FileshareDaemon {
         })
     }
 
-    // Method to get discovered devices (for UI access)
+    // Method to get discovered devices from peer manager (for UI access)
     pub async fn get_discovered_devices(&self) -> Vec<crate::network::discovery::DeviceInfo> {
         let pm = self.peer_manager.read().await;
         pm.get_all_discovered_devices().await
+    }
+    
+    // Method to get ALL discovered devices directly from discovery service (for pairing mode)
+    pub async fn get_all_discovered_devices_from_discovery(&self) -> Vec<crate::network::discovery::DeviceInfo> {
+        if let Some(discovery) = &self.discovery {
+            discovery.get_discovered_devices().await
+        } else {
+            Vec::new()
+        }
     }
     
     // Getter for settings (for UI access)
