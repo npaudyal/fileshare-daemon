@@ -268,7 +268,9 @@ async fn test_discovery_status(state: tauri::State<'_, AppState>) -> Result<Stri
     info!("🔍 Testing discovery system status");
 
     if let Some(daemon_ref) = state.daemon_ref.lock().await.as_ref() {
-        let discovered_devices = daemon_ref.get_discovered_devices().await;
+        // Get devices from both sources for comparison
+        let peer_manager_devices = daemon_ref.get_discovered_devices().await;
+        let discovery_service_devices = daemon_ref.get_all_discovered_devices_from_discovery().await;
         let pm = daemon_ref.peer_manager.read().await;
         let peers: Vec<_> = pm.peers.values().collect();
 
@@ -278,24 +280,48 @@ async fn test_discovery_status(state: tauri::State<'_, AppState>) -> Result<Stri
             Device: {} ({})\n\
             QUIC Port: {}\n\
             Discovery Port: {}\n\
-            Discovered Devices: {}\n\
+            Peer Manager Devices: {}\n\
+            Discovery Service Devices: {}\n\
             Active Peers: {}\n\n",
             settings.device.name,
             settings.device.id,
             settings.network.port,
             settings.network.discovery_port,
-            discovered_devices.len(),
+            peer_manager_devices.len(),
+            discovery_service_devices.len(),
             peers.len()
         );
 
-        if !discovered_devices.is_empty() {
-            result.push_str("📱 Discovered Devices:\n");
-            for device in discovered_devices.iter().take(5) {
+        if !discovery_service_devices.is_empty() {
+            result.push_str("📱 Discovery Service Devices:\n");
+            for device in discovery_service_devices.iter().take(10) {
                 result.push_str(&format!(
                     "  • {} ({}) at {}\n",
                     device.name, device.id, device.addr
                 ));
             }
+        } else {
+            result.push_str("❌ No devices found in Discovery Service\n");
+        }
+        
+        if !peer_manager_devices.is_empty() {
+            result.push_str("\n📡 Peer Manager Devices:\n");
+            for device in peer_manager_devices.iter().take(10) {
+                result.push_str(&format!(
+                    "  • {} ({}) at {}\n",
+                    device.name, device.id, device.addr
+                ));
+            }
+        } else {
+            result.push_str("❌ No devices found in Peer Manager\n");
+        }
+        
+        // Check if discovery service exists
+        result.push_str("\n🔧 Discovery Service Status:\n");
+        if daemon_ref.discovery.is_some() {
+            result.push_str("✅ Discovery service is initialized\n");
+        } else {
+            result.push_str("❌ Discovery service is NOT initialized\n");
         }
 
         if !peers.is_empty() {
@@ -1082,7 +1108,10 @@ async fn get_unpaired_devices(
             })
             .collect();
 
-        info!("Found {} unpaired devices", unpaired.len());
+        info!("📊 Final result - Found {} unpaired devices", unpaired.len());
+        for device in &unpaired {
+            info!("📱 Unpaired device: {} at {}", device.name, device.address);
+        }
         Ok(unpaired)
     } else {
         Err("Daemon not ready".to_string())
@@ -1168,6 +1197,60 @@ fn determine_device_type_and_platform(device_name: &str) -> (String, Option<Stri
     (device_type, platform)
 }
 
+#[tauri::command]
+async fn debug_discovery_broadcast(state: tauri::State<'_, AppState>) -> Result<String, String> {
+    info!("🔧 Manually testing discovery broadcast...");
+    
+    if let Some(daemon_ref) = state.daemon_ref.lock().await.as_ref() {
+        let settings = daemon_ref.get_settings();
+        
+        // Try to manually create and send a broadcast
+        use tokio::net::UdpSocket;
+        use std::time::{SystemTime, UNIX_EPOCH};
+        
+        let result = async {
+            let socket = UdpSocket::bind("0.0.0.0:0").await
+                .map_err(|e| format!("Failed to bind socket: {}", e))?;
+            
+            socket.set_broadcast(true)
+                .map_err(|e| format!("Failed to set broadcast: {}", e))?;
+                
+            let announcement = serde_json::json!({
+                "device_id": settings.device.id,
+                "device_name": settings.device.name,
+                "port": settings.network.port,
+                "version": env!("CARGO_PKG_VERSION"),
+                "timestamp": SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs()
+            });
+            
+            let data = announcement.to_string();
+            let broadcast_addr = format!("255.255.255.255:{}", settings.network.discovery_port);
+            
+            match socket.send_to(data.as_bytes(), &broadcast_addr).await {
+                Ok(bytes_sent) => {
+                    Ok(format!(
+                        "✅ Manual broadcast successful!\n\
+                        Device: {} ({})\n\
+                        Broadcast Address: {}\n\
+                        Bytes Sent: {}\n\
+                        Data: {}",
+                        settings.device.name,
+                        settings.device.id,
+                        broadcast_addr,
+                        bytes_sent,
+                        data
+                    ))
+                }
+                Err(e) => Err(format!("❌ Manual broadcast failed: {}", e))
+            }
+        }.await;
+        
+        result
+    } else {
+        Err("Daemon not ready".to_string())
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt()
@@ -1227,6 +1310,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             initiate_pairing,
             get_paired_devices,
             get_unpaired_devices,
+            debug_discovery_broadcast,
             unpair_device_new
         ])
         .setup(|app| {
