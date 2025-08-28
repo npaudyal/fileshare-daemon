@@ -12,7 +12,7 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::sync::{mpsc, RwLock};
+use tokio::sync::{mpsc, RwLock, oneshot};
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
@@ -78,6 +78,8 @@ pub struct PeerManager {
     pub pairing_manager: Option<Arc<PairingManager>>,
     // Callback for when pairing is completed
     pairing_completion_callback: Option<PairingCompletionCallback>,
+    // Track pending pairing requests waiting for responses
+    pending_pairings: HashMap<Uuid, oneshot::Sender<std::result::Result<(), String>>>,
 }
 
 impl PeerManager {
@@ -126,6 +128,7 @@ impl PeerManager {
             http_transfer_manager,
             pairing_manager: _pairing_manager,
             pairing_completion_callback,
+            pending_pairings: HashMap::new(),
         };
 
         // Start accepting QUIC connections
@@ -474,14 +477,6 @@ impl PeerManager {
             None
         };
         
-        // Create pairing request message
-        let message = Message::new(MessageType::PairingRequest {
-            device_id: self.settings.device.id,
-            device_name: self.settings.device.name.clone(),
-            pin_hash,
-            platform,
-        });
-        
         // First, check if the peer exists in our discovered devices
         if !self.peers.contains_key(&device_id) {
             return Err(FileshareError::Unknown(format!(
@@ -489,6 +484,12 @@ impl PeerManager {
                 device_id
             )));
         }
+        
+        // Create a response channel to wait for the pairing result
+        let (response_tx, response_rx) = oneshot::channel();
+        
+        // Store the response channel for this pairing request
+        self.pending_pairings.insert(device_id, response_tx);
         
         // Establish connection to the target device for pairing (bypass pairing requirement)
         info!("🔗 Establishing connection to device {} for pairing...", device_id);
@@ -498,6 +499,8 @@ impl PeerManager {
             }
             Err(e) => {
                 error!("❌ Failed to establish connection for pairing: {}", e);
+                // Clean up pending pairing on connection failure
+                self.pending_pairings.remove(&device_id);
                 return Err(FileshareError::Transfer(format!(
                     "Failed to establish connection for pairing: {}",
                     e
@@ -505,14 +508,67 @@ impl PeerManager {
             }
         }
         
-        // Now send the pairing message over the established connection
-        self.send_message_to_peer(device_id, message).await?;
+        // Create pairing request message
+        let message = Message::new(MessageType::PairingRequest {
+            device_id: self.settings.device.id,
+            device_name: self.settings.device.name.clone(),
+            pin_hash,
+            platform,
+        });
         
-        info!("✅ Pairing request sent to device {}", device_id);
-        Ok(())
+        // Send the pairing message over the established connection
+        if let Err(e) = self.send_message_to_peer(device_id, message).await {
+            // Clean up pending pairing on send failure
+            self.pending_pairings.remove(&device_id);
+            return Err(e);
+        }
+        
+        info!("📤 Pairing request sent to device {}, waiting for validation result...", device_id);
+        
+        // Wait for the pairing result with timeout
+        match tokio::time::timeout(Duration::from_secs(30), response_rx).await {
+            Ok(Ok(result)) => {
+                info!("✅ Pairing validation completed for device {}", device_id);
+                result.map_err(|e| FileshareError::Unknown(e))
+            }
+            Ok(Err(_)) => {
+                error!("❌ Pairing response channel closed unexpectedly for device {}", device_id);
+                Err(FileshareError::Unknown("Pairing response channel closed unexpectedly".to_string()))
+            }
+            Err(_) => {
+                error!("⏰ Pairing request timed out for device {}", device_id);
+                // Clean up pending pairing on timeout
+                self.pending_pairings.remove(&device_id);
+                Err(FileshareError::Unknown("Pairing request timed out after 30 seconds".to_string()))
+            }
+        }
     }
     
+    // Helper function to check if a device is properly paired
+    fn is_device_paired(&self, device_id: Uuid) -> bool {
+        // Check both the PairingManager (in-memory paired devices) and settings.security.allowed_devices
+        let in_pairing_manager = if let Some(_pairing_manager) = &self.pairing_manager {
+            // TODO: Add method to check if device is in pairing manager
+            // For now, always check settings as the authoritative source
+            false
+        } else {
+            false
+        };
+        
+        let in_allowed_devices = self.settings.security.allowed_devices.contains(&device_id);
+        
+        // Device is considered paired if it's in either location
+        in_pairing_manager || in_allowed_devices
+    }
+
     pub async fn send_file_to_peer(&mut self, peer_id: Uuid, file_path: PathBuf) -> Result<()> {
+        // First check if the device is actually paired
+        if !self.is_device_paired(peer_id) {
+            return Err(FileshareError::Transfer(
+                "File transfer denied: Device is not paired. Please pair the device first.".to_string(),
+            ));
+        }
+
         // Check if peer is connected
         let peer = self
             .peers
@@ -758,7 +814,13 @@ impl PeerManager {
                 timestamp,
                 file_size,
             } => {
-                info!("Received clipboard update from {}: {}", peer_id, file_path);
+                // Verify device is paired before accepting clipboard data
+                if !self.is_device_paired(peer_id) {
+                    warn!("🚫 Clipboard update denied from unpaired device {}", peer_id);
+                    return Ok(()); // Silently ignore clipboard updates from unpaired devices
+                }
+
+                info!("📋 Received clipboard update from paired device {}: {}", peer_id, file_path);
 
                 let clipboard_item = crate::clipboard::NetworkClipboardItem {
                     file_path: PathBuf::from(file_path),
@@ -771,7 +833,13 @@ impl PeerManager {
             }
 
             MessageType::ClipboardClear => {
-                info!("Received clipboard clear from {}", peer_id);
+                // Verify device is paired before accepting clipboard clear command
+                if !self.is_device_paired(peer_id) {
+                    warn!("🚫 Clipboard clear denied from unpaired device {}", peer_id);
+                    return Ok(()); // Silently ignore clipboard clear from unpaired devices
+                }
+
+                info!("🗑️ Received clipboard clear from paired device {}", peer_id);
                 clipboard.clear().await;
             }
 
@@ -944,8 +1012,22 @@ impl PeerManager {
                 file_path,
                 target_path,
             } => {
+                // Verify device is paired before processing file requests
+                if !self.is_device_paired(peer_id) {
+                    warn!("🚫 File request denied from unpaired device {}", peer_id);
+                    
+                    // Send rejection response for unpaired devices
+                    let response = Message::new(MessageType::FileRequestResponse {
+                        request_id: *request_id,
+                        accepted: false,
+                        reason: Some("Device not paired".to_string()),
+                    });
+                    self.send_message_to_peer(peer_id, response).await?;
+                    return Ok(());
+                }
+
                 info!(
-                    "📁 Received file request from {}: {} -> {}",
+                    "📁 Received file request from paired device {}: {} -> {}",
                     peer_id, file_path, target_path
                 );
 
@@ -1237,13 +1319,44 @@ impl PeerManager {
                 device_name: remote_device_name,
                 reason,
             } => {
-                if *success {
-                    info!(
-                        "🎉 Pairing result: SUCCESS with {} ({})",
-                        remote_device_name.as_deref().unwrap_or("Unknown"),
-                        remote_device_id.unwrap_or(peer_id)
-                    );
+                // Notify any waiting pairing request
+                let device_to_notify = remote_device_id.unwrap_or(peer_id);
+                if let Some(response_tx) = self.pending_pairings.remove(&device_to_notify) {
+                    let result = if *success {
+                        info!(
+                            "🎉 Pairing result: SUCCESS with {} ({})",
+                            remote_device_name.as_deref().unwrap_or("Unknown"),
+                            device_to_notify
+                        );
+                        Ok(())
+                    } else {
+                        let error_msg = reason.as_deref().unwrap_or("Pairing failed");
+                        warn!(
+                            "❌ Pairing result: FAILED - {}",
+                            error_msg
+                        );
+                        Err(format!("Pairing failed: {}", error_msg))
+                    };
                     
+                    // Send result to waiting channel (ignore if receiver dropped)
+                    let _ = response_tx.send(result);
+                } else {
+                    // Log result even if no one is waiting
+                    if *success {
+                        info!(
+                            "🎉 Pairing result: SUCCESS with {} ({})",
+                            remote_device_name.as_deref().unwrap_or("Unknown"),
+                            device_to_notify
+                        );
+                    } else {
+                        warn!(
+                            "❌ Pairing result: FAILED - {}",
+                            reason.as_deref().unwrap_or("No reason provided")
+                        );
+                    }
+                }
+                
+                if *success {
                     // Update our pairing manager if needed
                     if let (Some(pairing_manager), Some(device_id), Some(device_name)) = 
                         (&self.pairing_manager, remote_device_id, remote_device_name) {
@@ -1271,11 +1384,6 @@ impl PeerManager {
                             }
                         }
                     }
-                } else {
-                    warn!(
-                        "❌ Pairing result: FAILED - {}",
-                        reason.as_deref().unwrap_or("No reason provided")
-                    );
                 }
             }
             
