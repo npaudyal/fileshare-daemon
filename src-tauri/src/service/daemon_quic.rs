@@ -181,12 +181,50 @@ impl FileshareDaemon {
                 }
             };
 
+            let message_received_at = std::time::Instant::now();
             info!("📨 Received message from {}: {:?}", peer_id, message.message_type);
 
-            // Only lock when handling the message
-            let mut pm = peer_manager.write().await;
-            if let Err(e) = pm.handle_message(peer_id, message, &clipboard).await {
-                error!("❌ Failed to handle message from {}: {}", peer_id, e);
+            // Try to acquire the lock with a timeout to avoid blocking message processing
+            let lock_start = std::time::Instant::now();
+            let lock_result = tokio::time::timeout(
+                std::time::Duration::from_millis(100), 
+                peer_manager.write()
+            ).await;
+            
+            match lock_result {
+                Ok(mut pm) => {
+                    let lock_acquired_at = std::time::Instant::now();
+                    let lock_wait_time = lock_acquired_at - lock_start;
+                    info!("🔒 Acquired peer manager lock in {:?} for message: {:?}", 
+                         lock_wait_time, message.message_type);
+                    
+                    if let Err(e) = pm.handle_message(peer_id, message, &clipboard).await {
+                        error!("❌ Failed to handle message from {}: {}", peer_id, e);
+                    }
+                    
+                    let processing_time = std::time::Instant::now() - lock_acquired_at;
+                    info!("✅ Message processing completed in {:?}", processing_time);
+                }
+                Err(_) => {
+                    warn!("⚠️ Could not acquire peer manager lock within 100ms, message may be delayed");
+                    // Fall back to blocking acquisition for critical messages like PairingResult
+                    if matches!(message.message_type, crate::network::protocol::MessageType::PairingResult { .. }) {
+                        warn!("🔄 PairingResult message - using blocking lock acquisition");
+                        let blocking_start = std::time::Instant::now();
+                        let mut pm = peer_manager.write().await;
+                        let blocking_wait = std::time::Instant::now() - blocking_start;
+                        warn!("🔒 Blocking lock acquired after {:?} for PairingResult", blocking_wait);
+                        
+                        if let Err(e) = pm.handle_message(peer_id, message, &clipboard).await {
+                            error!("❌ Failed to handle PairingResult from {}: {}", peer_id, e);
+                        }
+                        
+                        let total_time = std::time::Instant::now() - message_received_at;
+                        warn!("⏱️ Total PairingResult processing time: {:?}", total_time);
+                    } else {
+                        error!("❌ Dropping non-critical message due to lock contention: {:?}", message.message_type);
+                    }
+                }
             }
         }
 

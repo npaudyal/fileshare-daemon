@@ -280,12 +280,26 @@ impl DiscoveryService {
         // Notify peer manager
         info!("🔄 About to notify peer manager about device: {}", device_info.name);
         {
+            let lock_start = std::time::Instant::now();
             let mut pm = peer_manager.write().await;
+            let lock_wait = std::time::Instant::now() - lock_start;
+            if lock_wait.as_millis() > 10 {
+                warn!("🔒 Discovery acquired peer manager lock after {:?} for device: {}", lock_wait, device_info.name);
+            } else {
+                info!("🔒 Discovery acquired peer manager lock in {:?} for device: {}", lock_wait, device_info.name);
+            }
             info!("🔄 Notifying peer manager about device: {}", device_info.name);
+            let process_start = std::time::Instant::now();
             if let Err(e) = pm.on_device_discovered(device_info.clone()).await {
                 error!("❌ Failed to notify peer manager about discovered device: {}", e);
             } else {
-                info!("✅ Successfully notified peer manager about device discovery: {}", device_info.name);
+                let processing_time = std::time::Instant::now() - process_start;
+                if processing_time.as_millis() > 100 {
+                    warn!("⏱️ Discovery processing took {:?} for device: {}", processing_time, device_info.name);
+                } else {
+                    info!("✅ Successfully notified peer manager about device discovery: {} (took {:?})", 
+                         device_info.name, processing_time);
+                }
             }
         }
 
