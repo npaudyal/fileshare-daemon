@@ -103,7 +103,7 @@ const PairingTab: React.FC<PairingTabProps> = ({ onPairComplete }) => {
         try {
             // Use the new fast_pairing command instead of initiate_pairing
             const result = await invoke<FastPairingResult>('fast_pairing', {
-                device_id: selectedDevice.id,  // Note: using snake_case as expected by Rust backend
+                deviceId: selectedDevice.id,  // Note: using camelCase as expected by Tauri
                 pin: pairingPin
             });
             
