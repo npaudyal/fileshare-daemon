@@ -488,8 +488,9 @@ impl PeerManager {
         // Create a response channel to wait for the pairing result
         let (response_tx, response_rx) = oneshot::channel();
         
-        // Store the response channel for this pairing request
+        // Store the response channel for this pairing request  
         info!("🔍 Storing pending pairing request for device_id: {}", device_id);
+        info!("🔍 Current peers in manager: {:?}", self.peers.keys().collect::<Vec<_>>());
         self.pending_pairings.insert(device_id, response_tx);
         
         // Establish connection to the target device for pairing (bypass pairing requirement)
@@ -1320,8 +1321,15 @@ impl PeerManager {
                 device_name: remote_device_name,
                 reason,
             } => {
-                // Check if we have a pending pairing request for this peer
-                if let Some(response_tx) = self.pending_pairings.remove(&peer_id) {
+                // Resolve peer_id to actual device_id in case there's ID mapping
+                let resolved_peer_id = self.resolve_peer_id(peer_id);
+                info!("🔍 PairingResult received: peer_id={}, resolved_peer_id={}", peer_id, resolved_peer_id);
+                
+                // Check if we have a pending pairing request for this peer (try both IDs)
+                let response_tx = self.pending_pairings.remove(&resolved_peer_id)
+                    .or_else(|| self.pending_pairings.remove(&peer_id));
+                
+                if let Some(response_tx) = response_tx {
                     // We initiated this pairing request, so notify the waiting channel
                     info!("📨 Received PairingResult for OUR initiated request: success={}, peer_id={}", 
                           success, peer_id);
