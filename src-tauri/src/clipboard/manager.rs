@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::RwLock;
-use tracing::info;
+use tracing::{info, warn};
 use uuid::Uuid;
 
 #[derive(Debug, Clone)]
@@ -62,30 +62,31 @@ impl ClipboardManager {
             let metadata = tokio::fs::metadata(&file_path).await.map_err(|e| {
                 crate::FileshareError::FileOperation(format!("Cannot access file: {}", e))
             })?;
-            
+
             // Validate file permissions and properties
             if metadata.is_dir() {
                 return Err(crate::FileshareError::FileOperation(
-                    "Cannot copy directories to clipboard".to_string()
+                    "Cannot copy directories to clipboard".to_string(),
                 ));
             }
-            
+
             if metadata.len() == 0 {
                 return Err(crate::FileshareError::FileOperation(
-                    "Cannot copy empty files".to_string()
+                    "Cannot copy empty files".to_string(),
                 ));
             }
-            
+
             // Check if file is readable
             match tokio::fs::File::open(&file_path).await {
-                Ok(_) => {},
+                Ok(_) => {}
                 Err(e) => {
-                    return Err(crate::FileshareError::FileOperation(
-                        format!("File is not readable: {}", e)
-                    ));
+                    return Err(crate::FileshareError::FileOperation(format!(
+                        "File is not readable: {}",
+                        e
+                    )));
                 }
             }
-            
+
             info!("File validation passed: {} bytes", metadata.len());
 
             let clipboard_item = NetworkClipboardItem {
