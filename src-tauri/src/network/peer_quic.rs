@@ -70,6 +70,8 @@ pub struct PeerManager {
     stream_managers: HashMap<Uuid, Arc<StreamManager>>,
     // Mapping from temporary connection IDs to real device IDs
     temp_to_real_id_map: HashMap<Uuid, Uuid>,
+    // Reverse mapping from real device IDs to temporary connection IDs
+    real_to_temp_id_map: HashMap<Uuid, Uuid>,
     // Temporary storage for incoming stream managers before handshake
     incoming_stream_managers: Arc<RwLock<HashMap<Uuid, Arc<StreamManager>>>>,
     // HTTP transfer manager for file transfers
@@ -124,6 +126,7 @@ impl PeerManager {
             quic_manager,
             stream_managers: HashMap::new(),
             temp_to_real_id_map: HashMap::new(),
+            real_to_temp_id_map: HashMap::new(),
             incoming_stream_managers: Arc::new(RwLock::new(HashMap::new())),
             http_transfer_manager,
             pairing_manager: _pairing_manager,
@@ -491,6 +494,9 @@ impl PeerManager {
         // Store the response channel for this pairing request  
         info!("🔍 Storing pending pairing request for device_id: {}", device_id);
         info!("🔍 Current peers in manager: {:?}", self.peers.keys().collect::<Vec<_>>());
+        info!("🔍 Current ID mappings - temp_to_real: {:?}, real_to_temp: {:?}", 
+             self.temp_to_real_id_map, self.real_to_temp_id_map);
+        
         self.pending_pairings.insert(device_id, response_tx);
         
         // Establish connection to the target device for pairing (bypass pairing requirement)
@@ -702,6 +708,7 @@ impl PeerManager {
                 // Clean up any temporary ID mappings pointing to this peer
                 self.temp_to_real_id_map
                     .retain(|_temp_id, real_id| *real_id != peer_id);
+                self.real_to_temp_id_map.remove(&peer_id);
 
                 // Remove from QUIC connections
                 self.quic_manager.remove_connection(peer_id).await;
@@ -921,6 +928,7 @@ impl PeerManager {
                     self.stream_managers
                         .insert(*device_id, stream_manager.clone());
                     self.temp_to_real_id_map.insert(peer_id, *device_id);
+                    self.real_to_temp_id_map.insert(*device_id, peer_id);
 
                     // Send handshake response immediately using the moved stream manager
                     let response = Message::new(MessageType::HandshakeResponse {
@@ -1323,11 +1331,19 @@ impl PeerManager {
             } => {
                 // Resolve peer_id to actual device_id in case there's ID mapping
                 let resolved_peer_id = self.resolve_peer_id(peer_id);
-                info!("🔍 PairingResult received: peer_id={}, resolved_peer_id={}", peer_id, resolved_peer_id);
+                info!("🔍 PairingResult received: peer_id={}, resolved_peer_id={}, remote_device_id={:?}", 
+                     peer_id, resolved_peer_id, remote_device_id);
                 
-                // Check if we have a pending pairing request for this peer (try both IDs)
+                // Log current pending pairings for debugging
+                info!("🔍 Current pending pairings: {:?}", self.pending_pairings.keys().collect::<Vec<_>>());
+                
+                // Try to find the pending pairing under various IDs
+                // 1. First try the resolved peer ID
+                // 2. Then try the original peer ID  
+                // 3. Then try the remote_device_id if provided (this is the actual device ID from the response)
                 let response_tx = self.pending_pairings.remove(&resolved_peer_id)
-                    .or_else(|| self.pending_pairings.remove(&peer_id));
+                    .or_else(|| self.pending_pairings.remove(&peer_id))
+                    .or_else(|| remote_device_id.and_then(|id| self.pending_pairings.remove(&id)));
                 
                 if let Some(response_tx) = response_tx {
                     // We initiated this pairing request, so notify the waiting channel
