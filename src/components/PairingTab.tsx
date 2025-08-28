@@ -4,7 +4,6 @@ import { invoke } from '@tauri-apps/api/core';
 import {
     Link2,
     Search,
-    Filter,
     Monitor,
     Smartphone,
     Laptop,
@@ -17,7 +16,7 @@ import {
 import PinDisplay from './PinDisplay';
 import { useToast } from '../hooks/useToast';
 import { useDebounce } from '../hooks/useDebounce';
-import { FadeIn, SlideIn } from './AnimatedComponents';
+import { FadeIn } from './AnimatedComponents';
 
 interface DeviceInfo {
     id: string;
@@ -33,6 +32,13 @@ interface PairingPin {
     code: string;
     generated_at: number;
     expires_at: number;
+}
+
+interface FastPairingResult {
+    success: boolean;
+    remote_device_id?: string;
+    remote_device_name?: string;
+    error_message?: string;
 }
 
 interface PairingTabProps {
@@ -89,28 +95,37 @@ const PairingTab: React.FC<PairingTabProps> = ({ onPairComplete }) => {
         }
     };
 
-    // Initiate pairing
+    // Initiate fast pairing (new Bluetooth-style system)
     const handlePairDevice = async () => {
         if (!selectedDevice || !pairingPin) return;
 
         setIsPairing(true);
         try {
-            await invoke('initiate_pairing', {
-                deviceId: selectedDevice.id,
+            // Use the new fast_pairing command instead of initiate_pairing
+            const result = await invoke<FastPairingResult>('fast_pairing', {
+                device_id: selectedDevice.id,  // Note: using snake_case as expected by Rust backend
                 pin: pairingPin
             });
             
-            addToast('success', 'Pairing Successful', `Paired with ${selectedDevice.name}`);
-            setShowPairingModal(false);
-            setPairingPin('');
-            setSelectedDevice(null);
+            console.log('Fast pairing result:', result);
             
-            // Reload devices and notify parent
-            await loadUnpairedDevices();
-            onPairComplete();
+            // Check if pairing was successful
+            if (result.success) {
+                addToast('success', 'Fast Pairing Successful! 🚀', `Quickly paired with ${selectedDevice.name}`);
+                setShowPairingModal(false);
+                setPairingPin('');
+                setSelectedDevice(null);
+                
+                // Reload devices and notify parent
+                await loadUnpairedDevices();
+                onPairComplete();
+            } else {
+                const errorMsg = result.error_message || 'Unknown error';
+                addToast('error', 'Fast Pairing Failed', errorMsg);
+            }
         } catch (error) {
             console.error('Failed to pair device:', error);
-            addToast('error', 'Pairing Failed', `${error}`);
+            addToast('error', 'Fast Pairing Failed', `${error}`);
         } finally {
             setIsPairing(false);
         }
@@ -334,7 +349,12 @@ const PairingTab: React.FC<PairingTabProps> = ({ onPairComplete }) => {
                             onClick={(e) => e.stopPropagation()}
                         >
                             <div className="flex items-center justify-between mb-4">
-                                <h3 className="text-xl font-semibold text-white">Pair Device</h3>
+                                <div className="flex items-center space-x-2">
+                                    <h3 className="text-xl font-semibold text-white">Fast Pair Device</h3>
+                                    <span className="px-2 py-1 bg-blue-500/20 text-blue-300 text-xs rounded-full">
+                                        ⚡ Bluetooth-style
+                                    </span>
+                                </div>
                                 <button
                                     onClick={() => !isPairing && setShowPairingModal(false)}
                                     className="p-1 rounded-lg hover:bg-white/10 transition-colors"
@@ -348,8 +368,11 @@ const PairingTab: React.FC<PairingTabProps> = ({ onPairComplete }) => {
                                 <p className="text-gray-300 mb-2">
                                     Enter the PIN displayed on <strong>{selectedDevice.name}</strong>
                                 </p>
+                                <p className="text-sm text-blue-300/60 mb-1">
+                                    ⚡ Fast pairing will complete in ~5 seconds
+                                </p>
                                 <p className="text-sm text-gray-500">
-                                    Make sure you're pairing with the correct device at {selectedDevice.address}
+                                    Device: {selectedDevice.address}
                                 </p>
                             </div>
 
@@ -388,12 +411,12 @@ const PairingTab: React.FC<PairingTabProps> = ({ onPairComplete }) => {
                                     {isPairing ? (
                                         <>
                                             <div className="animate-spin rounded-full h-4 w-4 border-2 border-white border-t-transparent" />
-                                            <span>Pairing...</span>
+                                            <span>Fast Pairing...</span>
                                         </>
                                     ) : (
                                         <>
-                                            <Link2 className="w-4 h-4" />
-                                            <span>Pair Device</span>
+                                            <span className="text-base">⚡</span>
+                                            <span>Fast Pair</span>
                                         </>
                                     )}
                                 </button>
