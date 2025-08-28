@@ -10,6 +10,7 @@ import DevicesList from './components/DevicesList';
 import AdvancedSettings from './components/AdvancedSettings';
 import EnhancedInfo from './components/EnhancedInfo';
 import TransferProgress from './components/TransferProgress';
+import PairingTab from './components/PairingTab';
 import { FadeIn, SlideIn } from './components/AnimatedComponents';
 import { LoadingOverlay } from './components/LoadingStates';
 import { useToast } from './hooks/useToast';
@@ -52,7 +53,7 @@ function App() {
     // State
     const [devices, setDevices] = useState<DeviceInfo[]>([]);
     const [settings, setSettings] = useState<AppSettings | null>(null);
-    const [activeTab, setActiveTab] = useState<'devices' | 'settings' | 'info'>('devices');
+    const [activeTab, setActiveTab] = useState<'devices' | 'pairing' | 'settings' | 'info'>('devices');
     const [isLoading, setIsLoading] = useState(true);
     const [lastUpdate, setLastUpdate] = useState<Date>(new Date());
     const [connectionStatus, setConnectionStatus] = useState(false);
@@ -397,6 +398,17 @@ function App() {
                                 onSettingsChange={(newSettings) => {
                                     setSettings(newSettings);
                                     loadDevices();
+                                }}
+                            />
+                        </FadeIn>
+                    )}
+
+                    {activeTab === 'pairing' && (
+                        <FadeIn key="pairing">
+                            <PairingTab 
+                                onPairComplete={async () => {
+                                    await loadDevices();
+                                    addToast('success', 'Pairing Complete', 'Device paired successfully');
                                 }}
                             />
                         </FadeIn>

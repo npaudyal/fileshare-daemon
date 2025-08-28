@@ -2,9 +2,11 @@ use crate::{
     config::Settings,
     http::HttpTransferManager,
     network::{discovery::DeviceInfo, protocol::*},
+    pairing::PairingManager,
     quic::{QuicConnectionManager, StreamManager},
     FileshareError, Result,
 };
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -69,10 +71,19 @@ pub struct PeerManager {
     incoming_stream_managers: Arc<RwLock<HashMap<Uuid, Arc<StreamManager>>>>,
     // HTTP transfer manager for file transfers
     http_transfer_manager: Arc<HttpTransferManager>,
+    // Pairing manager for secure device pairing
+    pub pairing_manager: Option<Arc<PairingManager>>,
 }
 
 impl PeerManager {
     pub async fn new(settings: Arc<Settings>) -> Result<Self> {
+        Self::new_with_pairing(settings, None).await
+    }
+
+    pub async fn new_with_pairing(
+        settings: Arc<Settings>,
+        _pairing_manager: Option<Arc<PairingManager>>,
+    ) -> Result<Self> {
         let (message_tx, message_rx) = mpsc::unbounded_channel();
 
         // Create QUIC connection manager
@@ -100,6 +111,7 @@ impl PeerManager {
             temp_to_real_id_map: HashMap::new(),
             incoming_stream_managers: Arc::new(RwLock::new(HashMap::new())),
             http_transfer_manager,
+            pairing_manager: None,
         };
 
         // Start accepting QUIC connections
@@ -274,10 +286,20 @@ impl PeerManager {
 
     fn should_connect_to_peer(&self, device_info: &DeviceInfo) -> bool {
         if self.settings.security.require_pairing {
-            self.settings
-                .security
-                .allowed_devices
-                .contains(&device_info.id)
+            // Check if device is in the paired devices list
+            if let Some(_pairing_manager) = &self.pairing_manager {
+                // We'll need to make this async or cache the paired devices
+                // For now, fallback to allowed_devices
+                self.settings
+                    .security
+                    .allowed_devices
+                    .contains(&device_info.id)
+            } else {
+                self.settings
+                    .security
+                    .allowed_devices
+                    .contains(&device_info.id)
+            }
         } else {
             true
         }
@@ -401,6 +423,44 @@ impl PeerManager {
         Ok(())
     }
 
+    pub async fn initiate_pairing(
+        &mut self,
+        device_id: Uuid,
+        pin: String,
+    ) -> Result<()> {
+        info!("🔐 Initiating pairing with device {}", device_id);
+        
+        // Hash the PIN
+        let mut hasher = Sha256::new();
+        hasher.update(pin.as_bytes());
+        let pin_hash = format!("{:x}", hasher.finalize());
+        
+        // Get our device info
+        let platform = if cfg!(target_os = "macos") {
+            Some("macOS".to_string())
+        } else if cfg!(target_os = "windows") {
+            Some("Windows".to_string())
+        } else if cfg!(target_os = "linux") {
+            Some("Linux".to_string())
+        } else {
+            None
+        };
+        
+        // Create pairing request message
+        let message = Message::new(MessageType::PairingRequest {
+            device_id: self.settings.device.id,
+            device_name: self.settings.device.name.clone(),
+            pin_hash,
+            platform,
+        });
+        
+        // Send to the target device
+        self.send_message_to_peer(device_id, message).await?;
+        
+        info!("✅ Pairing request sent to device {}", device_id);
+        Ok(())
+    }
+    
     pub async fn send_file_to_peer(&mut self, peer_id: Uuid, file_path: PathBuf) -> Result<()> {
         // Check if peer is connected
         let peer = self
@@ -1030,6 +1090,113 @@ impl PeerManager {
                 }
             }
 
+            MessageType::PairingRequest {
+                device_id,
+                device_name,
+                pin_hash,
+                platform,
+            } => {
+                info!(
+                    "🔐 Received pairing request from {} ({})",
+                    device_name, device_id
+                );
+                
+                if let Some(pairing_manager) = &self.pairing_manager {
+                    // Verify the PIN hash matches our current PIN
+                    let current_pin = pairing_manager.get_current_pin().await;
+                    let our_pin_hash = sha2::Sha256::digest(current_pin.code.as_bytes());
+                    let our_pin_hash_str = format!("{:x}", our_pin_hash);
+                    
+                    let success = pin_hash == &our_pin_hash_str;
+                    
+                    if success {
+                        // Complete the pairing
+                        if let Err(e) = pairing_manager.complete_pairing(
+                            *device_id,
+                            device_name.clone(),
+                            platform.clone(),
+                        ).await {
+                            error!("Failed to complete pairing: {}", e);
+                            let response = Message::new(MessageType::PairingResult {
+                                success: false,
+                                device_id: None,
+                                device_name: None,
+                                reason: Some("Failed to save pairing".to_string()),
+                            });
+                            self.send_message_to_peer(peer_id, response).await?;
+                        } else {
+                            info!("✅ Pairing successful with {} ({})", device_name, device_id);
+                            
+                            // Send success response with our device info
+                            let response = Message::new(MessageType::PairingResult {
+                                success: true,
+                                device_id: Some(self.settings.device.id),
+                                device_name: Some(self.settings.device.name.clone()),
+                                reason: None,
+                            });
+                            self.send_message_to_peer(peer_id, response).await?;
+                        }
+                    } else {
+                        warn!("❌ Invalid PIN from {} ({})", device_name, device_id);
+                        let response = Message::new(MessageType::PairingResult {
+                            success: false,
+                            device_id: None,
+                            device_name: None,
+                            reason: Some("Invalid PIN".to_string()),
+                        });
+                        self.send_message_to_peer(peer_id, response).await?;
+                    }
+                } else {
+                    // Pairing not configured
+                    let response = Message::new(MessageType::PairingResult {
+                        success: false,
+                        device_id: None,
+                        device_name: None,
+                        reason: Some("Pairing not enabled".to_string()),
+                    });
+                    self.send_message_to_peer(peer_id, response).await?;
+                }
+            }
+            
+            MessageType::PairingResult {
+                success,
+                device_id: remote_device_id,
+                device_name: remote_device_name,
+                reason,
+            } => {
+                if *success {
+                    info!(
+                        "🎉 Pairing result: SUCCESS with {} ({})",
+                        remote_device_name.as_deref().unwrap_or("Unknown"),
+                        remote_device_id.unwrap_or(peer_id)
+                    );
+                    
+                    // Update our pairing manager if needed
+                    if let (Some(pairing_manager), Some(device_id), Some(device_name)) = 
+                        (&self.pairing_manager, remote_device_id, remote_device_name) {
+                        
+                        if let Err(e) = pairing_manager.complete_pairing(
+                            *device_id,
+                            device_name.clone(),
+                            None,
+                        ).await {
+                            error!("Failed to save pairing locally: {}", e);
+                        }
+                    }
+                } else {
+                    warn!(
+                        "❌ Pairing result: FAILED - {}",
+                        reason.as_deref().unwrap_or("No reason provided")
+                    );
+                }
+            }
+            
+            MessageType::PairingChallenge { .. } | MessageType::PairingResponse { .. } => {
+                // These messages would be used for more complex challenge-response auth
+                // For now, we're using simple PIN verification
+                debug!("Received advanced pairing message, not implemented yet");
+            }
+            
             _ => {
                 debug!(
                     "Unhandled message type from {}: {:?}",

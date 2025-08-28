@@ -1,8 +1,8 @@
-use crate::{FileshareError, Result};
+use crate::Result;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::sync::mpsc;
-use tracing::{debug, error, info, warn};
+use tracing::{error, info, warn};
 
 #[derive(Debug, Clone)]
 pub enum HotkeyEvent {
@@ -375,7 +375,7 @@ impl HotkeyManager {
         self.is_running.store(false, Ordering::SeqCst);
 
         // Wait for thread to finish
-        if let Some(handle) = self.platform_handle.take() {
+        if let Some(_handle) = self.platform_handle.take() {
             // Give it a moment to stop gracefully
             std::thread::sleep(std::time::Duration::from_millis(100));
             // The thread should stop on its own due to is_running flag

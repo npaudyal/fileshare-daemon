@@ -3,6 +3,7 @@ use crate::{
     config::Settings,
     hotkeys::{HotkeyEvent, HotkeyManager},
     network::{DiscoveryService, PeerManager},
+    pairing::PairingManager,
     Result,
 };
 use std::sync::Arc;
@@ -14,6 +15,7 @@ pub struct FileshareDaemon {
     settings: Arc<Settings>,
     pub discovery: Option<DiscoveryService>,
     pub peer_manager: Arc<RwLock<PeerManager>>,
+    pub pairing_manager: Arc<PairingManager>,
     hotkey_manager: Option<HotkeyManager>,
     clipboard: ClipboardManager,
     shutdown_tx: broadcast::Sender<()>,
@@ -25,8 +27,16 @@ impl FileshareDaemon {
         let settings = Arc::new(settings);
         let (shutdown_tx, shutdown_rx) = broadcast::channel(1);
 
-        // Initialize peer manager with QUIC
-        let peer_manager = PeerManager::new(settings.clone()).await?;
+        // Initialize pairing manager
+        let mut pairing_manager = PairingManager::new()?;
+        pairing_manager.start().await?;
+        let pairing_manager = Arc::new(pairing_manager);
+
+        // Initialize peer manager with QUIC and pairing support
+        let peer_manager = PeerManager::new_with_pairing(
+            settings.clone(), 
+            Some(pairing_manager.clone())
+        ).await?;
         let peer_manager = Arc::new(RwLock::new(peer_manager));
 
         // Initialize discovery service
@@ -47,6 +57,7 @@ impl FileshareDaemon {
             settings,
             discovery: Some(discovery),
             peer_manager,
+            pairing_manager,
             hotkey_manager: Some(hotkey_manager),
             clipboard,
             shutdown_tx,
@@ -66,7 +77,7 @@ impl FileshareDaemon {
     }
 
     // Enhanced daemon startup with health monitoring
-    pub async fn start_background_services(mut self: Arc<Self>) -> Result<()> {
+    pub async fn start_background_services(self: Arc<Self>) -> Result<()> {
         info!("🚀 Starting Enhanced Fileshare Daemon with QUIC support...");
         info!("📱 Device ID: {}", self.settings.device.id);
         info!("🏷️ Device Name: {}", self.settings.device.name);

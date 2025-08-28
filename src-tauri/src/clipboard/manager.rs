@@ -2,7 +2,6 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use tracing::info;
-use tracing::warn;
 use uuid::Uuid;
 
 #[derive(Debug, Clone)]

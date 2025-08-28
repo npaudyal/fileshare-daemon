@@ -22,6 +22,29 @@ pub enum MessageType {
         reason: Option<String>,
     },
 
+    // Pairing messages
+    PairingRequest {
+        device_id: Uuid,
+        device_name: String,
+        pin_hash: String,
+        platform: Option<String>,
+    },
+    PairingChallenge {
+        nonce: Vec<u8>,
+        timestamp: u64,
+    },
+    PairingResponse {
+        pin_hash: String,
+        nonce: Vec<u8>,
+        signature: Vec<u8>,
+    },
+    PairingResult {
+        success: bool,
+        device_id: Option<Uuid>,
+        device_name: Option<String>,
+        reason: Option<String>,
+    },
+
     ClipboardUpdate {
         file_path: String,
         source_device: Uuid,

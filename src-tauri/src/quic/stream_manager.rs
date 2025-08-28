@@ -85,7 +85,7 @@ impl StreamManager {
         });
     }
     
-    async fn handle_incoming_bi_stream(&self, send: SendStream, mut recv: RecvStream) -> Result<()> {
+    async fn handle_incoming_bi_stream(&self, _send: SendStream, mut recv: RecvStream) -> Result<()> {
         // Read stream type header
         let stream_type = QuicProtocol::read_stream_header(&mut recv).await?;
         

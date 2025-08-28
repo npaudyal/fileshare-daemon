@@ -102,7 +102,7 @@ impl HttpFileClient {
         info!("⚡ Starting parallel HTTP download with {} connections", PARALLEL_CONNECTIONS);
 
         // Create target file and pre-allocate space
-        let mut file = OpenOptions::new()
+        let file = OpenOptions::new()
             .create(true)
             .write(true)
             .truncate(true)

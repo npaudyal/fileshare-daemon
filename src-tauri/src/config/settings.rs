@@ -75,7 +75,7 @@ impl Default for Settings {
                 resume_enabled: true,
             },
             security: SecuritySettings {
-                require_pairing: false,
+                require_pairing: true,  // Changed to true for secure pairing
                 encryption_enabled: true,
                 allowed_devices: Vec::new(),
             },

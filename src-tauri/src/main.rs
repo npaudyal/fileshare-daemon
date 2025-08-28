@@ -69,7 +69,7 @@ async fn test_isolated_hotkey() -> Result<String, String> {
 fn run_hotkey_diagnostics() -> String {
     use global_hotkey::{
         hotkey::{Code, HotKey, Modifiers},
-        GlobalHotKeyEvent, GlobalHotKeyManager,
+        GlobalHotKeyManager,
     };
 
     let mut results = Vec::new();
@@ -228,8 +228,7 @@ async fn test_file_transfer(state: tauri::State<'_, AppState>) -> Result<String,
             "📊 Transfer System Status:\n\
             Connections: {} total ({} healthy)\n\
             System: Ready with optimized QUIC streaming (unlimited file size)",
-            stats.total,
-            stats.authenticated
+            stats.total, stats.authenticated
         ))
     } else {
         Err("Daemon not ready".to_string())
@@ -356,7 +355,7 @@ async fn update_app_settings(
 }
 
 #[tauri::command]
-async fn export_settings(state: tauri::State<'_, AppState>) -> Result<(), String> {
+async fn export_settings(_state: tauri::State<'_, AppState>) -> Result<(), String> {
     // Export settings to a file
     info!("Exporting settings to file");
     // Implementation would save to user-selected file
@@ -449,11 +448,16 @@ async fn get_discovered_devices(
     if let Some(daemon_ref) = state.daemon_ref.lock().await.as_ref() {
         let discovered = daemon_ref.get_discovered_devices().await;
 
+        // Get paired devices from pairing manager
+        let paired_devices = daemon_ref.pairing_manager.get_paired_devices().await;
+        let paired_ids: Vec<Uuid> = paired_devices.iter().map(|d| d.id).collect();
+
         let mut devices = Vec::new();
 
         for device in discovered {
             let device_id_str = device.id.to_string();
-            let is_paired = settings.security.allowed_devices.contains(&device.id);
+            let is_paired = paired_ids.contains(&device.id)
+                || settings.security.allowed_devices.contains(&device.id);
             let is_blocked = device_manager.blocked_devices.contains(&device_id_str);
             let is_connected = false; // Would need to check actual connection status
 
@@ -743,7 +747,7 @@ async fn bulk_device_action(
 #[tauri::command]
 async fn connect_to_peer(
     device_id: String,
-    state: tauri::State<'_, AppState>,
+    _state: tauri::State<'_, AppState>,
 ) -> Result<(), String> {
     info!("🔗 UI requested to connect to device: {}", device_id);
 
@@ -761,7 +765,7 @@ async fn connect_to_peer(
 #[tauri::command]
 async fn disconnect_from_peer(
     device_id: String,
-    state: tauri::State<'_, AppState>,
+    _state: tauri::State<'_, AppState>,
 ) -> Result<(), String> {
     info!("🔌 UI requested to disconnect from device: {}", device_id);
 
@@ -946,6 +950,170 @@ async fn hide_window(app: tauri::AppHandle) -> Result<(), String> {
     Ok(())
 }
 
+// Pairing commands
+#[tauri::command]
+async fn get_current_pin(state: tauri::State<'_, AppState>) -> Result<serde_json::Value, String> {
+    info!("🔐 UI requesting current PIN");
+
+    if let Some(daemon_ref) = state.daemon_ref.lock().await.as_ref() {
+        let pin = daemon_ref.pairing_manager.get_current_pin().await;
+        Ok(serde_json::json!({
+            "code": pin.code,
+            "generated_at": pin.generated_at,
+            "expires_at": pin.expires_at
+        }))
+    } else {
+        Err("Daemon not ready".to_string())
+    }
+}
+
+#[tauri::command]
+async fn refresh_pin(state: tauri::State<'_, AppState>) -> Result<serde_json::Value, String> {
+    info!("🔄 UI requesting PIN refresh");
+
+    if let Some(daemon_ref) = state.daemon_ref.lock().await.as_ref() {
+        match daemon_ref.pairing_manager.refresh_pin().await {
+            Ok(pin) => Ok(serde_json::json!({
+                "code": pin.code,
+                "generated_at": pin.generated_at,
+                "expires_at": pin.expires_at
+            })),
+            Err(e) => Err(format!("Failed to refresh PIN: {}", e)),
+        }
+    } else {
+        Err("Daemon not ready".to_string())
+    }
+}
+
+#[tauri::command]
+async fn initiate_pairing(
+    device_id: String,
+    pin: String,
+    state: tauri::State<'_, AppState>,
+) -> Result<(), String> {
+    info!(
+        "🔗 UI requested pairing with device: {} using PIN",
+        device_id
+    );
+
+    let device_uuid =
+        Uuid::parse_str(&device_id).map_err(|e| format!("Invalid device ID: {}", e))?;
+
+    if let Some(daemon_ref) = state.daemon_ref.lock().await.as_ref() {
+        let mut pm = daemon_ref.peer_manager.write().await;
+        pm.initiate_pairing(device_uuid, pin)
+            .await
+            .map_err(|e| format!("Failed to initiate pairing: {}", e))?;
+        Ok(())
+    } else {
+        Err("Daemon not ready".to_string())
+    }
+}
+
+#[tauri::command]
+async fn get_paired_devices(
+    state: tauri::State<'_, AppState>,
+) -> Result<Vec<serde_json::Value>, String> {
+    info!("📱 UI requesting paired devices");
+
+    if let Some(daemon_ref) = state.daemon_ref.lock().await.as_ref() {
+        let paired = daemon_ref.pairing_manager.get_paired_devices().await;
+        let devices: Vec<serde_json::Value> = paired
+            .into_iter()
+            .map(|device| {
+                serde_json::json!({
+                    "id": device.id,
+                    "name": device.name,
+                    "paired_at": device.paired_at,
+                    "trust_level": format!("{:?}", device.trust_level),
+                    "platform": device.metadata.platform,
+                })
+            })
+            .collect();
+        Ok(devices)
+    } else {
+        Err("Daemon not ready".to_string())
+    }
+}
+
+#[tauri::command]
+async fn get_unpaired_devices(
+    state: tauri::State<'_, AppState>,
+) -> Result<Vec<DeviceInfo>, String> {
+    info!("🔍 UI requesting unpaired devices");
+
+    if let Some(daemon_ref) = state.daemon_ref.lock().await.as_ref() {
+        let all_devices = daemon_ref.get_discovered_devices().await;
+        let paired_devices = daemon_ref.pairing_manager.get_paired_devices().await;
+        let paired_ids: Vec<Uuid> = paired_devices.iter().map(|d| d.id).collect();
+
+        let unpaired: Vec<DeviceInfo> = all_devices
+            .into_iter()
+            .filter(|device| !paired_ids.contains(&device.id))
+            .map(|device| {
+                let (device_type, platform) = determine_device_type_and_platform(&device.name);
+                DeviceInfo {
+                    id: device.id.to_string(),
+                    name: device.name,
+                    display_name: None,
+                    device_type,
+                    is_paired: false,
+                    is_connected: false,
+                    is_blocked: false,
+                    trust_level: TrustLevel::Unknown,
+                    last_seen: device.last_seen,
+                    first_seen: device.last_seen,
+                    connection_count: 0,
+                    address: device.addr.to_string(),
+                    version: device.version,
+                    platform,
+                    last_transfer_time: None,
+                    total_transfers: 0,
+                }
+            })
+            .collect();
+
+        info!("Found {} unpaired devices", unpaired.len());
+        Ok(unpaired)
+    } else {
+        Err("Daemon not ready".to_string())
+    }
+}
+
+#[tauri::command]
+async fn unpair_device_new(
+    device_id: String,
+    state: tauri::State<'_, AppState>,
+) -> Result<(), String> {
+    info!("🔓 UI requested to unpair device: {}", device_id);
+
+    let device_uuid =
+        Uuid::parse_str(&device_id).map_err(|e| format!("Invalid device ID: {}", e))?;
+
+    if let Some(daemon_ref) = state.daemon_ref.lock().await.as_ref() {
+        daemon_ref
+            .pairing_manager
+            .unpair_device(device_uuid)
+            .await
+            .map_err(|e| format!("Failed to unpair device: {}", e))?;
+
+        // Also remove from settings
+        let mut settings = state.settings.write().await;
+        settings
+            .security
+            .allowed_devices
+            .retain(|&id| id != device_uuid);
+        settings
+            .save(None)
+            .map_err(|e| format!("Failed to save settings: {}", e))?;
+
+        info!("✅ Device {} unpaired successfully", device_id);
+        Ok(())
+    } else {
+        Err("Daemon not ready".to_string())
+    }
+}
+
 // Enhanced device type detection
 fn determine_device_type_and_platform(device_name: &str) -> (String, Option<String>) {
     let name_lower = device_name.to_lowercase();
@@ -1043,7 +1211,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             toggle_transfer_pause,
             cancel_transfer,
             quit_app,
-            hide_window
+            hide_window,
+            // Pairing commands
+            get_current_pin,
+            refresh_pin,
+            initiate_pairing,
+            get_paired_devices,
+            get_unpaired_devices,
+            unpair_device_new
         ])
         .setup(|app| {
             let _main_window = WebviewWindowBuilder::new(app, "main", WebviewUrl::default())
