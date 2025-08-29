@@ -1041,18 +1041,18 @@ async fn request_pairing(
         return Err("Device is blocked".to_string());
     }
     
-    // Create pairing session using the proper pairing module
-    let (session_id, pin) = state.pairing_session_manager
-        .create_initiator_session()
-        .await
-        .map_err(|e| format!("Failed to create pairing session: {}", e))?;
-    
     let expires_at = chrono::Utc::now().timestamp() as u64 + 60;
-    
-    info!("🤝 Pairing session created for device {}: {} with PIN: {}", device_id, session_id, pin);
     
     // Send pairing request message to the remote device
     if let Some(daemon_ref) = state.daemon_ref.lock().await.as_ref() {
+        // Create pairing session using the daemon's session manager
+        let (session_id, pin) = daemon_ref.pairing_session_manager
+            .create_initiator_session()
+            .await
+            .map_err(|e| format!("Failed to create pairing session: {}", e))?;
+        
+        info!("🤝 Pairing session created for device {}: {} with PIN: {}", device_id, session_id, pin);
+        
         // Create device info for the pairing request
         use fileshare_daemon::pairing::messages::{DeviceInfo as PairingDeviceInfo, PairingMessage};
         
@@ -1099,14 +1099,16 @@ async fn request_pairing(
         } else {
             info!("📨 Sent pairing request message to {}", device_id);
         }
+        
+        return Ok(serde_json::json!({
+            "session_id": session_id.to_string(),
+            "pin": pin,
+            "expires_at": expires_at,
+            "status": "showing_pin"
+        }));
     }
     
-    Ok(serde_json::json!({
-        "session_id": session_id.to_string(),
-        "pin": pin,
-        "expires_at": expires_at,
-        "status": "showing_pin"
-    }))
+    Err("Daemon not available".to_string())
 }
 
 #[tauri::command]
