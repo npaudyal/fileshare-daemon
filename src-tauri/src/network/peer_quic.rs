@@ -190,6 +190,7 @@ impl PeerManager {
                 addr: peer.device_info.addr,
                 last_seen: peer.device_info.last_seen,
                 version: peer.device_info.version.clone(),
+                pairing_available: false, // Peers are already connected, not in pairing mode
             });
         }
 
@@ -717,6 +718,7 @@ impl PeerManager {
                             .unwrap()
                             .as_secs(),
                         version: version.clone(),
+                        pairing_available: false, // Incoming connection, not in pairing mode
                     };
 
                     let peer = Peer {
@@ -1030,11 +1032,9 @@ impl PeerManager {
                 }
             }
 
-            MessageType::Pairing(pairing_message) => {
-                info!("🤝 Received pairing message from {}: {:?}", peer_id, pairing_message.message_type);
-                // TODO: Forward pairing message to pairing session manager
-                // For now, just log that we received it
-                warn!("⚠️ Pairing message received but not yet handled - forwarding needed");
+            MessageType::Pairing(_) => {
+                // Pairing messages are now handled by the daemon before reaching here
+                debug!("🤝 Pairing message received at peer manager (should be handled by daemon)");
             }
 
             _ => {

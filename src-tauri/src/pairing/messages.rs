@@ -56,6 +56,16 @@ pub struct DeviceInfo {
     pub version: String,
 }
 
+impl PairingMessageType {
+    pub fn get_ephemeral_public_key(&self) -> Option<&Vec<u8>> {
+        match self {
+            PairingMessageType::PairingRequest { ephemeral_public_key, .. } => Some(ephemeral_public_key),
+            PairingMessageType::PairingChallenge { ephemeral_public_key, .. } => Some(ephemeral_public_key),
+            _ => None,
+        }
+    }
+}
+
 impl PairingMessage {
     pub fn new(session_id: Uuid, message_type: PairingMessageType) -> Self {
         Self {

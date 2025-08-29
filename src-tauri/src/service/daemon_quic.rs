@@ -16,6 +16,8 @@ pub struct FileshareDaemon {
     pub peer_manager: Arc<RwLock<PeerManager>>,
     hotkey_manager: Option<HotkeyManager>,
     clipboard: ClipboardManager,
+    pub pairing_session_manager: Arc<crate::pairing::PairingSessionManager>,
+    pub pairing_storage: Arc<crate::pairing::storage::PairedDeviceStorage>,
     shutdown_tx: broadcast::Sender<()>,
     shutdown_rx: broadcast::Receiver<()>,
 }
@@ -43,12 +45,18 @@ impl FileshareDaemon {
         // Initialize clipboard manager with device ID
         let clipboard = ClipboardManager::new(settings.device.id);
 
+        // Initialize pairing components
+        let pairing_storage = Arc::new(crate::pairing::storage::PairedDeviceStorage::new());
+        let pairing_session_manager = Arc::new(crate::pairing::PairingSessionManager::new());
+
         Ok(Self {
             settings,
             discovery: Some(discovery),
             peer_manager,
             hotkey_manager: Some(hotkey_manager),
             clipboard,
+            pairing_session_manager,
+            pairing_storage,
             shutdown_tx,
             shutdown_rx,
         })
@@ -117,8 +125,15 @@ impl FileshareDaemon {
         // Start peer manager message handler
         let peer_manager = self.peer_manager.clone();
         let clipboard = self.clipboard.clone();
+        let pairing_session_manager = self.pairing_session_manager.clone();
+        let pairing_storage = self.pairing_storage.clone();
         tokio::spawn(async move {
-            if let Err(e) = Self::run_quic_message_handler(peer_manager, clipboard).await {
+            if let Err(e) = Self::run_quic_message_handler(
+                peer_manager, 
+                clipboard,
+                pairing_session_manager,
+                pairing_storage
+            ).await {
                 error!("❌ QUIC message handler error: {}", e);
             }
         });
@@ -131,6 +146,8 @@ impl FileshareDaemon {
     async fn run_quic_message_handler(
         peer_manager: Arc<RwLock<PeerManager>>,
         clipboard: ClipboardManager,
+        pairing_session_manager: Arc<crate::pairing::PairingSessionManager>,
+        pairing_storage: Arc<crate::pairing::storage::PairedDeviceStorage>,
     ) -> Result<()> {
         info!("🚀 Starting QUIC message handler...");
         
@@ -174,10 +191,370 @@ impl FileshareDaemon {
 
             info!("📨 Received message from {}: {:?}", peer_id, message.message_type);
 
-            // Only lock when handling the message
-            let mut pm = peer_manager.write().await;
-            if let Err(e) = pm.handle_message(peer_id, message, &clipboard).await {
-                error!("❌ Failed to handle message from {}: {}", peer_id, e);
+            // Handle pairing messages first (before peer manager)
+            match &message.message_type {
+                crate::network::protocol::MessageType::Pairing(pairing_message) => {
+                    info!("🤝 Processing pairing message from {}: {:?}", peer_id, pairing_message.message_type);
+                    
+                    // Handle different pairing message types
+                    match &pairing_message.message_type {
+                        crate::pairing::messages::PairingMessageType::PairingRequest { device_info, .. } => {
+                            info!("📱 Received pairing request from device: {} ({})", device_info.name, device_info.id);
+                            
+                            // Check if device is already paired
+                            if pairing_storage.is_device_paired(device_info.id).await {
+                                info!("⚠️ Device {} is already paired, rejecting request", device_info.id);
+                                
+                                let rejection = crate::pairing::messages::PairingMessage::pairing_rejected(
+                                    pairing_message.session_id,
+                                    "Device is already paired".to_string()
+                                );
+                                
+                                let response_message = crate::network::protocol::Message::new(
+                                    crate::network::protocol::MessageType::Pairing(rejection)
+                                );
+                                
+                                let mut pm = peer_manager.write().await;
+                                if let Err(e) = pm.send_message_to_peer(peer_id, response_message).await {
+                                    error!("❌ Failed to send pairing rejection: {}", e);
+                                }
+                            } else if pairing_storage.is_device_blocked(device_info.id).await {
+                                info!("🚫 Device {} is blocked, rejecting request", device_info.id);
+                                
+                                let rejection = crate::pairing::messages::PairingMessage::pairing_rejected(
+                                    pairing_message.session_id,
+                                    "Device is blocked".to_string()
+                                );
+                                
+                                let response_message = crate::network::protocol::Message::new(
+                                    crate::network::protocol::MessageType::Pairing(rejection)
+                                );
+                                
+                                let mut pm = peer_manager.write().await;
+                                if let Err(e) = pm.send_message_to_peer(peer_id, response_message).await {
+                                    error!("❌ Failed to send pairing rejection: {}", e);
+                                }
+                            } else {
+                                // Process valid pairing request with proper cryptographic flow
+                                info!("🔐 Processing pairing request from device: {} ({})", device_info.name, device_info.id);
+                                
+                                // Create acceptor session and generate ephemeral keys
+                                match pairing_session_manager.create_acceptor_session(device_info.clone()).await {
+                                    Ok(session_id) => {
+                                        info!("✅ Created acceptor session: {}", session_id);
+                                        
+                                        // Generate ephemeral key pair for ECDH
+                                        let (ephemeral_private_key, ephemeral_public_key) = 
+                                            match crate::pairing::crypto::PairingCrypto::generate_ephemeral_keypair() {
+                                                Ok(keypair) => keypair,
+                                                Err(e) => {
+                                                    error!("❌ Failed to generate ephemeral keypair: {}", e);
+                                                    let rejection = crate::pairing::messages::PairingMessage::pairing_rejected(
+                                                        pairing_message.session_id,
+                                                        "Cryptographic error".to_string()
+                                                    );
+                                                    let response = crate::network::protocol::Message::new(
+                                                        crate::network::protocol::MessageType::Pairing(rejection)
+                                                    );
+                                                    let mut pm = peer_manager.write().await;
+                                                    let _ = pm.send_message_to_peer(peer_id, response).await;
+                                                    continue;
+                                                }
+                                            };
+                                        
+                                        // Generate 6-digit PIN for challenge
+                                        let pin = crate::pairing::crypto::PairingCrypto::generate_pin();
+                                        
+                                        // Perform ECDH with peer's ephemeral key
+                                        let peer_ephemeral_key = match pairing_message.message_type.get_ephemeral_public_key() {
+                                            Some(key) => key,
+                                            None => {
+                                                error!("❌ No ephemeral public key in pairing request");
+                                                let rejection = crate::pairing::messages::PairingMessage::pairing_rejected(
+                                                    pairing_message.session_id,
+                                                    "Missing ephemeral key".to_string()
+                                                );
+                                                let response = crate::network::protocol::Message::new(
+                                                    crate::network::protocol::MessageType::Pairing(rejection)
+                                                );
+                                                let mut pm = peer_manager.write().await;
+                                                let _ = pm.send_message_to_peer(peer_id, response).await;
+                                                continue;
+                                            }
+                                        };
+                                        let shared_secret = match crate::pairing::crypto::PairingCrypto::derive_shared_secret(
+                                            ephemeral_private_key,
+                                            peer_ephemeral_key
+                                        ) {
+                                            Ok(secret) => secret,
+                                            Err(e) => {
+                                                error!("❌ Failed to derive shared secret: {}", e);
+                                                let rejection = crate::pairing::messages::PairingMessage::pairing_rejected(
+                                                    pairing_message.session_id,
+                                                    "Cryptographic error".to_string()
+                                                );
+                                                let response = crate::network::protocol::Message::new(
+                                                    crate::network::protocol::MessageType::Pairing(rejection)
+                                                );
+                                                let mut pm = peer_manager.write().await;
+                                                let _ = pm.send_message_to_peer(peer_id, response).await;
+                                                continue;
+                                            }
+                                        };
+                                        
+                                        // Encrypt the PIN as challenge
+                                        let info = b"pairing-challenge";
+                                        let encryption_key = match crate::pairing::crypto::PairingCrypto::derive_key(&shared_secret, info) {
+                                            Ok(key) => key,
+                                            Err(e) => {
+                                                error!("❌ Failed to derive encryption key: {}", e);
+                                                let rejection = crate::pairing::messages::PairingMessage::pairing_rejected(
+                                                    pairing_message.session_id,
+                                                    "Key derivation error".to_string()
+                                                );
+                                                let response = crate::network::protocol::Message::new(
+                                                    crate::network::protocol::MessageType::Pairing(rejection)
+                                                );
+                                                let mut pm = peer_manager.write().await;
+                                                let _ = pm.send_message_to_peer(peer_id, response).await;
+                                                continue;
+                                            }
+                                        };
+                                        let (encrypted_challenge, nonce) = match crate::pairing::crypto::PairingCrypto::encrypt_aes_gcm(
+                                            &encryption_key,
+                                            pin.as_bytes(),
+                                            b"pairing-challenge"
+                                        ) {
+                                            Ok(result) => result,
+                                            Err(e) => {
+                                                error!("❌ Failed to encrypt challenge: {}", e);
+                                                let rejection = crate::pairing::messages::PairingMessage::pairing_rejected(
+                                                    pairing_message.session_id,
+                                                    "Encryption error".to_string()
+                                                );
+                                                let response = crate::network::protocol::Message::new(
+                                                    crate::network::protocol::MessageType::Pairing(rejection)
+                                                );
+                                                let mut pm = peer_manager.write().await;
+                                                let _ = pm.send_message_to_peer(peer_id, response).await;
+                                                continue;
+                                            }
+                                        };
+                                        
+                                        // Update session with ephemeral keys
+                                        if let Err(e) = pairing_session_manager.update_session(session_id, |session| {
+                                            session.ephemeral_public_key = Some(ephemeral_public_key.clone());
+                                            session.peer_ephemeral_public_key = Some(peer_ephemeral_key.clone());
+                                            session.shared_secret = Some(shared_secret.clone());
+                                            session.pin = Some(pin.clone());
+                                            Ok(())
+                                        }).await {
+                                            error!("❌ Failed to update session: {}", e);
+                                            continue;
+                                        }
+                                        
+                                        // Create pairing challenge message
+                                        let challenge = crate::pairing::messages::PairingMessage::pairing_challenge(
+                                            session_id,
+                                            ephemeral_public_key,
+                                            encrypted_challenge,
+                                            nonce
+                                        );
+                                        
+                                        let challenge_message = crate::network::protocol::Message::new(
+                                            crate::network::protocol::MessageType::Pairing(challenge)
+                                        );
+                                        
+                                        let mut pm = peer_manager.write().await;
+                                        if let Err(e) = pm.send_message_to_peer(peer_id, challenge_message).await {
+                                            error!("❌ Failed to send pairing challenge: {}", e);
+                                        } else {
+                                            info!("📨 Sent encrypted pairing challenge to device {} with PIN: {}", device_info.id, pin);
+                                        }
+                                    },
+                                    Err(e) => {
+                                        error!("❌ Failed to create acceptor session: {}", e);
+                                        let rejection = crate::pairing::messages::PairingMessage::pairing_rejected(
+                                            pairing_message.session_id,
+                                            format!("Session error: {}", e)
+                                        );
+                                        let response = crate::network::protocol::Message::new(
+                                            crate::network::protocol::MessageType::Pairing(rejection)
+                                        );
+                                        let mut pm = peer_manager.write().await;
+                                        let _ = pm.send_message_to_peer(peer_id, response).await;
+                                    }
+                                }
+                            }
+                        },
+                        
+                        crate::pairing::messages::PairingMessageType::PairingResponse { pin, encrypted_response, device_public_key } => {
+                            info!("🔑 Received pairing response with PIN for session {}", pairing_message.session_id);
+                            
+                            match pairing_session_manager.verify_session_pin(pairing_message.session_id, pin).await {
+                                Ok(is_valid) if is_valid => {
+                                    info!("✅ PIN verified successfully for session {}", pairing_message.session_id);
+                                    
+                                    // Generate device key pair for long-term authentication
+                                    let (our_private_key, our_public_key) = match crate::pairing::crypto::PairingCrypto::generate_device_keypair() {
+                                        Ok(keypair) => keypair,
+                                        Err(e) => {
+                                            error!("❌ Failed to generate device keypair: {}", e);
+                                            let rejection = crate::pairing::messages::PairingMessage::pairing_rejected(
+                                                pairing_message.session_id,
+                                                "Cryptographic error".to_string()
+                                            );
+                                            let response = crate::network::protocol::Message::new(
+                                                crate::network::protocol::MessageType::Pairing(rejection)
+                                            );
+                                            let mut pm = peer_manager.write().await;
+                                            let _ = pm.send_message_to_peer(peer_id, response).await;
+                                            continue;
+                                        }
+                                    };
+                                    
+                                    // Create confirmation data to sign
+                                    let session = match pairing_session_manager.get_session(pairing_message.session_id).await {
+                                        Ok(session) => session,
+                                        Err(e) => {
+                                            error!("❌ Failed to get session: {}", e);
+                                            continue;
+                                        }
+                                    };
+                                    
+                                    let confirmation_data = format!("pairing-complete:{}", pairing_message.session_id);
+                                    let signature = match crate::pairing::crypto::PairingCrypto::sign_ed25519(
+                                        &our_private_key,
+                                        confirmation_data.as_bytes()
+                                    ) {
+                                        Ok(sig) => sig,
+                                        Err(e) => {
+                                            error!("❌ Failed to sign confirmation: {}", e);
+                                            continue;
+                                        }
+                                    };
+                                    
+                                    // Encrypt confirmation with shared secret
+                                    let shared_secret = session.shared_secret.unwrap_or_default();
+                                    let info = b"pairing-completion";
+                                    let encryption_key = match crate::pairing::crypto::PairingCrypto::derive_key(&shared_secret, info) {
+                                        Ok(key) => key,
+                                        Err(e) => {
+                                            error!("❌ Failed to derive completion key: {}", e);
+                                            continue;
+                                        }
+                                    };
+                                    
+                                    let (encrypted_confirmation, _nonce) = match crate::pairing::crypto::PairingCrypto::encrypt_aes_gcm(
+                                        &encryption_key,
+                                        confirmation_data.as_bytes(),
+                                        b"pairing-completion"
+                                    ) {
+                                        Ok(result) => result,
+                                        Err(e) => {
+                                            error!("❌ Failed to encrypt confirmation: {}", e);
+                                            continue;
+                                        }
+                                    };
+                                    
+                                    let completion = crate::pairing::messages::PairingMessage::pairing_complete(
+                                        pairing_message.session_id,
+                                        our_public_key,
+                                        encrypted_confirmation,
+                                        signature
+                                    );
+                                    
+                                    let completion_message = crate::network::protocol::Message::new(
+                                        crate::network::protocol::MessageType::Pairing(completion)
+                                    );
+                                    
+                                    let mut pm = peer_manager.write().await;
+                                    if let Err(e) = pm.send_message_to_peer(peer_id, completion_message).await {
+                                        error!("❌ Failed to send pairing completion: {}", e);
+                                    } else {
+                                        info!("🎉 Pairing completed successfully!");
+                                    }
+                                },
+                                Ok(_) => {
+                                    warn!("❌ Invalid PIN for session {}", pairing_message.session_id);
+                                    
+                                    let rejection = crate::pairing::messages::PairingMessage::pairing_rejected(
+                                        pairing_message.session_id,
+                                        "Invalid PIN".to_string()
+                                    );
+                                    
+                                    let response_message = crate::network::protocol::Message::new(
+                                        crate::network::protocol::MessageType::Pairing(rejection)
+                                    );
+                                    
+                                    let mut pm = peer_manager.write().await;
+                                    if let Err(e) = pm.send_message_to_peer(peer_id, response_message).await {
+                                        error!("❌ Failed to send pairing rejection: {}", e);
+                                    }
+                                },
+                                Err(e) => {
+                                    warn!("❌ PIN verification failed for session {}: {}", pairing_message.session_id, e);
+                                    
+                                    let rejection = crate::pairing::messages::PairingMessage::pairing_rejected(
+                                        pairing_message.session_id,
+                                        "Invalid PIN".to_string()
+                                    );
+                                    
+                                    let response_message = crate::network::protocol::Message::new(
+                                        crate::network::protocol::MessageType::Pairing(rejection)
+                                    );
+                                    
+                                    let mut pm = peer_manager.write().await;
+                                    if let Err(e) = pm.send_message_to_peer(peer_id, response_message).await {
+                                        error!("❌ Failed to send pairing rejection: {}", e);
+                                    }
+                                }
+                            }
+                        },
+                        
+                        crate::pairing::messages::PairingMessageType::PairingChallenge { .. } => {
+                            info!("🔐 Received pairing challenge for session {}", pairing_message.session_id);
+                            // This would be handled by the device that initiated pairing (not implemented here)
+                            // In a complete implementation, this would show PIN entry dialog to user
+                        },
+                        
+                        crate::pairing::messages::PairingMessageType::PairingComplete { .. } => {
+                            info!("🎉 Received pairing completion for session {}", pairing_message.session_id);
+                            
+                            // Mark pairing as completed and store device info
+                            if let Err(e) = pairing_session_manager.complete_session(pairing_message.session_id).await {
+                                error!("❌ Failed to complete pairing: {}", e);
+                            } else {
+                                info!("✅ Pairing completed and device stored successfully!");
+                            }
+                        },
+                        
+                        crate::pairing::messages::PairingMessageType::PairingRejected { reason } => {
+                            warn!("🚫 Pairing rejected for session {}: {}", pairing_message.session_id, reason);
+                            
+                            // Clean up the session
+                            if let Err(e) = pairing_session_manager.cancel_session(pairing_message.session_id).await {
+                                error!("❌ Failed to cancel pairing session: {}", e);
+                            }
+                        },
+                        
+                        crate::pairing::messages::PairingMessageType::PairingCancelled => {
+                            info!("🚫 Pairing cancelled for session {}", pairing_message.session_id);
+                            
+                            // Clean up the session
+                            if let Err(e) = pairing_session_manager.cancel_session(pairing_message.session_id).await {
+                                error!("❌ Failed to cancel pairing session: {}", e);
+                            }
+                        },
+                    }
+                },
+                _ => {
+                    // Handle non-pairing messages normally
+                    let mut pm = peer_manager.write().await;
+                    if let Err(e) = pm.handle_message(peer_id, message, &clipboard).await {
+                        error!("❌ Failed to handle message from {}: {}", peer_id, e);
+                    }
+                }
             }
         }
 
@@ -222,11 +599,13 @@ impl FileshareDaemon {
         let message_handle = {
             let peer_manager = self.peer_manager.clone();
             let clipboard = self.clipboard.clone();
+            let pairing_session_manager = self.pairing_session_manager.clone();
+            let pairing_storage = self.pairing_storage.clone();
             let mut shutdown_rx = self.shutdown_tx.subscribe();
 
             tokio::spawn(async move {
                 tokio::select! {
-                    result = Self::run_quic_message_handler(peer_manager, clipboard) => {
+                    result = Self::run_quic_message_handler(peer_manager, clipboard, pairing_session_manager, pairing_storage) => {
                         if let Err(e) = result {
                             error!("❌ QUIC message handler error: {}", e);
                         }

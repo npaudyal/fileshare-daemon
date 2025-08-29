@@ -16,6 +16,7 @@ pub struct DeviceInfo {
     pub addr: SocketAddr,
     pub last_seen: u64,
     pub version: String,
+    pub pairing_available: bool,
 }
 
 #[derive(Clone)]
@@ -179,7 +180,8 @@ impl DiscoveryService {
             "device_name": settings.device.name,
             "port": settings.network.port,
             "version": env!("CARGO_PKG_VERSION"),
-            "timestamp": SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs()
+            "timestamp": SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs(),
+            "pairing_available": false  // TODO: Make this dynamic based on pairing session state
         });
 
         let data = announcement.to_string();
@@ -253,6 +255,11 @@ impl DiscoveryService {
         // Create device address using the actual IP from the packet
         let device_addr = SocketAddr::new(addr.ip(), port);
 
+        let pairing_available = announcement
+            .get("pairing_available")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+
         let device_info = DeviceInfo {
             id: device_id,
             name: device_name.clone(),
@@ -262,6 +269,7 @@ impl DiscoveryService {
                 .unwrap()
                 .as_secs(),
             version,
+            pairing_available,
         };
 
         info!(
