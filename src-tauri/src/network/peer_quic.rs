@@ -1030,6 +1030,13 @@ impl PeerManager {
                 }
             }
 
+            MessageType::Pairing(pairing_message) => {
+                info!("🤝 Received pairing message from {}: {:?}", peer_id, pairing_message.message_type);
+                // TODO: Forward pairing message to pairing session manager
+                // For now, just log that we received it
+                warn!("⚠️ Pairing message received but not yet handled - forwarding needed");
+            }
+
             _ => {
                 debug!(
                     "Unhandled message type from {}: {:?}",
