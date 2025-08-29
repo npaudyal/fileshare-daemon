@@ -114,7 +114,7 @@ function App() {
         }
     }, []);
 
-    // Device filtering and sorting
+    // Device filtering and sorting  
     const getPairedDevices = () => {
         return devices.filter(d => d.is_paired && !d.is_blocked);
     };
@@ -319,12 +319,21 @@ function App() {
     useEffect(() => {
         const loadInitialData = async () => {
             setIsLoading(true);
+            
+            // Create test devices for demonstration
+            try {
+                await invoke('create_test_devices');
+                addToast('info', 'Test Devices', 'Created test devices for demonstration');
+            } catch (error) {
+                console.error('Failed to create test devices:', error);
+            }
+            
             await loadDevices();
             await loadSettings();
             await checkConnectionStatus();
         };
         loadInitialData();
-    }, [loadDevices, loadSettings, checkConnectionStatus]);
+    }, [loadDevices, loadSettings, checkConnectionStatus, addToast]);
 
     // Auto-refresh
     useEffect(() => {
