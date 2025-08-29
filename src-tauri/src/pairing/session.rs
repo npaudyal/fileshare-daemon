@@ -175,6 +175,17 @@ impl PairingSessionManager {
         Ok(session_id)
     }
     
+    pub async fn create_acceptor_session_with_id(&self, session_id: Uuid, peer_device: DeviceInfo) -> Result<(), PairingError> {
+        let mut session = PairingSession::new_acceptor(peer_device);
+        session.id = session_id; // Use the provided session ID
+        
+        let mut sessions = self.sessions.write().await;
+        sessions.insert(session_id, session);
+        
+        info!("Created acceptor session with specific ID: {}", session_id);
+        Ok(())
+    }
+    
     pub async fn get_session(&self, session_id: Uuid) -> Result<PairingSession, PairingError> {
         let sessions = self.sessions.read().await;
         sessions

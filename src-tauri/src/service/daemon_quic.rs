@@ -238,9 +238,22 @@ impl FileshareDaemon {
                                 // Process valid pairing request with proper cryptographic flow
                                 info!("🔐 Processing pairing request from device: {} ({})", device_info.name, device_info.id);
                                 
-                                // Use the session ID from the PairingRequest - don't create a new one
+                                // Create acceptor session with the specific session ID from the request
                                 let session_id = pairing_message.session_id;
-                                info!("✅ Using session from PairingRequest: {}", session_id);
+                                if let Err(e) = pairing_session_manager.create_acceptor_session_with_id(session_id, device_info.clone()).await {
+                                    error!("❌ Failed to create acceptor session: {}", e);
+                                    let rejection = crate::pairing::messages::PairingMessage::pairing_rejected(
+                                        pairing_message.session_id,
+                                        "Session creation error".to_string()
+                                    );
+                                    let response = crate::network::protocol::Message::new(
+                                        crate::network::protocol::MessageType::Pairing(rejection)
+                                    );
+                                    let mut pm = peer_manager.write().await;
+                                    let _ = pm.send_message_to_peer(peer_id, response).await;
+                                    continue;
+                                }
+                                info!("✅ Created acceptor session with ID from PairingRequest: {}", session_id);
                                 
                                 // Generate ephemeral key pair for ECDH
                                 let (ephemeral_private_key, ephemeral_public_key) = 
