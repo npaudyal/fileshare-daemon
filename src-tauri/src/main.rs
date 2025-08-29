@@ -228,8 +228,7 @@ async fn test_file_transfer(state: tauri::State<'_, AppState>) -> Result<String,
             "📊 Transfer System Status:\n\
             Connections: {} total ({} healthy)\n\
             System: Ready with optimized QUIC streaming (unlimited file size)",
-            stats.total,
-            stats.authenticated
+            stats.total, stats.authenticated
         ))
     } else {
         Err("Daemon not ready".to_string())
@@ -434,6 +433,17 @@ struct AppState {
     settings: Arc<RwLock<Settings>>,
     daemon_ref: Arc<Mutex<Option<Arc<FileshareDaemon>>>>,
     device_manager: Arc<RwLock<DeviceManager>>,
+    pairing_manager: Arc<RwLock<HashMap<String, PairingSessionData>>>,
+}
+
+#[derive(Debug, Clone)]
+struct PairingSessionData {
+    session_id: String,
+    device_id: String,
+    pin: String,
+    created_at: u64,
+    expires_at: u64,
+    status: String,
 }
 
 // Enhanced device discovery with metadata
@@ -931,6 +941,349 @@ async fn cancel_transfer(
     Err("Transfer cancellation not supported with optimized QUIC transfers".to_string())
 }
 
+// NEW PAIRING COMMANDS FOR SECURE PAIRING FLOW
+
+fn generate_secure_pin() -> String {
+    use rand::Rng;
+    let mut rng = rand::thread_rng();
+    let pin: u32 = rng.gen_range(100_000..1_000_000);
+    format!("{:06}", pin)
+}
+
+#[tauri::command]
+async fn get_paired_devices(state: tauri::State<'_, AppState>) -> Result<Vec<DeviceInfo>, String> {
+    let device_manager = state.device_manager.read().await;
+    let mut paired_devices = Vec::new();
+    
+    for (device_id, metadata) in &device_manager.device_metadata {
+        // For now, assume trusted devices are "paired" since we don't have is_paired field yet
+        if matches!(metadata.trust_level, TrustLevel::Trusted | TrustLevel::Verified) && !device_manager.blocked_devices.contains(device_id) {
+            let device_info = DeviceInfo {
+                id: device_id.clone(),
+                name: metadata.display_name.clone().unwrap_or_else(|| format!("Device {}", &device_id[..8])),
+                display_name: metadata.display_name.clone(),
+                device_type: "unknown".to_string(), // Placeholder
+                is_paired: true,
+                is_connected: false, // Placeholder - would need connection tracking
+                is_blocked: false,
+                trust_level: metadata.trust_level.clone(),
+                last_seen: metadata.first_seen, // Using first_seen as placeholder
+                first_seen: metadata.first_seen,
+                connection_count: metadata.connection_count,
+                address: "127.0.0.1".to_string(), // Placeholder
+                version: "1.0.0".to_string(), // Placeholder
+                platform: None,
+                last_transfer_time: metadata.last_transfer_time,
+                total_transfers: metadata.total_transfers,
+            };
+            paired_devices.push(device_info);
+        }
+    }
+    
+    Ok(paired_devices)
+}
+
+#[tauri::command]
+async fn get_unpaired_devices(state: tauri::State<'_, AppState>) -> Result<Vec<DeviceInfo>, String> {
+    let device_manager = state.device_manager.read().await;
+    let mut unpaired_devices = Vec::new();
+    
+    for (device_id, metadata) in &device_manager.device_metadata {
+        // Devices that are not trusted/verified are considered unpaired
+        if matches!(metadata.trust_level, TrustLevel::Unknown) && !device_manager.blocked_devices.contains(device_id) {
+            let device_info = DeviceInfo {
+                id: device_id.clone(),
+                name: metadata.display_name.clone().unwrap_or_else(|| format!("Device {}", &device_id[..8])),
+                display_name: metadata.display_name.clone(),
+                device_type: "unknown".to_string(), // Placeholder
+                is_paired: false,
+                is_connected: false, // Placeholder - would need connection tracking
+                is_blocked: false,
+                trust_level: metadata.trust_level.clone(),
+                last_seen: metadata.first_seen, // Using first_seen as placeholder
+                first_seen: metadata.first_seen,
+                connection_count: metadata.connection_count,
+                address: "127.0.0.1".to_string(), // Placeholder
+                version: "1.0.0".to_string(), // Placeholder
+                platform: None,
+                last_transfer_time: metadata.last_transfer_time,
+                total_transfers: metadata.total_transfers,
+            };
+            unpaired_devices.push(device_info);
+        }
+    }
+    
+    Ok(unpaired_devices)
+}
+
+#[tauri::command]
+async fn start_pairing_mode(state: tauri::State<'_, AppState>) -> Result<serde_json::Value, String> {
+    info!("🔗 Starting pairing mode");
+    
+    let session_id = uuid::Uuid::new_v4().to_string();
+    let pin = generate_secure_pin();
+    let created_at = chrono::Utc::now().timestamp() as u64;
+    let expires_at = created_at + 60; // 60 seconds
+    
+    let session_data = PairingSessionData {
+        session_id: session_id.clone(),
+        device_id: String::new(), // Will be set when device requests pairing
+        pin: pin.clone(),
+        created_at,
+        expires_at,
+        status: "waiting_for_request".to_string(),
+    };
+    
+    {
+        let mut pairing_manager = state.pairing_manager.write().await;
+        pairing_manager.insert(session_id.clone(), session_data);
+    }
+    
+    info!("🔗 Pairing session created: {} with PIN: {}", session_id, pin);
+    
+    Ok(serde_json::json!({
+        "session_id": session_id,
+        "pin": pin,
+        "expires_at": expires_at
+    }))
+}
+
+#[tauri::command]
+async fn request_pairing(
+    device_id: String,
+    state: tauri::State<'_, AppState>
+) -> Result<serde_json::Value, String> {
+    info!("🤝 Requesting pairing with device: {}", device_id);
+    
+    // Check if device exists in device_manager
+    let device_manager = state.device_manager.read().await;
+    if !device_manager.device_metadata.contains_key(&device_id) {
+        return Err("Device not found".to_string());
+    }
+    drop(device_manager);
+    
+    // Create a pairing session for this specific device
+    let session_id = uuid::Uuid::new_v4().to_string();
+    let pin = generate_secure_pin();
+    let created_at = chrono::Utc::now().timestamp() as u64;
+    let expires_at = created_at + 60; // 60 seconds
+    
+    let session_data = PairingSessionData {
+        session_id: session_id.clone(),
+        device_id: device_id.clone(),
+        pin: pin.clone(),
+        created_at,
+        expires_at,
+        status: "showing_pin".to_string(),
+    };
+    
+    {
+        let mut pairing_manager = state.pairing_manager.write().await;
+        pairing_manager.insert(session_id.clone(), session_data);
+    }
+    
+    info!("🤝 Pairing session created for device {}: {} with PIN: {}", device_id, session_id, pin);
+    
+    Ok(serde_json::json!({
+        "session_id": session_id,
+        "pin": pin,
+        "expires_at": expires_at,
+        "status": "showing_pin"
+    }))
+}
+
+#[tauri::command]
+async fn verify_pairing_pin(
+    session_id: String,
+    pin: String,
+    state: tauri::State<'_, AppState>
+) -> Result<serde_json::Value, String> {
+    info!("🔐 Verifying PIN for session: {}", session_id);
+    
+    // Get and validate the pairing session
+    let session_data = {
+        let pairing_manager = state.pairing_manager.read().await;
+        match pairing_manager.get(&session_id) {
+            Some(session) => session.clone(),
+            None => return Err("Session not found".to_string()),
+        }
+    };
+    
+    // Check if session has expired
+    let now = chrono::Utc::now().timestamp() as u64;
+    if now > session_data.expires_at {
+        // Clean up expired session
+        let mut pairing_manager = state.pairing_manager.write().await;
+        pairing_manager.remove(&session_id);
+        return Err("Session expired".to_string());
+    }
+    
+    // Verify PIN using constant-time comparison for security
+    use subtle::ConstantTimeEq;
+    let pin_matches: bool = session_data.pin.as_bytes().ct_eq(pin.as_bytes()).into();
+    if !pin_matches {
+        return Ok(serde_json::json!({
+            "success": false,
+            "error": "Invalid PIN"
+        }));
+    }
+    
+    // PIN is correct, pair the device
+    info!("✅ PIN verified successfully for device: {}", session_data.device_id);
+    
+    // Update device trust level to Trusted (effectively pairing it)
+    {
+        let mut device_manager = state.device_manager.write().await;
+        if let Some(metadata) = device_manager.device_metadata.get_mut(&session_data.device_id) {
+            metadata.trust_level = TrustLevel::Trusted;
+            info!("🔗 Device {} is now paired", session_data.device_id);
+        }
+    }
+    
+    // Update session status to completed
+    {
+        let mut pairing_manager = state.pairing_manager.write().await;
+        if let Some(session) = pairing_manager.get_mut(&session_id) {
+            session.status = "completed".to_string();
+        }
+    }
+    
+    Ok(serde_json::json!({
+        "success": true,
+        "device_id": session_data.device_id,
+        "message": "Device paired successfully"
+    }))
+}
+
+#[tauri::command]
+async fn cancel_pairing(
+    session_id: String,
+    state: tauri::State<'_, AppState>
+) -> Result<(), String> {
+    info!("❌ Cancelling pairing session: {}", session_id);
+    
+    // Remove the session from the pairing manager
+    let mut pairing_manager = state.pairing_manager.write().await;
+    match pairing_manager.remove(&session_id) {
+        Some(session_data) => {
+            info!("❌ Pairing session cancelled for device: {}", session_data.device_id);
+        },
+        None => {
+            return Err("Session not found".to_string());
+        }
+    }
+    
+    Ok(())
+}
+
+#[tauri::command]
+async fn get_pairing_session(
+    session_id: String,
+    state: tauri::State<'_, AppState>
+) -> Result<serde_json::Value, String> {
+    let pairing_manager = state.pairing_manager.read().await;
+    
+    match pairing_manager.get(&session_id) {
+        Some(session) => {
+            let now = chrono::Utc::now().timestamp() as u64;
+            if now > session.expires_at {
+                return Err("Session expired".to_string());
+            }
+            
+            Ok(serde_json::json!({
+                "session_id": session.session_id,
+                "device_id": session.device_id,
+                "pin": session.pin,
+                "status": session.status,
+                "expires_at": session.expires_at,
+                "created_at": session.created_at
+            }))
+        },
+        None => Err("Session not found".to_string())
+    }
+}
+
+#[tauri::command]
+async fn cleanup_expired_sessions(state: tauri::State<'_, AppState>) -> Result<u32, String> {
+    let mut pairing_manager = state.pairing_manager.write().await;
+    let now = chrono::Utc::now().timestamp() as u64;
+    
+    let initial_count = pairing_manager.len();
+    pairing_manager.retain(|_, session| now <= session.expires_at);
+    let final_count = pairing_manager.len();
+    
+    let cleaned_up = (initial_count - final_count) as u32;
+    if cleaned_up > 0 {
+        info!("🧹 Cleaned up {} expired pairing sessions", cleaned_up);
+    }
+    
+    Ok(cleaned_up)
+}
+
+#[tauri::command]
+async fn create_test_devices(state: tauri::State<'_, AppState>) -> Result<String, String> {
+    info!("🧪 Creating test devices for demonstration");
+    
+    let test_devices = vec![
+        ("test-device-1", "Alice's MacBook", TrustLevel::Unknown),
+        ("test-device-2", "Bob's iPhone", TrustLevel::Unknown),
+        ("test-device-3", "Carol's iPad", TrustLevel::Trusted), // Already paired
+        ("test-device-4", "Dave's Desktop", TrustLevel::Unknown),
+    ];
+    
+    {
+        let mut device_manager = state.device_manager.write().await;
+        let now = chrono::Utc::now().timestamp() as u64;
+        
+        for (device_id, name, trust_level) in test_devices {
+            device_manager.device_metadata.insert(
+                device_id.to_string(),
+                DeviceMetadata {
+                    display_name: Some(name.to_string()),
+                    trust_level,
+                    first_seen: now,
+                    connection_count: 0,
+                    last_transfer_time: None,
+                    total_transfers: 0,
+                    notes: None,
+                }
+            );
+        }
+    }
+    
+    info!("🧪 Test devices created successfully");
+    Ok("Test devices created successfully".to_string())
+}
+
+#[tauri::command]
+async fn get_device_statuses(state: tauri::State<'_, AppState>) -> Result<serde_json::Value, String> {
+    let device_manager = state.device_manager.read().await;
+    let mut statuses = serde_json::Map::new();
+    
+    for (device_id, metadata) in &device_manager.device_metadata {
+        // Placeholder connection status - would need actual connection tracking
+        let is_connected = false;
+        let time_diff = chrono::Utc::now().timestamp() as u64 - metadata.first_seen;
+        
+        let status = if is_connected {
+            "connected"
+        } else if time_diff < 300 {  // 5 minutes
+            "online"
+        } else {
+            "offline"
+        };
+        
+        statuses.insert(device_id.clone(), serde_json::json!({
+            "status": status,
+            "last_seen": metadata.first_seen,
+            "is_paired": matches!(metadata.trust_level, TrustLevel::Trusted | TrustLevel::Verified),
+            "is_blocked": device_manager.blocked_devices.contains(device_id)
+        }));
+    }
+    
+    Ok(serde_json::Value::Object(statuses))
+}
+
 #[tauri::command]
 async fn quit_app(app: tauri::AppHandle) -> Result<(), String> {
     info!("🚪 UI requested app quit");
@@ -1006,6 +1359,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         settings: Arc::new(RwLock::new(settings)),
         daemon_ref: Arc::new(Mutex::new(None)),
         device_manager: Arc::new(RwLock::new(DeviceManager::default())),
+        pairing_manager: Arc::new(RwLock::new(HashMap::new())),
     };
 
     tauri::Builder::default()
@@ -1013,6 +1367,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .plugin(tauri_plugin_shell::init())
         .invoke_handler(tauri::generate_handler![
             get_discovered_devices,
+            get_paired_devices,
+            get_unpaired_devices,
+            start_pairing_mode,
+            request_pairing,
+            verify_pairing_pin,
+            cancel_pairing,
+            get_pairing_session,
+            cleanup_expired_sessions,
+            create_test_devices,
+            get_device_statuses,
             pair_device,
             pair_device_with_trust,
             unpair_device,

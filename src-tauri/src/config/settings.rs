@@ -1,4 +1,5 @@
 use crate::{FileshareError, Result};
+use crate::pairing::storage::{PairedDevice, TrustLevel};
 use directories::ProjectDirs;
 use serde::{Deserialize, Serialize};
 use std::fs;
@@ -46,6 +47,12 @@ pub struct TransferSettings {
 pub struct SecuritySettings {
     pub require_pairing: bool,
     pub encryption_enabled: bool,
+    #[serde(default)]
+    pub paired_devices: Vec<PairedDevice>,
+    #[serde(default)]
+    pub blocked_devices: Vec<Uuid>,
+    // Keep for backward compatibility, will be migrated
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub allowed_devices: Vec<Uuid>,
 }
 
@@ -77,6 +84,8 @@ impl Default for Settings {
             security: SecuritySettings {
                 require_pairing: false,
                 encryption_enabled: true,
+                paired_devices: Vec::new(),
+                blocked_devices: Vec::new(),
                 allowed_devices: Vec::new(),
             },
         }
@@ -84,6 +93,30 @@ impl Default for Settings {
 }
 
 impl Settings {
+    /// Migrate from old allowed_devices to new paired_devices structure
+    pub fn migrate_allowed_devices(&mut self) {
+        if !self.security.allowed_devices.is_empty() {
+            // Convert each allowed device to a PairedDevice with minimal info
+            for device_id in self.security.allowed_devices.drain(..) {
+                // Check if already migrated
+                if !self.security.paired_devices.iter().any(|d| d.device_id == device_id) {
+                    let paired_device = PairedDevice::new(
+                        device_id,
+                        format!("Device-{}", device_id.to_string().split('-').next().unwrap_or("unknown")),
+                        "unknown".to_string(),
+                        "unknown".to_string(),
+                        Vec::new(), // Empty public key, will be updated on next pairing
+                        "0.0.0.0".to_string(),
+                        "unknown".to_string(),
+                    );
+                    self.security.paired_devices.push(paired_device);
+                }
+            }
+            // Clear allowed_devices after migration
+            self.security.allowed_devices.clear();
+        }
+    }
+    
     pub fn validate_transfer_settings(&self) -> Result<()> {
         let transfer = &self.transfer;
 
@@ -125,9 +158,12 @@ impl Settings {
             let content = fs::read_to_string(&path)
                 .map_err(|e| FileshareError::Config(format!("Failed to read config: {}", e)))?;
 
-            let settings: Settings = toml::from_str(&content)
+            let mut settings: Settings = toml::from_str(&content)
                 .map_err(|e| FileshareError::Config(format!("Failed to parse config: {}", e)))?;
 
+            // Migrate old allowed_devices to paired_devices if needed
+            settings.migrate_allowed_devices();
+            
             // Validate settings before returning
             settings.validate_transfer_settings()?;
 

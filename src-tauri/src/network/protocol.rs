@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
-
+use crate::pairing::messages::{PairingMessage, PairingMessageType};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Message {
@@ -59,6 +59,9 @@ pub enum MessageType {
     Ping,
     Pong,
     Disconnect,
+    
+    // Pairing messages
+    Pairing(PairingMessage),
 }
 
 

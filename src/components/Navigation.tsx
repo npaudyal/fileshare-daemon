@@ -1,16 +1,18 @@
 import React from 'react';
 import { motion } from 'framer-motion';
-import { Monitor, Settings, Info } from 'lucide-react';
+import { Monitor, Settings, Info, Link2 } from 'lucide-react';
 
 interface NavigationProps {
-    activeTab: 'devices' | 'settings' | 'info';
-    onTabChange: (tab: 'devices' | 'settings' | 'info') => void;
+    activeTab: 'devices' | 'pairing' | 'settings' | 'info';
+    onTabChange: (tab: 'devices' | 'pairing' | 'settings' | 'info') => void;
     deviceCount: number;
+    unpairedDeviceCount?: number;
 }
 
-const Navigation: React.FC<NavigationProps> = ({ activeTab, onTabChange, deviceCount }) => {
+const Navigation: React.FC<NavigationProps> = ({ activeTab, onTabChange, deviceCount, unpairedDeviceCount }) => {
     const tabs = [
         { id: 'devices', label: 'Devices', icon: Monitor, count: deviceCount },
+        { id: 'pairing', label: 'Pairing', icon: Link2, count: unpairedDeviceCount },
         { id: 'settings', label: 'Settings', icon: Settings, count: undefined },
         { id: 'info', label: 'Info', icon: Info, count: undefined },
     ] as const;

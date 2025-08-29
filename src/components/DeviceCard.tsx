@@ -104,6 +104,35 @@ const DeviceCard: React.FC<DeviceCardProps> = ({
         }
     };
 
+    // Connection status indicator
+    const getConnectionStatus = () => {
+        if (device.is_connected) {
+            return (
+                <div className="flex items-center gap-1 text-green-500 text-xs">
+                    <div className="w-2 h-2 bg-green-500 rounded-full animate-pulse" />
+                    Connected
+                </div>
+            );
+        }
+        
+        const timeDiff = Math.floor(Date.now() / 1000) - device.last_seen;
+        if (timeDiff < 300) { // Within 5 minutes
+            return (
+                <div className="flex items-center gap-1 text-yellow-500 text-xs">
+                    <div className="w-2 h-2 bg-yellow-500 rounded-full" />
+                    Online
+                </div>
+            );
+        }
+        
+        return (
+            <div className="flex items-center gap-1 text-gray-500 text-xs">
+                <div className="w-2 h-2 bg-gray-500 rounded-full" />
+                Offline
+            </div>
+        );
+    };
+
     // Trust level indicator
     const getTrustLevelIndicator = (trustLevel: string) => {
         switch (trustLevel) {
@@ -350,10 +379,14 @@ const DeviceCard: React.FC<DeviceCardProps> = ({
                             </div>
                         )}
                         <div className="flex items-center space-x-2 mt-1">
-                            {device.platform && (
-                                <span className="text-xs text-gray-400">{device.platform}</span>
-                            )}
+                            {getConnectionStatus()}
                             <span className="text-xs text-gray-500">•</span>
+                            {device.platform && (
+                                <>
+                                    <span className="text-xs text-gray-400">{device.platform}</span>
+                                    <span className="text-xs text-gray-500">•</span>
+                                </>
+                            )}
                             <span className="text-xs text-gray-400">{device.address}</span>
                             <span className="text-xs text-gray-500">•</span>
                             <span className="text-xs text-gray-400">{getTimeAgo(device.last_seen)}</span>

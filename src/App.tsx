@@ -7,6 +7,7 @@ import { Power } from 'lucide-react';
 import Header from './components/Headers';
 import Navigation from './components/Navigation';
 import DevicesList from './components/DevicesList';
+import PairingTab from './components/PairingTab';
 import AdvancedSettings from './components/AdvancedSettings';
 import EnhancedInfo from './components/EnhancedInfo';
 import TransferProgress from './components/TransferProgress';
@@ -52,7 +53,7 @@ function App() {
     // State
     const [devices, setDevices] = useState<DeviceInfo[]>([]);
     const [settings, setSettings] = useState<AppSettings | null>(null);
-    const [activeTab, setActiveTab] = useState<'devices' | 'settings' | 'info'>('devices');
+    const [activeTab, setActiveTab] = useState<'devices' | 'pairing' | 'settings' | 'info'>('devices');
     const [isLoading, setIsLoading] = useState(true);
     const [lastUpdate, setLastUpdate] = useState<Date>(new Date());
     const [connectionStatus, setConnectionStatus] = useState(false);
@@ -114,8 +115,17 @@ function App() {
     }, []);
 
     // Device filtering and sorting
+    const getPairedDevices = () => {
+        return devices.filter(d => d.is_paired && !d.is_blocked);
+    };
+
+    const getUnpairedDevices = () => {
+        return devices.filter(d => !d.is_paired && !d.is_blocked);
+    };
+
     const getFilteredDevices = () => {
-        let filtered = devices;
+        // For the DEVICES tab, only show paired devices
+        let filtered = getPairedDevices();
 
         if (debouncedSearchTerm) {
             filtered = filtered.filter(device =>
@@ -126,16 +136,16 @@ function App() {
             );
         }
 
+        // Update filter logic for paired devices
         switch (filterType) {
-            case 'paired':
-                filtered = filtered.filter(d => d.is_paired);
-                break;
-            case 'blocked':
-                filtered = filtered.filter(d => d.is_blocked);
-                break;
             case 'connected':
                 filtered = filtered.filter(d => d.is_connected);
                 break;
+            case 'blocked':
+                // For the devices tab, don't show blocked devices anyway
+                filtered = [];
+                break;
+            // Remove 'paired' filter since all devices in this tab are paired
         }
 
         filtered.sort((a, b) => {
@@ -248,6 +258,12 @@ function App() {
         }
     };
 
+    // Pairing actions (simplified since PairingTab handles the actual pairing)
+    const startPairing = (_deviceId: string) => {
+        addToast('info', 'Pairing Started', 'Initiating pairing process...');
+        // The actual pairing is handled by PairingTab component
+    };
+
     // Other handlers
     const handleRefresh = async () => {
         setIsRefreshing(true);
@@ -333,6 +349,8 @@ function App() {
     }, []);
 
     const filteredDevices = getFilteredDevices();
+    const pairedDevices = getPairedDevices();
+    const unpairedDevices = getUnpairedDevices();
 
     return (
         <div className="app-container w-full h-full bg-gradient-to-br from-slate-900/95 to-slate-800/95 backdrop-blur-xl border border-white/10 shadow-2xl relative">
@@ -359,7 +377,8 @@ function App() {
                 <Navigation
                     activeTab={activeTab}
                     onTabChange={setActiveTab}
-                    deviceCount={filteredDevices.length}
+                    deviceCount={pairedDevices.length}
+                    unpairedDeviceCount={unpairedDevices.length}
                 />
             </SlideIn>
 
@@ -386,6 +405,17 @@ function App() {
                                 onBulkAction={handleBulkAction}
                                 onRefresh={handleRefresh}
                                 deviceActions={deviceActions}
+                            />
+                        </FadeIn>
+                    )}
+
+                    {activeTab === 'pairing' && (
+                        <FadeIn key="pairing">
+                            <PairingTab
+                                devices={unpairedDevices}
+                                onRefresh={handleRefresh}
+                                onStartPairing={startPairing}
+                                isRefreshing={isRefreshing}
                             />
                         </FadeIn>
                     )}

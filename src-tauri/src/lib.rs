@@ -4,6 +4,7 @@ pub mod error;
 pub mod hotkeys;
 pub mod http;
 pub mod network;
+pub mod pairing;
 pub mod quic;
 pub mod service;
 pub mod utils;
