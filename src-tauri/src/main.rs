@@ -1066,11 +1066,29 @@ async fn request_pairing(
         };
         drop(our_settings);
         
-        // For now, we'll send a basic pairing request
-        // In a full implementation, we'd generate ephemeral keys here
+        // Generate ephemeral key pair for secure pairing
+        let (ephemeral_private_key, ephemeral_public_key) = match fileshare_daemon::pairing::crypto::PairingCrypto::generate_ephemeral_keypair() {
+            Ok(keypair) => keypair,
+            Err(e) => {
+                error!("🚑 Failed to generate ephemeral keypair: {}", e);
+                return Err(format!("Cryptographic error: {}", e));
+            }
+        };
+        
+        // Store the public key in the session
+        if let Err(e) = daemon_ref.pairing_session_manager.update_session(session_id, |session| {
+            session.ephemeral_public_key = Some(ephemeral_public_key.clone());
+            Ok(())
+        }).await {
+            error!("🚑 Failed to update session with ephemeral keys: {}", e);
+            return Err(format!("Session error: {}", e));
+        }
+        
+        // For now, we need to handle the key exchange differently since ephemeral keys can't be stored
+        // The full implementation would require restructuring the pairing flow
         let pairing_request = PairingMessage::pairing_request(
             session_id,
-            vec![], // Empty ephemeral key for now - should be generated
+            ephemeral_public_key,
             our_device_info,
         );
         

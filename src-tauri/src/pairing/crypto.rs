@@ -35,6 +35,7 @@ impl PairingCrypto {
         Ok((private_key, public_key.as_ref().to_vec()))
     }
     
+    
     /// Generate long-term Ed25519 key pair for device authentication
     pub fn generate_device_keypair() -> Result<(Vec<u8>, Vec<u8>), PairingError> {
         let rng = SystemRandom::new();
