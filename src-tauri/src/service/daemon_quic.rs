@@ -238,54 +238,53 @@ impl FileshareDaemon {
                                 // Process valid pairing request with proper cryptographic flow
                                 info!("🔐 Processing pairing request from device: {} ({})", device_info.name, device_info.id);
                                 
-                                // Create acceptor session and generate ephemeral keys
-                                match pairing_session_manager.create_acceptor_session(device_info.clone()).await {
-                                    Ok(session_id) => {
-                                        info!("✅ Created acceptor session: {}", session_id);
-                                        
-                                        // Generate ephemeral key pair for ECDH
-                                        let (ephemeral_private_key, ephemeral_public_key) = 
-                                            match crate::pairing::crypto::PairingCrypto::generate_ephemeral_keypair() {
-                                                Ok(keypair) => keypair,
-                                                Err(e) => {
-                                                    error!("❌ Failed to generate ephemeral keypair: {}", e);
-                                                    let rejection = crate::pairing::messages::PairingMessage::pairing_rejected(
-                                                        pairing_message.session_id,
-                                                        "Cryptographic error".to_string()
-                                                    );
-                                                    let response = crate::network::protocol::Message::new(
-                                                        crate::network::protocol::MessageType::Pairing(rejection)
-                                                    );
-                                                    let mut pm = peer_manager.write().await;
-                                                    let _ = pm.send_message_to_peer(peer_id, response).await;
-                                                    continue;
-                                                }
-                                            };
-                                        
-                                        // Generate 6-digit PIN for challenge
-                                        let pin = crate::pairing::crypto::PairingCrypto::generate_pin();
-                                        
-                                        // Perform ECDH with peer's ephemeral key
-                                        let peer_ephemeral_key = match pairing_message.message_type.get_ephemeral_public_key() {
-                                            Some(key) => key,
-                                            None => {
-                                                error!("❌ No ephemeral public key in pairing request");
-                                                let rejection = crate::pairing::messages::PairingMessage::pairing_rejected(
-                                                    pairing_message.session_id,
-                                                    "Missing ephemeral key".to_string()
-                                                );
-                                                let response = crate::network::protocol::Message::new(
-                                                    crate::network::protocol::MessageType::Pairing(rejection)
-                                                );
-                                                let mut pm = peer_manager.write().await;
-                                                let _ = pm.send_message_to_peer(peer_id, response).await;
-                                                continue;
-                                            }
-                                        };
-                                        let shared_secret = match crate::pairing::crypto::PairingCrypto::derive_shared_secret(
-                                            ephemeral_private_key,
-                                            peer_ephemeral_key
-                                        ) {
+                                // Use the session ID from the PairingRequest - don't create a new one
+                                let session_id = pairing_message.session_id;
+                                info!("✅ Using session from PairingRequest: {}", session_id);
+                                
+                                // Generate ephemeral key pair for ECDH
+                                let (ephemeral_private_key, ephemeral_public_key) = 
+                                    match crate::pairing::crypto::PairingCrypto::generate_ephemeral_keypair() {
+                                        Ok(keypair) => keypair,
+                                        Err(e) => {
+                                            error!("❌ Failed to generate ephemeral keypair: {}", e);
+                                            let rejection = crate::pairing::messages::PairingMessage::pairing_rejected(
+                                                pairing_message.session_id,
+                                                "Cryptographic error".to_string()
+                                            );
+                                            let response = crate::network::protocol::Message::new(
+                                                crate::network::protocol::MessageType::Pairing(rejection)
+                                            );
+                                            let mut pm = peer_manager.write().await;
+                                            let _ = pm.send_message_to_peer(peer_id, response).await;
+                                            continue;
+                                        }
+                                    };
+                                
+                                // Generate 6-digit PIN for challenge
+                                let pin = crate::pairing::crypto::PairingCrypto::generate_pin();
+                                
+                                // Perform ECDH with peer's ephemeral key
+                                let peer_ephemeral_key = match pairing_message.message_type.get_ephemeral_public_key() {
+                                    Some(key) => key,
+                                    None => {
+                                        error!("❌ No ephemeral public key in pairing request");
+                                        let rejection = crate::pairing::messages::PairingMessage::pairing_rejected(
+                                            pairing_message.session_id,
+                                            "Missing ephemeral key".to_string()
+                                        );
+                                        let response = crate::network::protocol::Message::new(
+                                            crate::network::protocol::MessageType::Pairing(rejection)
+                                        );
+                                        let mut pm = peer_manager.write().await;
+                                        let _ = pm.send_message_to_peer(peer_id, response).await;
+                                        continue;
+                                    }
+                                };
+                                let shared_secret = match crate::pairing::crypto::PairingCrypto::derive_shared_secret(
+                                    ephemeral_private_key,
+                                    peer_ephemeral_key
+                                ) {
                                             Ok(secret) => secret,
                                             Err(e) => {
                                                 error!("❌ Failed to derive shared secret: {}", e);
@@ -371,20 +370,6 @@ impl FileshareDaemon {
                                         } else {
                                             info!("📨 Sent encrypted pairing challenge to device {} with PIN: {}", device_info.id, pin);
                                         }
-                                    },
-                                    Err(e) => {
-                                        error!("❌ Failed to create acceptor session: {}", e);
-                                        let rejection = crate::pairing::messages::PairingMessage::pairing_rejected(
-                                            pairing_message.session_id,
-                                            format!("Session error: {}", e)
-                                        );
-                                        let response = crate::network::protocol::Message::new(
-                                            crate::network::protocol::MessageType::Pairing(rejection)
-                                        );
-                                        let mut pm = peer_manager.write().await;
-                                        let _ = pm.send_message_to_peer(peer_id, response).await;
-                                    }
-                                }
                             }
                         },
                         
