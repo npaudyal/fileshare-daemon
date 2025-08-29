@@ -1016,12 +1016,30 @@ async fn request_pairing(
 ) -> Result<serde_json::Value, String> {
     info!("🤝 Requesting pairing with device: {}", device_id);
     
-    // Check if device exists in device_manager
-    let device_manager = state.device_manager.read().await;
-    if !device_manager.device_metadata.contains_key(&device_id) {
-        return Err("Device not found".to_string());
+    // Check if device exists in discovered devices
+    let device_uuid = uuid::Uuid::parse_str(&device_id)
+        .map_err(|_| "Invalid device ID format".to_string())?;
+    
+    // Get discovered devices from daemon to verify this device exists
+    let discovered_devices = if let Some(daemon_ref) = state.daemon_ref.lock().await.as_ref() {
+        daemon_ref.get_discovered_devices().await
+    } else {
+        return Err("Daemon not available".to_string());
+    };
+    
+    // Check if the device is in discovered devices
+    if !discovered_devices.iter().any(|d| d.id == device_uuid) {
+        return Err("Device not found in discovered devices".to_string());
     }
-    drop(device_manager);
+    
+    // Check if device is already paired or blocked
+    if state.pairing_storage.is_device_paired(device_uuid).await {
+        return Err("Device is already paired".to_string());
+    }
+    
+    if state.pairing_storage.is_device_blocked(device_uuid).await {
+        return Err("Device is blocked".to_string());
+    }
     
     // Create pairing session using the proper pairing module
     let (session_id, pin) = state.pairing_session_manager
