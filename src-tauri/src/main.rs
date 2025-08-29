@@ -1051,6 +1051,38 @@ async fn request_pairing(
     
     info!("🤝 Pairing session created for device {}: {} with PIN: {}", device_id, session_id, pin);
     
+    // Send pairing request message to the remote device
+    if let Some(daemon_ref) = state.daemon_ref.lock().await.as_ref() {
+        // Create device info for the pairing request
+        use fileshare_daemon::pairing::messages::{DeviceInfo as PairingDeviceInfo, PairingMessage};
+        
+        let our_settings = state.settings.read().await;
+        let our_device_info = PairingDeviceInfo {
+            id: our_settings.device.id,
+            name: our_settings.device.name.clone(),
+            device_type: "desktop".to_string(), // Default type
+            platform: std::env::consts::OS.to_string(),
+            version: env!("CARGO_PKG_VERSION").to_string(),
+        };
+        drop(our_settings);
+        
+        // For now, we'll send a basic pairing request
+        // In a full implementation, we'd generate ephemeral keys here
+        let pairing_request = PairingMessage::pairing_request(
+            session_id,
+            vec![], // Empty ephemeral key for now - should be generated
+            our_device_info,
+        );
+        
+        // Send the pairing message
+        if let Err(e) = daemon_ref.send_pairing_message(device_uuid, pairing_request).await {
+            error!("🚑 Failed to send pairing message to {}: {}", device_id, e);
+            // Don't fail the command, just log the error
+        } else {
+            info!("📨 Sent pairing request message to {}", device_id);
+        }
+    }
+    
     Ok(serde_json::json!({
         "session_id": session_id.to_string(),
         "pin": pin,

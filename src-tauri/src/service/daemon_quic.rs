@@ -60,6 +60,16 @@ impl FileshareDaemon {
         pm.get_all_discovered_devices().await
     }
     
+    // Method to send pairing messages (for UI access)
+    pub async fn send_pairing_message(&self, device_id: uuid::Uuid, pairing_message: crate::pairing::messages::PairingMessage) -> crate::Result<()> {
+        let message = crate::network::protocol::Message::new(
+            crate::network::protocol::MessageType::Pairing(pairing_message)
+        );
+        
+        let mut pm = self.peer_manager.write().await;
+        pm.send_message_to_peer(device_id, message).await
+    }
+    
     // Getter for settings (for UI access)
     pub fn get_settings(&self) -> &Arc<Settings> {
         &self.settings
