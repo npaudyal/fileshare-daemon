@@ -1066,8 +1066,8 @@ async fn request_pairing(
         };
         drop(our_settings);
         
-        // Generate ephemeral key pair for secure pairing
-        let (ephemeral_private_key, ephemeral_public_key) = match fileshare_daemon::pairing::crypto::PairingCrypto::generate_ephemeral_keypair() {
+        // Generate storable ephemeral key pair for secure pairing
+        let (ephemeral_private_key_bytes, ephemeral_public_key) = match fileshare_daemon::pairing::crypto::PairingCrypto::generate_storable_keypair() {
             Ok(keypair) => keypair,
             Err(e) => {
                 error!("🚑 Failed to generate ephemeral keypair: {}", e);
@@ -1075,8 +1075,9 @@ async fn request_pairing(
             }
         };
         
-        // Store the public key in the session
+        // Store both keys in the session
         if let Err(e) = daemon_ref.pairing_session_manager.update_session(session_id, |session| {
+            session.ephemeral_private_key = Some(ephemeral_private_key_bytes);
             session.ephemeral_public_key = Some(ephemeral_public_key.clone());
             Ok(())
         }).await {

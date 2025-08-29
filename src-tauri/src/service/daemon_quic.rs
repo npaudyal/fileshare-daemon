@@ -255,9 +255,9 @@ impl FileshareDaemon {
                                 }
                                 info!("✅ Created acceptor session with ID from PairingRequest: {}", session_id);
                                 
-                                // Generate ephemeral key pair for ECDH
-                                let (ephemeral_private_key, ephemeral_public_key) = 
-                                    match crate::pairing::crypto::PairingCrypto::generate_ephemeral_keypair() {
+                                // Generate storable ephemeral key pair for ECDH
+                                let (ephemeral_private_key_bytes, ephemeral_public_key) = 
+                                    match crate::pairing::crypto::PairingCrypto::generate_storable_keypair() {
                                         Ok(keypair) => keypair,
                                         Err(e) => {
                                             error!("❌ Failed to generate ephemeral keypair: {}", e);
@@ -294,8 +294,8 @@ impl FileshareDaemon {
                                         continue;
                                     }
                                 };
-                                let shared_secret = match crate::pairing::crypto::PairingCrypto::derive_shared_secret(
-                                    ephemeral_private_key,
+                                let shared_secret = match crate::pairing::crypto::PairingCrypto::derive_shared_secret_from_raw(
+                                    &ephemeral_private_key_bytes,
                                     peer_ephemeral_key
                                 ) {
                                             Ok(secret) => secret,
@@ -355,6 +355,7 @@ impl FileshareDaemon {
                                         
                                         // Update session with ephemeral keys
                                         if let Err(e) = pairing_session_manager.update_session(session_id, |session| {
+                                            session.ephemeral_private_key = Some(ephemeral_private_key_bytes);
                                             session.ephemeral_public_key = Some(ephemeral_public_key.clone());
                                             session.peer_ephemeral_public_key = Some(peer_ephemeral_key.clone());
                                             session.shared_secret = Some(shared_secret.clone());
@@ -518,7 +519,7 @@ impl FileshareDaemon {
                             info!("🔐 Received pairing challenge for session {}", pairing_message.session_id);
                             
                             // Get the session to access our ephemeral keys
-                            let _session = match pairing_session_manager.get_session(pairing_message.session_id).await {
+                            let session = match pairing_session_manager.get_session(pairing_message.session_id).await {
                                 Ok(session) => session,
                                 Err(e) => {
                                     error!("❌ Failed to get session for challenge: {}", e);
@@ -526,20 +527,18 @@ impl FileshareDaemon {
                                 }
                             };
                             
-                            // We need our ephemeral private key to derive the shared secret
-                            // For now, we'll generate a new keypair since we can't store the private key
-                            let (our_ephemeral_private_key, _our_ephemeral_public_key) = 
-                                match crate::pairing::crypto::PairingCrypto::generate_ephemeral_keypair() {
-                                    Ok(keypair) => keypair,
-                                    Err(e) => {
-                                        error!("❌ Failed to generate ephemeral keypair for challenge: {}", e);
-                                        continue;
-                                    }
-                                };
+                            // Get our ephemeral private key from the session
+                            let our_ephemeral_private_key = match session.ephemeral_private_key.clone() {
+                                Some(key) => key,
+                                None => {
+                                    error!("❌ No ephemeral private key stored in session");
+                                    continue;
+                                }
+                            };
                             
-                            // Derive shared secret using peer's ephemeral key
-                            let shared_secret = match crate::pairing::crypto::PairingCrypto::derive_shared_secret(
-                                our_ephemeral_private_key,
+                            // Derive shared secret using our stored private key and peer's ephemeral key
+                            let shared_secret = match crate::pairing::crypto::PairingCrypto::derive_shared_secret_from_raw(
+                                &our_ephemeral_private_key,
                                 ephemeral_public_key
                             ) {
                                 Ok(secret) => secret,

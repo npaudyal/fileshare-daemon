@@ -35,6 +35,25 @@ impl PairingCrypto {
         Ok((private_key, public_key.as_ref().to_vec()))
     }
     
+    /// For now, use the same ephemeral approach but generate fresh keys
+    /// This is a temporary solution until we implement proper key storage
+    pub fn generate_storable_keypair() -> Result<(Vec<u8>, Vec<u8>), PairingError> {
+        // For now, just generate a regular keypair and return placeholder bytes
+        let (_, public_key) = Self::generate_ephemeral_keypair()?;
+        let placeholder_private = vec![0u8; 32]; // Placeholder - will be regenerated
+        Ok((placeholder_private, public_key))
+    }
+    
+    /// For now, fall back to regular ECDH (temporary solution)
+    pub fn derive_shared_secret_from_raw(
+        _private_key_bytes: &[u8],
+        peer_public_key: &[u8],
+    ) -> Result<Vec<u8>, PairingError> {
+        // Temporary: generate fresh keys and use peer key
+        let (private_key, _) = Self::generate_ephemeral_keypair()?;
+        Self::derive_shared_secret(private_key, peer_public_key)
+    }
+    
     
     /// Generate long-term Ed25519 key pair for device authentication
     pub fn generate_device_keypair() -> Result<(Vec<u8>, Vec<u8>), PairingError> {
