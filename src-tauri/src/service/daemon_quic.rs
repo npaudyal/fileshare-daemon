@@ -388,7 +388,7 @@ impl FileshareDaemon {
                             }
                         },
                         
-                        crate::pairing::messages::PairingMessageType::PairingResponse { pin, encrypted_response, device_public_key } => {
+                        crate::pairing::messages::PairingMessageType::PairingResponse { pin, encrypted_response: _, device_public_key: _ } => {
                             info!("🔑 Received pairing response with PIN for session {}", pairing_message.session_id);
                             
                             match pairing_session_manager.verify_session_pin(pairing_message.session_id, pin).await {
@@ -520,7 +520,7 @@ impl FileshareDaemon {
                             info!("🔐 Received pairing challenge for session {}", pairing_message.session_id);
                             
                             // Get the session to access our ephemeral keys
-                            let session = match pairing_session_manager.get_session(pairing_message.session_id).await {
+                            let _session = match pairing_session_manager.get_session(pairing_message.session_id).await {
                                 Ok(session) => session,
                                 Err(e) => {
                                     error!("❌ Failed to get session for challenge: {}", e);
@@ -530,7 +530,7 @@ impl FileshareDaemon {
                             
                             // We need our ephemeral private key to derive the shared secret
                             // For now, we'll generate a new keypair since we can't store the private key
-                            let (our_ephemeral_private_key, our_ephemeral_public_key) = 
+                            let (our_ephemeral_private_key, _our_ephemeral_public_key) = 
                                 match crate::pairing::crypto::PairingCrypto::generate_ephemeral_keypair() {
                                     Ok(keypair) => keypair,
                                     Err(e) => {
@@ -590,7 +590,7 @@ impl FileshareDaemon {
                             // In a complete implementation, this would show a PIN confirmation dialog
                             
                             // Generate device keypair for authentication
-                            let (device_private_key, device_public_key) = match crate::pairing::crypto::PairingCrypto::generate_device_keypair() {
+                            let (_device_private_key, device_public_key) = match crate::pairing::crypto::PairingCrypto::generate_device_keypair() {
                                 Ok(keypair) => keypair,
                                 Err(e) => {
                                     error!("❌ Failed to generate device keypair: {}", e);
@@ -624,7 +624,7 @@ impl FileshareDaemon {
                             // Send pairing response with the PIN
                             let response_message = crate::pairing::messages::PairingMessage::pairing_response(
                                 pairing_message.session_id,
-                                decrypted_pin,
+                                decrypted_pin.clone(),
                                 encrypted_response,
                                 device_public_key,
                             );
