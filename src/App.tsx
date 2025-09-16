@@ -62,16 +62,12 @@ function App() {
     // Device management state
     const [selectedDevices, setSelectedDevices] = useState<Set<string>>(new Set());
     const [showBulkActions, setShowBulkActions] = useState(false);
-    const [filterType, setFilterType] = useState<'all' | 'paired' | 'blocked' | 'connected'>('all');
     const [searchTerm, setSearchTerm] = useState('');
     const [sortBy, setSortBy] = useState<'name' | 'last_seen' | 'trust_level'>('name');
     const [favoriteDevices, setFavoriteDevices] = useState<Set<string>>(new Set());
     const [showTransferProgress, setShowTransferProgress] = useState(false);
 
     // Wrapper functions for type conversion
-    const handleFilterChange = (filter: string) => {
-        setFilterType(filter as 'all' | 'paired' | 'blocked' | 'connected');
-    };
 
     const handleSortChange = (sort: string) => {
         setSortBy(sort as 'name' | 'last_seen' | 'trust_level');
@@ -139,16 +135,6 @@ function App() {
             );
         }
 
-        // Apply additional filters for paired devices
-        switch (filterType) {
-            case 'blocked':
-                filtered = filtered.filter(d => d.is_blocked);
-                break;
-            case 'connected':
-                filtered = filtered.filter(d => d.is_connected);
-                break;
-            // 'paired' filter is redundant here since we already filter for paired devices
-        }
 
         filtered.sort((a, b) => {
             const aFav = favoriteDevices.has(a.id);
@@ -186,15 +172,6 @@ function App() {
                 addToast('success', 'Device Paired', 'Device paired successfully');
             } catch (error) {
                 addToast('error', 'Pairing Failed', `Failed to pair device: ${error}`);
-            }
-        },
-        onUnpair: async (deviceId: string) => {
-            try {
-                await invoke('unpair_device', { deviceId });
-                await loadDevices();
-                addToast('info', 'Device Unpaired', 'Device unpaired successfully');
-            } catch (error) {
-                addToast('error', 'Unpair Failed', `Failed to unpair device: ${error}`);
             }
         },
         onBlock: async (deviceId: string) => {
@@ -244,24 +221,6 @@ function App() {
             }
             setFavoriteDevices(newFavorites);
             localStorage.setItem('favoriteDevices', JSON.stringify(Array.from(newFavorites)));
-        },
-        onConnect: async (deviceId: string) => {
-            try {
-                await invoke('connect_to_peer', { deviceId });
-                await loadDevices();
-                addToast('success', 'Connected', 'Connected to device');
-            } catch (error) {
-                addToast('error', 'Connection Failed', `Failed to connect: ${error}`);
-            }
-        },
-        onDisconnect: async (deviceId: string) => {
-            try {
-                await invoke('disconnect_from_peer', { deviceId });
-                await loadDevices();
-                addToast('info', 'Disconnected', 'Disconnected from device');
-            } catch (error) {
-                addToast('error', 'Disconnect Failed', `Failed to disconnect: ${error}`);
-            }
         }
     };
 
@@ -396,12 +355,10 @@ function App() {
                                 filteredDevices={pairedDevices}
                                 isLoading={isLoading}
                                 searchTerm={searchTerm}
-                                filterType={filterType}
                                 selectedDevices={selectedDevices}
                                 showBulkActions={showBulkActions}
                                 favoriteDevices={favoriteDevices}
                                 onSearchChange={setSearchTerm}
-                                onFilterChange={handleFilterChange}
                                 onSortChange={handleSortChange}
                                 onDeviceSelect={handleDeviceSelect}
                                 onSelectAll={handleSelectAll}

@@ -4,11 +4,9 @@ import { Search, ChevronDown } from 'lucide-react';
 
 interface DeviceControlsProps {
     searchTerm: string;
-    filterType: string;
     selectedDevices: Set<string>;
     showBulkActions: boolean;
     onSearchChange: (term: string) => void;
-    onFilterChange: (filter: string) => void;
     onSortChange: (sort: string) => void;
     onSelectAll: () => void;
     onClearSelection: () => void;
@@ -17,11 +15,9 @@ interface DeviceControlsProps {
 
 const DeviceControls: React.FC<DeviceControlsProps> = ({
     searchTerm,
-    filterType,
     selectedDevices,
     showBulkActions,
     onSearchChange,
-    onFilterChange,
     onSortChange,
     onClearSelection,
     onBulkAction
@@ -45,21 +41,7 @@ const DeviceControls: React.FC<DeviceControlsProps> = ({
                     />
                 </div>
 
-                <div className="relative">
-                    <select
-                        value={filterType}
-                        onChange={(e) => onFilterChange(e.target.value)}
-                        className="bg-black/20 text-white text-sm px-3 py-2 rounded border border-white/20 focus:outline-none focus:border-blue-400 appearance-none pr-8"
-                    >
-                        <option value="all">All Devices</option>
-                        <option value="paired">Paired</option>
-                        <option value="connected">Connected</option>
-                        <option value="blocked">Blocked</option>
-                    </select>
-                    <ChevronDown className="w-4 h-4 absolute right-2 top-1/2 transform -translate-y-1/2 text-gray-400 pointer-events-none" />
-                </div>
-
-                <div className="relative">
+<div className="relative">
                     <select
                         onChange={(e) => onSortChange(e.target.value)}
                         className="bg-black/20 text-white text-sm px-3 py-2 rounded border border-white/20 focus:outline-none focus:border-blue-400 appearance-none pr-8"
@@ -92,14 +74,6 @@ const DeviceControls: React.FC<DeviceControlsProps> = ({
                                 className="text-xs px-3 py-1 bg-blue-500/20 text-blue-300 rounded hover:bg-blue-500/30 transition-colors"
                             >
                                 Pair All
-                            </motion.button>
-                            <motion.button
-                                whileHover={{ scale: 1.05 }}
-                                whileTap={{ scale: 0.95 }}
-                                onClick={() => onBulkAction('unpair')}
-                                className="text-xs px-3 py-1 bg-yellow-500/20 text-yellow-300 rounded hover:bg-yellow-500/30 transition-colors"
-                            >
-                                Unpair All
                             </motion.button>
                             <motion.button
                                 whileHover={{ scale: 1.05 }}

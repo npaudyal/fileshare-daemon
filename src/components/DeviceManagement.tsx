@@ -13,9 +13,6 @@ interface DeviceManagementProps {
     deviceName: string;
     isFavorite: boolean;
     onToggleFavorite: (deviceId: string) => void;
-    onConnectDevice: (deviceId: string) => void;
-    onDisconnectDevice: (deviceId: string) => void;
-    isConnected: boolean;
     stats?: DeviceStats;
 }
 
@@ -23,9 +20,6 @@ const DeviceManagement: React.FC<DeviceManagementProps> = ({
     deviceId,
     isFavorite,
     onToggleFavorite,
-    onConnectDevice,
-    onDisconnectDevice,
-    isConnected,
     stats
 }) => {
     const [showStats, setShowStats] = useState(false);
@@ -65,24 +59,6 @@ const DeviceManagement: React.FC<DeviceManagementProps> = ({
                     >
                         <Activity className="w-4 h-4" />
                     </button>
-                </div>
-
-                <div className="flex items-center space-x-2">
-                    {isConnected ? (
-                        <button
-                            onClick={() => onDisconnectDevice(deviceId)}
-                            className="px-3 py-1 bg-red-500/20 text-red-300 rounded text-xs hover:bg-red-500/30 transition-colors"
-                        >
-                            Disconnect
-                        </button>
-                    ) : (
-                        <button
-                            onClick={() => onConnectDevice(deviceId)}
-                            className="px-3 py-1 bg-green-500/20 text-green-300 rounded text-xs hover:bg-green-500/30 transition-colors"
-                        >
-                            Connect
-                        </button>
-                    )}
                 </div>
             </div>
 
