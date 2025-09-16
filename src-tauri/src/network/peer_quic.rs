@@ -1163,13 +1163,31 @@ impl PeerManager {
                     };
                     match verification_result {
                         Ok(()) => {
-                            // Send completion acknowledgment
-                            let complete = Message::new(MessageType::PairingComplete {
-                                session_id: *session_id,
-                                signed_acknowledgment: vec![], // TODO: Sign acknowledgment
-                            });
-                            self.send_message_to_peer(peer_id, complete).await?;
-                            info!("✅ Pairing completed with device {}", resolved_peer_id);
+                            // Complete the pairing in our manager first
+                            let pairing_result = {
+                                let mut pm = pairing_manager.write().await;
+                                pm.complete_pairing(resolved_peer_id).await
+                            };
+
+                            match pairing_result {
+                                Ok(_) => {
+                                    // Send completion acknowledgment
+                                    let complete = Message::new(MessageType::PairingComplete {
+                                        session_id: *session_id,
+                                        signed_acknowledgment: vec![], // TODO: Sign acknowledgment
+                                    });
+                                    self.send_message_to_peer(peer_id, complete).await?;
+                                    info!("✅ Pairing completed with device {}", resolved_peer_id);
+                                }
+                                Err(e) => {
+                                    error!("❌ Failed to complete pairing: {}", e);
+                                    let reject = Message::new(MessageType::PairingReject {
+                                        session_id: *session_id,
+                                        reason: format!("Failed to complete pairing: {}", e),
+                                    });
+                                    self.send_message_to_peer(peer_id, reject).await?;
+                                }
+                            }
                         }
                         Err(e) => {
                             error!("❌ Failed to verify pairing confirmation: {}", e);
