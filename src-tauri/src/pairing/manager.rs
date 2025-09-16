@@ -245,8 +245,10 @@ impl PairingManager {
                 .get_mut(&peer_device_id)
                 .ok_or_else(|| FileshareError::Pairing("Session not found".to_string()))?;
 
-            if session.state != PairingState::Confirmed {
-                return Err(FileshareError::Pairing("Session not confirmed".to_string()));
+            // Accept both AwaitingConfirm (device that confirmed first) and Confirmed (device that received confirmation)
+            // This makes pairing work regardless of which device confirms first
+            if session.state != PairingState::Confirmed && session.state != PairingState::AwaitingConfirm {
+                return Err(FileshareError::Pairing(format!("Invalid session state for completion: {:?}", session.state)));
             }
 
             session.complete();
@@ -287,57 +289,6 @@ impl PairingManager {
         Ok(paired_device)
     }
 
-    /// Complete pairing as responder (accepts AwaitingConfirm state)
-    pub async fn complete_pairing_as_responder(&self, peer_device_id: Uuid) -> Result<PairedDevice> {
-        let session = {
-            let mut sessions = self.active_sessions.write().await;
-
-            let session = sessions
-                .get_mut(&peer_device_id)
-                .ok_or_else(|| FileshareError::Pairing("Session not found".to_string()))?;
-
-            // For responders, we accept AwaitingConfirm state (since they confirmed but are waiting for the initiator)
-            if session.state != PairingState::AwaitingConfirm && session.state != PairingState::Confirmed {
-                return Err(FileshareError::Pairing(format!("Invalid session state for responder: {:?}", session.state)));
-            }
-
-            session.complete();
-            session.clone()
-        };
-
-        // Create paired device entry
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_secs();
-
-        let paired_device = PairedDevice {
-            device_id: peer_device_id,
-            name: session.peer_name.clone(),
-            public_key: session.peer_public_key.clone(),
-            paired_at: now,
-            last_seen: now,
-            trust_level: TrustLevel::Verified,
-            auto_accept_files: false,
-        };
-
-        // Store paired device
-        {
-            let mut paired = self.paired_devices.write().await;
-            paired.insert(peer_device_id, paired_device.clone());
-        }
-
-        info!("Pairing completed successfully as responder with: {} ({})",
-              session.peer_name, peer_device_id);
-
-        // Remove session
-        {
-            let mut sessions = self.active_sessions.write().await;
-            sessions.remove(&peer_device_id);
-        }
-
-        Ok(paired_device)
-    }
 
     /// Reject pairing
     pub async fn reject_pairing(&self, session_id: Uuid, reason: String) -> Result<()> {
