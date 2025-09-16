@@ -19,10 +19,10 @@ pub struct PairingSession {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub enum PairingState {
-    Initiated,        // Request sent, waiting for challenge
-    Challenging,      // PIN displayed, waiting for user confirmation  
-    AwaitingConfirm,  // User confirmed, waiting for peer
-    Confirmed,        // Both confirmed, completing pairing
+    Initiated,        // Initiator: Request sent, waiting for challenge
+    DisplayingPin,    // Initiator: Displaying PIN, waiting for target confirmation
+    AwaitingApproval, // Target: Received request, showing PIN for user to approve/reject
+    Confirmed,        // Target confirmed, completing pairing
     Completed,        // Successfully paired
     Failed(String),   // Pairing failed
     Timeout,          // Session timed out
@@ -50,7 +50,7 @@ impl PairingSession {
             state: if initiated_by_us {
                 PairingState::Initiated
             } else {
-                PairingState::Challenging
+                PairingState::AwaitingApproval
             },
             initiated_by_us,
             created_at: now,
@@ -114,21 +114,41 @@ impl PairingSession {
 
     /// Check if session is waiting for user action
     pub fn is_waiting_for_user(&self) -> bool {
-        matches!(self.state, PairingState::Challenging)
+        matches!(self.state, PairingState::AwaitingApproval | PairingState::DisplayingPin)
     }
 
-    /// Check if session can be confirmed
+    /// Check if this is an initiator displaying PIN (no user action needed)
+    pub fn is_displaying_pin(&self) -> bool {
+        matches!(self.state, PairingState::DisplayingPin)
+    }
+
+    /// Check if this is a target waiting for approval
+    pub fn is_awaiting_approval(&self) -> bool {
+        matches!(self.state, PairingState::AwaitingApproval)
+    }
+
+    /// Check if session can be confirmed (only targets can confirm)
     pub fn can_confirm(&self) -> bool {
-        matches!(self.state, PairingState::Challenging) && !self.is_expired()
+        matches!(self.state, PairingState::AwaitingApproval) && !self.is_expired()
     }
 
-    /// Mark session as confirmed by user
+    /// Mark session as confirmed by target user
     pub fn confirm(&mut self) -> Result<(), String> {
         if !self.can_confirm() {
-            return Err("Cannot confirm session in current state".to_string());
+            return Err(format!("Cannot confirm session in current state: {:?}", self.state));
         }
 
-        self.state = PairingState::AwaitingConfirm;
+        self.state = PairingState::Confirmed;
+        Ok(())
+    }
+
+    /// Update initiator state to displaying PIN after receiving challenge response
+    pub fn start_displaying_pin(&mut self) -> Result<(), String> {
+        if self.state != PairingState::Initiated {
+            return Err(format!("Cannot start displaying PIN from state: {:?}", self.state));
+        }
+
+        self.state = PairingState::DisplayingPin;
         Ok(())
     }
 
@@ -152,9 +172,9 @@ impl PairingSession {
     /// Get a display-friendly status message
     pub fn status_message(&self) -> String {
         match &self.state {
-            PairingState::Initiated => "Waiting for response...".to_string(),
-            PairingState::Challenging => format!("Verify PIN: {}", self.pin),
-            PairingState::AwaitingConfirm => "Waiting for other device...".to_string(),
+            PairingState::Initiated => "Sending pairing request...".to_string(),
+            PairingState::DisplayingPin => format!("Show this PIN to the other device: {}", self.pin),
+            PairingState::AwaitingApproval => format!("Accept pairing from {}? PIN: {}", self.peer_name, self.pin),
             PairingState::Confirmed => "Completing pairing...".to_string(),
             PairingState::Completed => "Successfully paired!".to_string(),
             PairingState::Failed(reason) => format!("Failed: {}", reason),
@@ -192,11 +212,11 @@ mod tests {
             false,
         );
 
-        assert_eq!(session.state, PairingState::Challenging);
+        assert_eq!(session.state, PairingState::AwaitingApproval);
         assert!(session.can_confirm());
 
         session.confirm().unwrap();
-        assert_eq!(session.state, PairingState::AwaitingConfirm);
+        assert_eq!(session.state, PairingState::Confirmed);
         assert!(!session.can_confirm());
 
         session.complete();

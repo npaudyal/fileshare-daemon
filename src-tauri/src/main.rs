@@ -497,8 +497,7 @@ async fn confirm_pairing(
                     peer_manager.send_message_to_peer(session.peer_device_id, confirm).await
                         .map_err(|e| format!("Failed to send pairing confirmation: {}", e))?;
 
-                    // Note: Pairing completion will be handled when we receive PairingComplete message
-                    info!("✅ Pairing confirmation sent, waiting for completion acknowledgment from peer");
+                    info!("✅ Pairing confirmation sent by target device, waiting for completion acknowledgment from initiator");
                 }
 
                 Ok(())

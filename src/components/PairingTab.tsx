@@ -33,7 +33,7 @@ interface PairingSession {
     peer_device_id: string;
     peer_name: string;
     pin: string;
-    state: 'Initiated' | 'Challenging' | 'AwaitingConfirm' | 'Confirmed' | 'Completed' | { Failed: string } | 'Timeout';
+    state: 'Initiated' | 'DisplayingPin' | 'AwaitingApproval' | 'Confirmed' | 'Completed' | { Failed: string } | 'Timeout';
     initiated_by_us: boolean;
     remaining_seconds: number;
 }
@@ -196,20 +196,20 @@ const PairingTab: React.FC<PairingTabProps> = ({ onRefresh }) => {
             case 'Initiated':
                 return {
                     icon: <Clock className="w-5 h-5 text-blue-500" />,
-                    text: 'Waiting for response...',
+                    text: 'Sending pairing request...',
                     color: 'text-blue-500'
                 };
-            case 'Challenging':
+            case 'DisplayingPin':
                 return {
                     icon: <Shield className="w-5 h-5 text-yellow-500" />,
-                    text: `Verify PIN: ${session.pin}`,
+                    text: `Show this PIN: ${session.pin}`,
                     color: 'text-yellow-500'
                 };
-            case 'AwaitingConfirm':
+            case 'AwaitingApproval':
                 return {
-                    icon: <Clock className="w-5 h-5 text-blue-500" />,
-                    text: 'Waiting for other device...',
-                    color: 'text-blue-500'
+                    icon: <Shield className="w-5 h-5 text-orange-500" />,
+                    text: `Accept from ${session.peerName}? PIN: ${session.pin}`,
+                    color: 'text-orange-500'
                 };
             case 'Confirmed':
                 return {
@@ -360,13 +360,14 @@ const PairingTab: React.FC<PairingTabProps> = ({ onRefresh }) => {
                                                 </span>
                                             )}
                                             
-                                            {session.state === 'Challenging' && (
+                                            {/* Only targets (AwaitingApproval) can confirm/reject */}
+                                            {session.state === 'AwaitingApproval' && (
                                                 <div className="flex gap-2">
                                                     <button
                                                         onClick={() => handleConfirmPairing(session.session_id)}
                                                         className="px-3 py-1 bg-green-500 text-white rounded text-sm hover:bg-green-600 transition-colors"
                                                     >
-                                                        Confirm
+                                                        Accept
                                                     </button>
                                                     <button
                                                         onClick={() => handleRejectPairing(session.session_id)}
@@ -374,6 +375,18 @@ const PairingTab: React.FC<PairingTabProps> = ({ onRefresh }) => {
                                                     >
                                                         Reject
                                                     </button>
+                                                </div>
+                                            )}
+
+                                            {/* Initiators display PIN but can't confirm */}
+                                            {session.state === 'DisplayingPin' && (
+                                                <div className="text-center p-4 bg-yellow-50 rounded-lg border border-yellow-200">
+                                                    <div className="text-2xl font-mono font-bold text-yellow-800 mb-2">
+                                                        {session.pin}
+                                                    </div>
+                                                    <div className="text-sm text-yellow-600">
+                                                        Show this PIN to {session.peer_name}
+                                                    </div>
                                                 </div>
                                             )}
                                         </div>

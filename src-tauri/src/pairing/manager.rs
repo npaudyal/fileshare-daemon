@@ -73,13 +73,16 @@ impl PairingManager {
         self.device_keypair.public_key_bytes()
     }
 
-    /// Update session state for a device
+    /// Update session state for a device when receiving challenge (initiator moves to DisplayingPin)
     pub async fn update_session_for_challenge(&self, device_id: Uuid, public_key: Vec<u8>, pin: String) -> Result<()> {
         let mut sessions = self.active_sessions.write().await;
         if let Some(session) = sessions.get_mut(&device_id) {
             session.peer_public_key = public_key;
             session.pin = pin;
-            session.update_state(crate::pairing::PairingState::Challenging);
+            // Initiator starts displaying PIN after receiving challenge
+            if let Err(e) = session.start_displaying_pin() {
+                return Err(FileshareError::Pairing(format!("Failed to update session state: {}", e)));
+            }
             Ok(())
         } else {
             Err(FileshareError::Pairing("Session not found".to_string()))
@@ -189,7 +192,12 @@ impl PairingManager {
             .get_mut(&peer_device_id)
             .ok_or_else(|| FileshareError::Pairing("Session not found".to_string()))?;
 
-        // Confirm the session
+        // Only targets (devices that didn't initiate) can confirm
+        if session.initiated_by_us {
+            return Err(FileshareError::Pairing("Initiators cannot confirm pairing - only targets can confirm".to_string()));
+        }
+
+        // Confirm the session (moves from AwaitingApproval to Confirmed)
         session.confirm()
             .map_err(|e| FileshareError::Pairing(e))?;
 
@@ -245,9 +253,8 @@ impl PairingManager {
                 .get_mut(&peer_device_id)
                 .ok_or_else(|| FileshareError::Pairing("Session not found".to_string()))?;
 
-            // Accept both AwaitingConfirm (device that confirmed first) and Confirmed (device that received confirmation)
-            // This makes pairing work regardless of which device confirms first
-            if session.state != PairingState::Confirmed && session.state != PairingState::AwaitingConfirm {
+            // Only Confirmed state is valid for completion (target confirmed pairing)
+            if session.state != PairingState::Confirmed {
                 return Err(FileshareError::Pairing(format!("Invalid session state for completion: {:?}", session.state)));
             }
 
