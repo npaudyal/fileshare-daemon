@@ -1210,8 +1210,11 @@ impl PeerManager {
                 info!("🎉 Pairing complete acknowledgment for session {}", session_id);
 
                 if let Some(pairing_manager) = &self.pairing_manager {
-                    let pm = pairing_manager.read().await;
-                    match pm.complete_pairing(resolved_peer_id).await {
+                    let pairing_result = {
+                        let pm = pairing_manager.write().await;
+                        pm.complete_pairing(resolved_peer_id).await
+                    };
+                    match pairing_result {
                         Ok(_) => {
                             info!("✅ Successfully completed pairing with {}", resolved_peer_id);
 
