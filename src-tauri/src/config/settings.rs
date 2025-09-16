@@ -1,4 +1,5 @@
 use crate::{FileshareError, Result};
+use crate::pairing::PairedDevice;
 use directories::ProjectDirs;
 use serde::{Deserialize, Serialize};
 use std::fs;
@@ -46,7 +47,13 @@ pub struct TransferSettings {
 pub struct SecuritySettings {
     pub require_pairing: bool,
     pub encryption_enabled: bool,
-    pub allowed_devices: Vec<Uuid>,
+    pub paired_devices: Vec<PairedDevice>,
+    pub device_private_key: Option<String>,  // Base64 encoded
+    pub device_public_key: Option<String>,   // Base64 encoded
+    pub auto_accept_from_paired: bool,
+    pub pairing_timeout_seconds: u64,
+    #[serde(default)]
+    pub allowed_devices: Vec<Uuid>,  // Legacy field for compatibility
 }
 
 impl Default for Settings {
@@ -75,8 +82,13 @@ impl Default for Settings {
                 resume_enabled: true,
             },
             security: SecuritySettings {
-                require_pairing: false,
+                require_pairing: true,  // Enable pairing by default
                 encryption_enabled: true,
+                paired_devices: Vec::new(),
+                device_private_key: None,
+                device_public_key: None,
+                auto_accept_from_paired: false,
+                pairing_timeout_seconds: 300, // 5 minutes
                 allowed_devices: Vec::new(),
             },
         }
@@ -170,5 +182,13 @@ impl Settings {
 
     pub fn get_bind_address(&self) -> SocketAddr {
         format!("0.0.0.0:{}", self.network.port).parse().unwrap()
+    }
+
+    pub fn get_keypair_path() -> Result<PathBuf> {
+        let proj_dirs = ProjectDirs::from("com", "fileshare", "daemon").ok_or_else(|| {
+            FileshareError::Config("Failed to get project directories".to_string())
+        })?;
+
+        Ok(proj_dirs.config_dir().join("device.key"))
     }
 }

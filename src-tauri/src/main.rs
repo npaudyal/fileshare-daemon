@@ -371,6 +371,247 @@ async fn import_settings(_state: tauri::State<'_, AppState>) -> Result<AppSettin
     Err("Import not implemented yet".to_string())
 }
 
+// Pairing Commands
+
+#[tauri::command]
+async fn initiate_pairing(
+    device_id: String,
+    state: tauri::State<'_, AppState>,
+) -> Result<serde_json::Value, String> {
+    info!("🔐 Initiating pairing with device: {}", device_id);
+
+    let device_uuid = uuid::Uuid::parse_str(&device_id)
+        .map_err(|e| format!("Invalid device ID: {}", e))?;
+
+    if let Some(daemon_ref) = state.daemon_ref.lock().await.as_ref() {
+        // Find device info from discovered devices
+        let discovered = daemon_ref.get_discovered_devices().await;
+        let device_info = discovered
+            .iter()
+            .find(|d| d.id == device_uuid)
+            .ok_or_else(|| format!("Device {} not found in discovered devices", device_id))?;
+
+        let device_name = device_info.name.clone();
+
+        // Ensure QUIC connection exists before attempting pairing
+        {
+            let mut peer_manager = daemon_ref.peer_manager.write().await;
+
+            // Check if we have an authenticated connection
+            let is_connected = peer_manager.peers.get(&device_uuid)
+                .map(|peer| matches!(peer.connection_status,
+                    fileshare_daemon::network::peer_quic::ConnectionStatus::Connected |
+                    fileshare_daemon::network::peer_quic::ConnectionStatus::Authenticated))
+                .unwrap_or(false);
+
+            if !is_connected {
+                info!("🔗 No QUIC connection to device, attempting to establish connection first...");
+
+                // Trigger connection to the device
+                if let Err(e) = peer_manager.connect_to_peer(device_uuid).await {
+                    error!("❌ Failed to establish QUIC connection: {}", e);
+                    return Err(format!("Failed to establish connection with device: {}", e));
+                }
+
+                // Wait a moment for the connection to establish
+                tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+
+                // Check connection status again
+                let connected_after = peer_manager.peers.get(&device_uuid)
+                    .map(|peer| matches!(peer.connection_status,
+                        fileshare_daemon::network::peer_quic::ConnectionStatus::Connected |
+                        fileshare_daemon::network::peer_quic::ConnectionStatus::Authenticated))
+                    .unwrap_or(false);
+
+                if !connected_after {
+                    return Err("Failed to establish QUIC connection with device. Please ensure the device is online and try again.".to_string());
+                }
+
+                info!("✅ QUIC connection established successfully");
+            }
+        }
+
+        // Now proceed with pairing
+        let pm = daemon_ref.pairing_manager.write().await;
+
+        match pm.initiate_pairing(device_uuid, device_name).await {
+            Ok(session) => {
+                // Send pairing request to the peer
+                let mut peer_manager = daemon_ref.peer_manager.write().await;
+                let request = fileshare_daemon::network::protocol::Message::new(
+                    fileshare_daemon::network::protocol::MessageType::PairingRequest {
+                        device_id: daemon_ref.get_settings().device.id,
+                        device_name: daemon_ref.get_settings().device.name.clone(),
+                        public_key: pm.get_public_key(),
+                    },
+                );
+
+                match peer_manager.send_message_to_peer(device_uuid, request).await {
+                    Ok(()) => {
+                        info!("✅ Pairing request sent successfully");
+                        Ok(serde_json::json!({
+                            "session_id": session.session_id.to_string(),
+                            "pin": session.pin,
+                            "state": "initiated"
+                        }))
+                    }
+                    Err(e) => {
+                        error!("❌ Failed to send pairing request: {}", e);
+                        Err(format!("Failed to send pairing request: {}", e))
+                    }
+                }
+            }
+            Err(e) => Err(format!("Failed to initiate pairing: {}", e)),
+        }
+    } else {
+        Err("Daemon not ready".to_string())
+    }
+}
+
+#[tauri::command]
+async fn confirm_pairing(
+    session_id: String,
+    state: tauri::State<'_, AppState>,
+) -> Result<(), String> {
+    info!("✅ Confirming pairing for session: {}", session_id);
+
+    let session_uuid = uuid::Uuid::parse_str(&session_id)
+        .map_err(|e| format!("Invalid session ID: {}", e))?;
+
+    if let Some(daemon_ref) = state.daemon_ref.lock().await.as_ref() {
+        let mut pm = daemon_ref.pairing_manager.write().await;
+
+        match pm.confirm_pairing(session_uuid).await {
+            Ok(signature) => {
+                // Find the peer device ID from the session
+                let sessions = pm.get_active_sessions().await;
+                if let Some(session) = sessions.iter().find(|s| s.session_id == session_uuid) {
+                    // Send confirmation to peer
+                    let mut peer_manager = daemon_ref.peer_manager.write().await;
+                    let confirm = fileshare_daemon::network::protocol::Message::new(
+                        fileshare_daemon::network::protocol::MessageType::PairingConfirm {
+                            session_id: session_uuid,
+                            signed_challenge: signature,
+                        },
+                    );
+                    peer_manager.send_message_to_peer(session.peer_device_id, confirm).await
+                        .map_err(|e| format!("Failed to send pairing confirmation: {}", e))?;
+
+                    info!("✅ Pairing confirmation sent by target device, waiting for completion acknowledgment from initiator");
+                }
+
+                Ok(())
+            }
+            Err(e) => Err(format!("Failed to confirm pairing: {}", e)),
+        }
+    } else {
+        Err("Daemon not ready".to_string())
+    }
+}
+
+#[tauri::command]
+async fn reject_pairing(
+    session_id: String,
+    reason: Option<String>,
+    state: tauri::State<'_, AppState>,
+) -> Result<(), String> {
+    info!("❌ Rejecting pairing for session: {}", session_id);
+
+    let session_uuid = uuid::Uuid::parse_str(&session_id)
+        .map_err(|e| format!("Invalid session ID: {}", e))?;
+
+    if let Some(daemon_ref) = state.daemon_ref.lock().await.as_ref() {
+        let mut pm = daemon_ref.pairing_manager.write().await;
+        let reject_reason = reason.unwrap_or_else(|| "User rejected".to_string());
+
+        match pm.reject_pairing(session_uuid, reject_reason.clone()).await {
+            Ok(()) => {
+                // Send rejection to peer
+                let sessions = pm.get_active_sessions().await;
+                if let Some(session) = sessions.iter().find(|s| s.session_id == session_uuid) {
+                    let mut peer_manager = daemon_ref.peer_manager.write().await;
+                    let reject = fileshare_daemon::network::protocol::Message::new(
+                        fileshare_daemon::network::protocol::MessageType::PairingReject {
+                            session_id: session_uuid,
+                            reason: reject_reason,
+                        },
+                    );
+                    peer_manager.send_message_to_peer(session.peer_device_id, reject).await
+                        .map_err(|e| format!("Failed to send pairing rejection: {}", e))?;
+                }
+
+                Ok(())
+            }
+            Err(e) => Err(format!("Failed to reject pairing: {}", e)),
+        }
+    } else {
+        Err("Daemon not ready".to_string())
+    }
+}
+
+#[tauri::command]
+async fn get_paired_devices(
+    state: tauri::State<'_, AppState>,
+) -> Result<Vec<serde_json::Value>, String> {
+    info!("📱 Getting paired devices");
+
+    if let Some(daemon_ref) = state.daemon_ref.lock().await.as_ref() {
+        let pm = daemon_ref.pairing_manager.read().await;
+        let paired_devices = pm.get_all_paired_devices().await;
+
+        let devices: Vec<serde_json::Value> = paired_devices
+            .into_iter()
+            .map(|device| {
+                serde_json::json!({
+                    "device_id": device.device_id.to_string(),
+                    "name": device.name,
+                    "paired_at": device.paired_at,
+                    "last_seen": device.last_seen,
+                    "trust_level": format!("{:?}", device.trust_level),
+                    "auto_accept_files": device.auto_accept_files,
+                })
+            })
+            .collect();
+
+        Ok(devices)
+    } else {
+        Err("Daemon not ready".to_string())
+    }
+}
+
+#[tauri::command]
+async fn get_active_pairing_sessions(
+    state: tauri::State<'_, AppState>,
+) -> Result<Vec<serde_json::Value>, String> {
+    info!("🔐 Getting active pairing sessions");
+
+    if let Some(daemon_ref) = state.daemon_ref.lock().await.as_ref() {
+        let pm = daemon_ref.pairing_manager.read().await;
+        let sessions = pm.get_active_sessions().await;
+
+        let active_sessions: Vec<serde_json::Value> = sessions
+            .into_iter()
+            .map(|session| {
+                let remaining_seconds = session.remaining_seconds();
+
+                serde_json::json!({
+                    "session_id": session.session_id.to_string(),
+                    "peer_device_id": session.peer_device_id.to_string(),
+                    "peer_name": session.peer_name,
+                    "pin": session.pin,
+                    "state": format!("{:?}", session.state),
+                    "initiated_by_us": session.initiated_by_us,
+                    "remaining_seconds": remaining_seconds,
+                })
+            })
+            .collect();
+
+        Ok(active_sessions)
+    } else {
+        Err("Daemon not ready".to_string())
+    }
+}
+
 // Add these structs
 #[derive(serde::Serialize, serde::Deserialize)]
 struct SystemInfo {
@@ -761,7 +1002,7 @@ async fn connect_to_peer(
 #[tauri::command]
 async fn disconnect_from_peer(
     device_id: String,
-    state: tauri::State<'_, AppState>,
+    _state: tauri::State<'_, AppState>,
 ) -> Result<(), String> {
     info!("🔌 UI requested to disconnect from device: {}", device_id);
 
@@ -1037,6 +1278,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             test_discovery_status,
             export_settings,
             import_settings,
+            // Pairing commands
+            initiate_pairing,
+            confirm_pairing,
+            reject_pairing,
+            get_paired_devices,
+            get_active_pairing_sessions,
             test_hotkey_system,
             test_isolated_hotkey,
             get_active_transfers,

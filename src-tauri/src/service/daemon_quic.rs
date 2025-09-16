@@ -3,6 +3,7 @@ use crate::{
     config::Settings,
     hotkeys::{HotkeyEvent, HotkeyManager},
     network::{DiscoveryService, PeerManager},
+    pairing::PairingManager,
     Result,
 };
 use std::sync::Arc;
@@ -14,6 +15,7 @@ pub struct FileshareDaemon {
     settings: Arc<Settings>,
     pub discovery: Option<DiscoveryService>,
     pub peer_manager: Arc<RwLock<PeerManager>>,
+    pub pairing_manager: Arc<RwLock<PairingManager>>,
     hotkey_manager: Option<HotkeyManager>,
     clipboard: ClipboardManager,
     shutdown_tx: broadcast::Sender<()>,
@@ -26,7 +28,28 @@ impl FileshareDaemon {
         let (shutdown_tx, shutdown_rx) = broadcast::channel(1);
 
         // Initialize peer manager with QUIC
-        let peer_manager = PeerManager::new(settings.clone()).await?;
+        let mut peer_manager = PeerManager::new(settings.clone()).await?;
+
+        // Get proper config path for keypair
+        let keypair_path = if let Some(proj_dirs) = directories::ProjectDirs::from("com", "fileshare", "daemon") {
+            let config_dir = proj_dirs.config_dir();
+            std::fs::create_dir_all(config_dir).ok();
+            config_dir.join("device_keypair.pem")
+        } else {
+            std::path::PathBuf::from("/tmp/device_keypair.pem")
+        };
+
+        // Initialize pairing manager
+        let pairing_manager = PairingManager::new(
+            settings.device.id,
+            settings.device.name.clone(),
+            keypair_path,
+            settings.security.paired_devices.clone(),
+        )?;
+        let pairing_manager = Arc::new(RwLock::new(pairing_manager));
+
+        // Set pairing manager in peer manager
+        peer_manager.set_pairing_manager(pairing_manager.clone());
         let peer_manager = Arc::new(RwLock::new(peer_manager));
 
         // Initialize discovery service
@@ -47,6 +70,7 @@ impl FileshareDaemon {
             settings,
             discovery: Some(discovery),
             peer_manager,
+            pairing_manager,
             hotkey_manager: Some(hotkey_manager),
             clipboard,
             shutdown_tx,
@@ -107,8 +131,10 @@ impl FileshareDaemon {
         // Start peer manager message handler
         let peer_manager = self.peer_manager.clone();
         let clipboard = self.clipboard.clone();
+        let pairing_manager = self.pairing_manager.clone();
+        let settings = self.settings.clone();
         tokio::spawn(async move {
-            if let Err(e) = Self::run_quic_message_handler(peer_manager, clipboard).await {
+            if let Err(e) = Self::run_quic_message_handler(peer_manager, clipboard, pairing_manager, settings).await {
                 error!("❌ QUIC message handler error: {}", e);
             }
         });
@@ -121,6 +147,8 @@ impl FileshareDaemon {
     async fn run_quic_message_handler(
         peer_manager: Arc<RwLock<PeerManager>>,
         clipboard: ClipboardManager,
+        pairing_manager: Arc<RwLock<PairingManager>>,
+        settings: Arc<Settings>,
     ) -> Result<()> {
         info!("🚀 Starting QUIC message handler...");
         
@@ -164,10 +192,25 @@ impl FileshareDaemon {
 
             info!("📨 Received message from {}: {:?}", peer_id, message.message_type);
 
+            // Check if this is a pairing-related message that might result in completion
+            let is_pairing_message = matches!(
+                message.message_type,
+                crate::network::protocol::MessageType::PairingComplete { .. } |
+                crate::network::protocol::MessageType::PairingConfirm { .. }
+            );
+
             // Only lock when handling the message
             let mut pm = peer_manager.write().await;
             if let Err(e) = pm.handle_message(peer_id, message, &clipboard).await {
                 error!("❌ Failed to handle message from {}: {}", peer_id, e);
+            }
+
+            // Save paired devices to config after pairing completion
+            if is_pairing_message {
+                drop(pm); // Release the lock before saving config
+                if let Err(e) = Self::save_paired_devices_to_config_static(&pairing_manager, &settings).await {
+                    error!("❌ Failed to save paired devices to config: {}", e);
+                }
             }
         }
 
@@ -213,10 +256,12 @@ impl FileshareDaemon {
             let peer_manager = self.peer_manager.clone();
             let clipboard = self.clipboard.clone();
             let mut shutdown_rx = self.shutdown_tx.subscribe();
+            let pairing_manager = self.pairing_manager.clone();
+            let settings = self.settings.clone();
 
             tokio::spawn(async move {
                 tokio::select! {
-                    result = Self::run_quic_message_handler(peer_manager, clipboard) => {
+                    result = Self::run_quic_message_handler(peer_manager, clipboard, pairing_manager, settings) => {
                         if let Err(e) = result {
                             error!("❌ QUIC message handler error: {}", e);
                         }
@@ -494,6 +539,36 @@ impl FileshareDaemon {
             info!("✅ File request sent to source device via QUIC");
         }
 
+        Ok(())
+    }
+
+    /// Save paired devices to config file
+    pub async fn save_paired_devices_to_config(&self) -> Result<()> {
+        Self::save_paired_devices_to_config_static(&self.pairing_manager, &self.settings).await
+    }
+
+    /// Static version of save_paired_devices_to_config for use in message handler
+    pub async fn save_paired_devices_to_config_static(
+        pairing_manager: &Arc<RwLock<PairingManager>>,
+        settings: &Arc<Settings>,
+    ) -> Result<()> {
+        // Get all paired devices from the pairing manager
+        let paired_devices = {
+            let pm = pairing_manager.read().await;
+            pm.get_all_paired_devices().await
+        };
+
+        // Create a mutable copy of the settings
+        let mut settings_copy = (**settings).clone();
+
+        // Update the paired devices in settings
+        settings_copy.security.paired_devices = paired_devices;
+
+        // Save to config file
+        settings_copy.save(None)
+            .map_err(|e| crate::FileshareError::Config(format!("Failed to save paired devices: {}", e)))?;
+
+        info!("💾 Saved {} paired devices to config", settings_copy.security.paired_devices.len());
         Ok(())
     }
 
