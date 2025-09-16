@@ -84,8 +84,20 @@ function App() {
     // Load data functions
     const loadDevices = useCallback(async () => {
         try {
+            // Get all discovered devices
             const discoveredDevices = await invoke<DeviceInfo[]>('get_discovered_devices');
-            setDevices(discoveredDevices);
+
+            // Get paired devices separately to ensure we have the most up-to-date data
+            const pairedDevicesData = await invoke<any[]>('get_paired_devices');
+            const pairedDeviceIds = new Set(pairedDevicesData.map(d => d.device_id));
+
+            // Mark devices as paired based on the paired devices list
+            const devicesWithPairingStatus = discoveredDevices.map(device => ({
+                ...device,
+                is_paired: pairedDeviceIds.has(device.id)
+            }));
+
+            setDevices(devicesWithPairingStatus);
             setLastUpdate(new Date());
         } catch (error) {
             console.error('Failed to load devices:', error);
@@ -114,9 +126,9 @@ function App() {
         }
     }, []);
 
-    // Device filtering and sorting
-    const getFilteredDevices = () => {
-        let filtered = devices;
+    // Get paired devices for DEVICES tab
+    const getPairedDevices = () => {
+        let filtered = devices.filter(d => d.is_paired);
 
         if (debouncedSearchTerm) {
             filtered = filtered.filter(device =>
@@ -127,16 +139,15 @@ function App() {
             );
         }
 
+        // Apply additional filters for paired devices
         switch (filterType) {
-            case 'paired':
-                filtered = filtered.filter(d => d.is_paired);
-                break;
             case 'blocked':
                 filtered = filtered.filter(d => d.is_blocked);
                 break;
             case 'connected':
                 filtered = filtered.filter(d => d.is_connected);
                 break;
+            // 'paired' filter is redundant here since we already filter for paired devices
         }
 
         filtered.sort((a, b) => {
@@ -159,6 +170,11 @@ function App() {
         });
 
         return filtered;
+    };
+
+    // Get unpaired devices for PAIRING tab
+    const getUnpairedDevices = () => {
+        return devices.filter(d => !d.is_paired);
     };
 
     // Device actions
@@ -311,14 +327,17 @@ function App() {
         loadInitialData();
     }, [loadDevices, loadSettings, checkConnectionStatus]);
 
-    // Auto-refresh
+    // Auto-refresh with faster updates during pairing
     useEffect(() => {
+        // Faster refresh when in pairing tab
+        const refreshInterval = activeTab === 'pairing' ? 1000 : 3000;
+
         const interval = setInterval(async () => {
             await loadDevices();
             await checkConnectionStatus();
-        }, 3000);
+        }, refreshInterval);
         return () => clearInterval(interval);
-    }, [loadDevices, checkConnectionStatus]);
+    }, [loadDevices, checkConnectionStatus, activeTab]);
 
     // Load favorites
     useEffect(() => {
@@ -333,12 +352,9 @@ function App() {
         }
     }, []);
 
-    const filteredDevices = getFilteredDevices();
-    
-    // Calculate paired and unpaired device counts
-    const pairedDevices = filteredDevices.filter(device => device.is_paired);
-    const unpairedDevices = devices.filter(device => !device.is_paired);
-    const unpairedDeviceCount = unpairedDevices.length;
+    // Get device lists
+    const pairedDevices = getPairedDevices();
+    const unpairedDevices = getUnpairedDevices();
 
     return (
         <div className="app-container w-full h-full bg-gradient-to-br from-slate-900/95 to-slate-800/95 backdrop-blur-xl border border-white/10 shadow-2xl relative">
@@ -351,7 +367,7 @@ function App() {
                     isLoading={isLoading}
                     isRefreshing={isRefreshing}
                     lastUpdate={lastUpdate}
-                    filteredDevicesCount={filteredDevices.length}
+                    filteredDevicesCount={activeTab === 'devices' ? pairedDevices.length : unpairedDevices.length}
                     deviceName={settings?.device_name}
                     showTransferProgress={showTransferProgress}
                     onRefresh={handleRefresh}
@@ -366,7 +382,7 @@ function App() {
                     activeTab={activeTab}
                     onTabChange={setActiveTab}
                     deviceCount={pairedDevices.length}
-                    unpairedDeviceCount={unpairedDeviceCount}
+                    unpairedDeviceCount={unpairedDevices.length}
                 />
             </SlideIn>
 

@@ -1,16 +1,20 @@
 import React, { useState, useEffect } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
-import { 
-    Wifi, 
-    Shield, 
-    Clock, 
-    Smartphone, 
-    Monitor, 
+import {
+    Wifi,
+    Shield,
+    Clock,
+    Smartphone,
+    Monitor,
     Tablet,
     AlertCircle,
     CheckCircle,
     XCircle,
-    RefreshCw
+    RefreshCw,
+    Search,
+    Filter,
+    Apple,
+    Chrome
 } from 'lucide-react';
 import { invoke } from '@tauri-apps/api/core';
 
@@ -43,6 +47,8 @@ const PairingTab: React.FC<PairingTabProps> = ({ onRefresh }) => {
     const [activeSessions, setActiveSessions] = useState<PairingSession[]>([]);
     const [isLoading, setIsLoading] = useState(true);
     const [error, setError] = useState<string | null>(null);
+    const [searchTerm, setSearchTerm] = useState('');
+    const [osFilter, setOsFilter] = useState<'all' | 'windows' | 'macos' | 'linux'>('all');
 
     // Load unpaired devices and active sessions
     const loadPairingData = async () => {
@@ -83,12 +89,45 @@ const PairingTab: React.FC<PairingTabProps> = ({ onRefresh }) => {
         }
     };
 
+    // Filter devices based on search and OS filter
+    const getFilteredDevices = () => {
+        let filtered = unpairedDevices;
+
+        // Apply search filter
+        if (searchTerm) {
+            filtered = filtered.filter(device =>
+                device.name.toLowerCase().includes(searchTerm.toLowerCase()) ||
+                device.address.includes(searchTerm) ||
+                (device.platform && device.platform.toLowerCase().includes(searchTerm.toLowerCase()))
+            );
+        }
+
+        // Apply OS filter
+        if (osFilter !== 'all') {
+            filtered = filtered.filter(device => {
+                const platform = device.platform?.toLowerCase();
+                switch (osFilter) {
+                    case 'windows':
+                        return platform === 'windows';
+                    case 'macos':
+                        return platform === 'macos' || platform === 'darwin';
+                    case 'linux':
+                        return platform === 'linux';
+                    default:
+                        return true;
+                }
+            });
+        }
+
+        return filtered;
+    };
+
     // Initialize data and set up refresh interval
     useEffect(() => {
         loadPairingData();
-        
-        // Refresh every 5 seconds to update session timers
-        const interval = setInterval(loadPairingData, 5000);
+
+        // Refresh every 2 seconds for real-time updates
+        const interval = setInterval(loadPairingData, 2000);
         return () => clearInterval(interval);
     }, []);
 
@@ -210,37 +249,71 @@ const PairingTab: React.FC<PairingTabProps> = ({ onRefresh }) => {
         return `${Math.floor(seconds / 86400)}d ago`;
     };
 
+    const filteredDevices = getFilteredDevices();
+
     return (
         <div className="space-y-6">
             {/* Header */}
-            <div className="flex items-center justify-between">
-                <div>
-                    <h2 className="text-xl font-semibold text-gray-900">Device Pairing</h2>
-                    <p className="text-sm text-gray-600">
-                        Pair with devices to enable secure file sharing
-                    </p>
+            <div className="space-y-4">
+                <div className="flex items-center justify-between">
+                    <div>
+                        <h2 className="text-xl font-semibold text-white">Device Pairing</h2>
+                        <p className="text-sm text-gray-400">
+                            Pair with devices to enable secure file sharing
+                        </p>
+                    </div>
+                    <button
+                        onClick={() => { onRefresh(); loadPairingData(); }}
+                        className="flex items-center gap-2 px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 transition-colors"
+                    >
+                        <RefreshCw className="w-4 h-4" />
+                        Refresh
+                    </button>
                 </div>
-                <button
-                    onClick={() => { onRefresh(); loadPairingData(); }}
-                    className="flex items-center gap-2 px-3 py-2 bg-blue-500 text-white rounded-lg hover:bg-blue-600 transition-colors"
-                >
-                    <RefreshCw className="w-4 h-4" />
-                    Refresh
-                </button>
+
+                {/* Search and Filters */}
+                <div className="flex flex-col sm:flex-row gap-4">
+                    {/* Search Bar */}
+                    <div className="relative flex-1">
+                        <Search className="absolute left-3 top-1/2 transform -translate-y-1/2 text-gray-400 w-4 h-4" />
+                        <input
+                            type="text"
+                            placeholder="Search devices by name, address..."
+                            value={searchTerm}
+                            onChange={(e) => setSearchTerm(e.target.value)}
+                            className="w-full pl-10 pr-4 py-2 bg-white/10 border border-white/20 rounded-lg text-white placeholder-gray-400 focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent"
+                        />
+                    </div>
+
+                    {/* OS Filter */}
+                    <div className="relative">
+                        <select
+                            value={osFilter}
+                            onChange={(e) => setOsFilter(e.target.value as any)}
+                            className="appearance-none bg-white/10 border border-white/20 rounded-lg px-4 py-2 pr-8 text-white focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent"
+                        >
+                            <option value="all" className="bg-gray-800">All OS</option>
+                            <option value="windows" className="bg-gray-800">Windows</option>
+                            <option value="macos" className="bg-gray-800">macOS</option>
+                            <option value="linux" className="bg-gray-800">Linux</option>
+                        </select>
+                        <Filter className="absolute right-2 top-1/2 transform -translate-y-1/2 text-gray-400 w-4 h-4 pointer-events-none" />
+                    </div>
+                </div>
             </div>
 
             {/* Error Message */}
             {error && (
-                <motion.div 
+                <motion.div
                     initial={{ opacity: 0, y: -10 }}
                     animate={{ opacity: 1, y: 0 }}
-                    className="bg-red-50 border border-red-200 rounded-lg p-4 flex items-center gap-3"
+                    className="bg-red-500/10 border border-red-500/20 rounded-lg p-4 flex items-center gap-3"
                 >
-                    <AlertCircle className="w-5 h-5 text-red-500" />
-                    <span className="text-red-700">{error}</span>
-                    <button 
+                    <AlertCircle className="w-5 h-5 text-red-400" />
+                    <span className="text-red-300">{error}</span>
+                    <button
                         onClick={() => setError(null)}
-                        className="ml-auto text-red-500 hover:text-red-700"
+                        className="ml-auto text-red-400 hover:text-red-300"
                     >
                         <XCircle className="w-5 h-5" />
                     </button>
@@ -256,20 +329,22 @@ const PairingTab: React.FC<PairingTabProps> = ({ onRefresh }) => {
                         exit={{ opacity: 0, height: 0 }}
                         className="space-y-3"
                     >
-                        <h3 className="text-lg font-medium text-gray-900">Active Pairing Sessions</h3>
+                        <h3 className="text-lg font-medium text-white">Active Pairing Sessions</h3>
                         {activeSessions.map((session) => {
                             const status = getSessionStatus(session);
                             return (
                                 <motion.div
                                     key={session.session_id}
                                     layout
-                                    className="bg-white border border-gray-200 rounded-lg p-4 shadow-sm"
+                                    className="bg-white/10 border border-white/20 rounded-lg p-4 backdrop-blur-sm"
                                 >
                                     <div className="flex items-center justify-between">
                                         <div className="flex items-center gap-3">
-                                            {getDeviceIcon()}
+                                            <div className="text-gray-300">
+                                                {getDeviceIcon()}
+                                            </div>
                                             <div>
-                                                <h4 className="font-medium text-gray-900">{session.peer_name}</h4>
+                                                <h4 className="font-medium text-white">{session.peer_name}</h4>
                                                 <div className={`flex items-center gap-2 text-sm ${status.color}`}>
                                                     {status.icon}
                                                     {status.text}
@@ -312,54 +387,59 @@ const PairingTab: React.FC<PairingTabProps> = ({ onRefresh }) => {
 
             {/* Discovered Devices */}
             <div className="space-y-3">
-                <h3 className="text-lg font-medium text-gray-900">Discovered Devices</h3>
-                
+                <h3 className="text-lg font-medium text-white">Discovered Devices</h3>
+
                 {isLoading ? (
                     <div className="space-y-3">
                         {[...Array(3)].map((_, i) => (
-                            <div key={i} className="bg-gray-100 rounded-lg h-16 animate-pulse" />
+                            <div key={i} className="bg-white/10 rounded-lg h-16 animate-pulse" />
                         ))}
                     </div>
-                ) : unpairedDevices.length === 0 ? (
+                ) : filteredDevices.length === 0 ? (
                     <motion.div
                         initial={{ opacity: 0 }}
                         animate={{ opacity: 1 }}
-                        className="text-center py-8 text-gray-500"
+                        className="text-center py-8 text-gray-400"
                     >
-                        <Wifi className="w-12 h-12 mx-auto mb-3 text-gray-300" />
-                        <p>No unpaired devices found</p>
+                        <Wifi className="w-12 h-12 mx-auto mb-3 text-gray-500" />
+                        <p className="text-white">No unpaired devices found</p>
                         <p className="text-sm">Make sure other devices are running Fileshare</p>
                     </motion.div>
                 ) : (
-                    <motion.div 
+                    <motion.div
                         className="space-y-3"
                         initial={{ opacity: 0 }}
                         animate={{ opacity: 1 }}
                     >
-                        {unpairedDevices.map((device, index) => (
+                        {filteredDevices.map((device, index) => (
                             <motion.div
                                 key={device.id}
                                 initial={{ opacity: 0, y: 20 }}
                                 animate={{ opacity: 1, y: 0 }}
                                 transition={{ delay: index * 0.1 }}
-                                className="bg-white border border-gray-200 rounded-lg p-4 hover:shadow-md transition-shadow"
+                                className="bg-white/10 border border-white/20 rounded-lg p-4 hover:bg-white/15 transition-all backdrop-blur-sm"
                             >
                                 <div className="flex items-center justify-between">
                                     <div className="flex items-center gap-3">
-                                        {getDeviceIcon(device.platform)}
+                                        <div className="text-gray-300">
+                                            {getDeviceIcon(device.platform)}
+                                        </div>
                                         <div>
-                                            <h4 className="font-medium text-gray-900">{device.name}</h4>
-                                            <div className="flex items-center gap-4 text-sm text-gray-500">
+                                            <h4 className="font-medium text-white">{device.name}</h4>
+                                            <div className="flex items-center gap-4 text-sm text-gray-400">
                                                 <span>{device.address}</span>
                                                 <span>v{device.version}</span>
+                                                {device.platform && (
+                                                    <span className="capitalize">{device.platform}</span>
+                                                )}
                                                 <span>{formatTimeAgo(device.last_seen)}</span>
                                             </div>
                                         </div>
                                     </div>
-                                    
+
                                     <button
                                         onClick={() => handlePairDevice(device.id)}
-                                        className="px-4 py-2 bg-blue-500 text-white rounded-lg hover:bg-blue-600 transition-colors flex items-center gap-2"
+                                        className="px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 transition-colors flex items-center gap-2"
                                     >
                                         <Shield className="w-4 h-4" />
                                         Pair
