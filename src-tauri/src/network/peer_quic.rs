@@ -1211,7 +1211,24 @@ impl PeerManager {
 
                 if let Some(pairing_manager) = &self.pairing_manager {
                     let pm = pairing_manager.read().await;
-                    pm.complete_pairing(resolved_peer_id).await.ok();
+                    match pm.complete_pairing(resolved_peer_id).await {
+                        Ok(_) => {
+                            info!("✅ Successfully completed pairing with {}", resolved_peer_id);
+
+                            // Save paired device to config file
+                            if let Err(e) = crate::service::daemon_quic::FileshareDaemon::save_paired_devices_to_config_static(
+                                pairing_manager,
+                                &self.settings
+                            ).await {
+                                error!("❌ Failed to save paired device to config: {}", e);
+                            } else {
+                                info!("💾 Paired device saved to config successfully");
+                            }
+                        }
+                        Err(e) => {
+                            error!("❌ Failed to complete pairing: {}", e);
+                        }
+                    }
                 } else {
                     warn!("⚠️ Received pairing complete but pairing manager not available");
                 }

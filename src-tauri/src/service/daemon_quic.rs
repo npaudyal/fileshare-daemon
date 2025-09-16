@@ -548,7 +548,7 @@ impl FileshareDaemon {
     }
 
     /// Static version of save_paired_devices_to_config for use in message handler
-    async fn save_paired_devices_to_config_static(
+    pub async fn save_paired_devices_to_config_static(
         pairing_manager: &Arc<RwLock<PairingManager>>,
         settings: &Arc<Settings>,
     ) -> Result<()> {
