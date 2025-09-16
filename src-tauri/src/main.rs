@@ -497,25 +497,8 @@ async fn confirm_pairing(
                     peer_manager.send_message_to_peer(session.peer_device_id, confirm).await
                         .map_err(|e| format!("Failed to send pairing confirmation: {}", e))?;
 
-                    // Complete pairing on this device (receiving device) and save config
-                    drop(peer_manager); // Release peer_manager lock before pairing operations
-
-                    // Complete pairing
-                    match pm.complete_pairing(session.peer_device_id).await {
-                        Ok(_) => {
-                            info!("✅ Successfully completed pairing with {} on receiving device", session.peer_device_id);
-
-                            // Save paired device to config file
-                            if let Err(e) = daemon_ref.save_paired_devices_to_config().await {
-                                error!("❌ Failed to save paired device to config: {}", e);
-                            } else {
-                                info!("💾 Paired device saved to config successfully on receiving device");
-                            }
-                        }
-                        Err(e) => {
-                            error!("❌ Failed to complete pairing on receiving device: {}", e);
-                        }
-                    }
+                    // Note: Pairing completion will be handled when we receive PairingComplete message
+                    info!("✅ Pairing confirmation sent, waiting for completion acknowledgment from peer");
                 }
 
                 Ok(())

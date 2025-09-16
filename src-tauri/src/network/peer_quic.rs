@@ -1210,13 +1210,28 @@ impl PeerManager {
                 info!("🎉 Pairing complete acknowledgment for session {}", session_id);
 
                 if let Some(pairing_manager) = &self.pairing_manager {
-                    let pairing_result = {
-                        let pm = pairing_manager.write().await;
-                        pm.complete_pairing(resolved_peer_id).await
+                    // Find the correct peer device ID using session ID instead of resolved_peer_id
+                    let peer_device_id = {
+                        let pm = pairing_manager.read().await;
+                        let sessions = pm.get_active_sessions().await;
+                        sessions.iter()
+                            .find(|session| session.session_id == *session_id)
+                            .map(|session| session.peer_device_id)
+                    };
+
+                    let pairing_result = match peer_device_id {
+                        Some(device_id) => {
+                            let pm = pairing_manager.write().await;
+                            pm.complete_pairing(device_id).await
+                        }
+                        None => {
+                            error!("❌ Could not find session {} for pairing completion", session_id);
+                            return Ok(());
+                        }
                     };
                     match pairing_result {
                         Ok(_) => {
-                            info!("✅ Successfully completed pairing with {}", resolved_peer_id);
+                            info!("✅ Successfully completed pairing with {}", peer_device_id.unwrap());
 
                             // Save paired device to config file
                             if let Err(e) = crate::service::daemon_quic::FileshareDaemon::save_paired_devices_to_config_static(
