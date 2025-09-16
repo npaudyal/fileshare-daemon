@@ -1256,7 +1256,7 @@ impl PeerManager {
                             if !initiated_by_us {
                                 let pairing_result = {
                                     let pm = pairing_manager.write().await;
-                                    pm.complete_pairing(peer_device_id).await
+                                    pm.complete_pairing_as_responder(peer_device_id).await
                                 };
 
                                 match pairing_result {
