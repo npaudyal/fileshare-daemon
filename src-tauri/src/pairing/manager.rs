@@ -2,7 +2,7 @@ use crate::{FileshareError, Result};
 use crate::pairing::{
     crypto::{DeviceKeypair, create_pairing_challenge, verify_pairing_challenge},
     pin::PinGenerator,
-    session::{PairingSession, PairingState},
+    session::{PairingSession, PairingState, PairingError},
 };
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -233,7 +233,7 @@ impl PairingManager {
         );
 
         if !verified {
-            session.state = PairingState::Failed("Invalid signature".to_string());
+            session.state = PairingState::Failed(PairingError::CryptoError);
             return Err(FileshareError::Pairing("Signature verification failed".to_string()));
         }
 
@@ -300,7 +300,7 @@ impl PairingManager {
     /// Reject pairing
     pub async fn reject_pairing(&self, session_id: Uuid, reason: String) -> Result<()> {
         let mut sessions = self.active_sessions.write().await;
-        
+
         // Find and update session
         for session in sessions.values_mut() {
             if session.session_id == session_id {
@@ -311,6 +311,18 @@ impl PairingManager {
         }
 
         Err(FileshareError::Pairing("Session not found".to_string()))
+    }
+
+    /// Mark session as failed with specific error by device ID
+    pub async fn fail_session(&self, device_id: Uuid, error: PairingError) -> Result<()> {
+        let mut sessions = self.active_sessions.write().await;
+
+        if let Some(session) = sessions.get_mut(&device_id) {
+            session.fail_with_error(error);
+            Ok(())
+        } else {
+            Err(FileshareError::Pairing("Session not found".to_string()))
+        }
     }
 
     /// Unpair a device
@@ -343,9 +355,46 @@ impl PairingManager {
         paired.values().cloned().collect()
     }
 
-    /// Get active pairing sessions
+    /// Get active pairing sessions (with timeout handling)
     pub async fn get_active_sessions(&self) -> Vec<PairingSession> {
-        let sessions = self.active_sessions.read().await;
+        let mut sessions = self.active_sessions.write().await;
+
+        // Clean up expired sessions with appropriate error types
+        let current_time = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+
+        // First, identify and mark expired sessions with appropriate errors
+        for (device_id, session) in sessions.iter_mut() {
+            if current_time >= session.expires_at && !session.is_terminal() {
+                // Determine the type of timeout based on current state
+                let error = match session.state {
+                    PairingState::Initiated => {
+                        // If we're still in Initiated state after timeout, the device never responded
+                        info!("⏰ Device {} appears to be offline - no response to pairing request", device_id);
+                        PairingError::DeviceOffline
+                    },
+                    PairingState::DisplayingPin => PairingError::ConfirmationTimeout,
+                    PairingState::AwaitingApproval => PairingError::ConfirmationTimeout,
+                    _ => PairingError::Unknown("Session expired".to_string()),
+                };
+
+                session.fail_with_error(error);
+                info!("⏰ Session {} timed out in state {:?}", session.session_id, session.state);
+            }
+        }
+
+        // Remove terminal sessions (completed, failed, timeout) that are old
+        sessions.retain(|_, session| {
+            if session.is_terminal() {
+                // Keep terminal sessions for 30 seconds so UI can show the result
+                current_time < session.expires_at + 30
+            } else {
+                current_time < session.expires_at
+            }
+        });
+
         sessions.values().cloned().collect()
     }
 

@@ -30,12 +30,10 @@ interface DevicesListProps {
     filteredDevices: DeviceInfo[];
     isLoading: boolean;
     searchTerm: string;
-    filterType: string;
     selectedDevices: Set<string>;
     showBulkActions: boolean;
     favoriteDevices: Set<string>;
     onSearchChange: (term: string) => void;
-    onFilterChange: (filter: string) => void;
     onSortChange: (sort: string) => void;
     onDeviceSelect: (deviceId: string) => void;
     onSelectAll: () => void;
@@ -44,14 +42,11 @@ interface DevicesListProps {
     onRefresh: () => void;
     deviceActions: {
         onPair: (deviceId: string) => void;
-        onUnpair: (deviceId: string) => void;
         onBlock: (deviceId: string) => void;
         onUnblock: (deviceId: string) => void;
         onForget: (deviceId: string) => void;
         onRename: (deviceId: string, newName: string) => void;
         onToggleFavorite: (deviceId: string) => void;
-        onConnect: (deviceId: string) => void;
-        onDisconnect: (deviceId: string) => void;
     };
 }
 
@@ -60,12 +55,10 @@ const DevicesList: React.FC<DevicesListProps> = ({
     filteredDevices,
     isLoading,
     searchTerm,
-    filterType,
     selectedDevices,
     showBulkActions,
     favoriteDevices,
     onSearchChange,
-    onFilterChange,
     onSortChange,
     onDeviceSelect,
     onSelectAll,
@@ -78,11 +71,9 @@ const DevicesList: React.FC<DevicesListProps> = ({
         <div>
             <DeviceControls
                 searchTerm={searchTerm}
-                filterType={filterType}
                 selectedDevices={selectedDevices}
                 showBulkActions={showBulkActions}
                 onSearchChange={onSearchChange}
-                onFilterChange={onFilterChange}
                 onSortChange={onSortChange}
                 onSelectAll={onSelectAll}
                 onClearSelection={onClearSelection}
@@ -104,15 +95,15 @@ const DevicesList: React.FC<DevicesListProps> = ({
                     >
                         <WifiOff className="w-12 h-12 text-gray-400 mx-auto mb-3" />
                         <p className="text-gray-400 text-sm">
-                            {searchTerm || filterType !== 'all'
-                                ? 'No devices match your filters'
-                                : 'No devices discovered'
+                            {searchTerm
+                                ? 'No devices match your search'
+                                : 'No paired devices'
                             }
                         </p>
                         <p className="text-gray-500 text-xs mt-1">
-                            {searchTerm || filterType !== 'all'
-                                ? 'Try adjusting your search or filters'
-                                : 'Make sure other devices are running Fileshare'
+                            {searchTerm
+                                ? 'Try adjusting your search'
+                                : 'Go to the Pairing tab to pair devices'
                             }
                         </p>
                         <motion.button
@@ -132,10 +123,10 @@ const DevicesList: React.FC<DevicesListProps> = ({
                             className="flex items-center justify-between mb-3"
                         >
                             <span className="text-xs text-gray-400">
-                                {devices.filter(d => d.is_connected).length} connected, {devices.filter(d => d.is_paired).length} paired, {devices.filter(d => d.is_blocked).length} blocked
+                                {devices.filter(d => d.is_connected).length} connected
                             </span>
                             <span className="text-xs text-gray-500">
-                                Showing {filteredDevices.length} of {devices.length}
+                                Showing {filteredDevices.length} paired device{filteredDevices.length !== 1 ? 's' : ''}
                             </span>
                         </motion.div>
                         <StaggeredList>
@@ -147,14 +138,11 @@ const DevicesList: React.FC<DevicesListProps> = ({
                                     isFavorite={favoriteDevices.has(device.id)}
                                     onSelect={() => onDeviceSelect(device.id)}
                                     onPair={() => deviceActions.onPair(device.id)}
-                                    onUnpair={() => deviceActions.onUnpair(device.id)}
                                     onBlock={() => deviceActions.onBlock(device.id)}
                                     onUnblock={() => deviceActions.onUnblock(device.id)}
                                     onForget={() => deviceActions.onForget(device.id)}
                                     onRename={(newName) => deviceActions.onRename(device.id, newName)}
                                     onToggleFavorite={() => deviceActions.onToggleFavorite(device.id)}
-                                    onConnect={() => deviceActions.onConnect(device.id)}
-                                    onDisconnect={() => deviceActions.onDisconnect(device.id)}
                                 />
                             ))}
                         </StaggeredList>

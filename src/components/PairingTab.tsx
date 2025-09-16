@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useCallback, useMemo, useRef } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
 import {
     Wifi,
@@ -13,8 +13,6 @@ import {
     RefreshCw,
     Search,
     Filter,
-    Apple,
-    Chrome
 } from 'lucide-react';
 import { invoke } from '@tauri-apps/api/core';
 
@@ -28,12 +26,23 @@ interface UnpairedDevice {
     last_seen: number;
 }
 
+interface PairingError {
+    DeviceOffline?: null;
+    ConnectionFailed?: null;
+    RequestTimeout?: null;
+    ConfirmationTimeout?: null;
+    UserRejected?: null;
+    CryptoError?: null;
+    ProtocolError?: string;
+    Unknown?: string;
+}
+
 interface PairingSession {
     session_id: string;
     peer_device_id: string;
     peer_name: string;
     pin: string;
-    state: 'Initiated' | 'DisplayingPin' | 'AwaitingApproval' | 'Confirmed' | 'Completed' | { Failed: string } | 'Timeout';
+    state: 'Initiated' | 'DisplayingPin' | 'AwaitingApproval' | 'Confirmed' | 'Completed' | { Failed: PairingError } | 'Timeout';
     initiated_by_us: boolean;
     remaining_seconds: number;
 }
@@ -49,16 +58,21 @@ const PairingTab: React.FC<PairingTabProps> = ({ onRefresh }) => {
     const [error, setError] = useState<string | null>(null);
     const [searchTerm, setSearchTerm] = useState('');
     const [osFilter, setOsFilter] = useState<'all' | 'windows' | 'macos' | 'linux'>('all');
+    const mountedRef = useRef(true);
 
-    // Load unpaired devices and active sessions
-    const loadPairingData = async () => {
+    // Load unpaired devices and active sessions with smart updates
+    const loadPairingData = async (showLoading = true) => {
+        if (!mountedRef.current) return; // Prevent state updates if unmounted
+
         try {
-            setIsLoading(true);
+            if (showLoading) {
+                setIsLoading(true);
+            }
             setError(null);
 
             // Get all discovered devices
             const allDevices = await invoke<any[]>('get_discovered_devices');
-            
+
             // Get paired devices to filter out
             const pairedDevices = await invoke<any[]>('get_paired_devices');
             const pairedIds = new Set(pairedDevices.map(d => d.device_id));
@@ -75,22 +89,54 @@ const PairingTab: React.FC<PairingTabProps> = ({ onRefresh }) => {
                     last_seen: device.last_seen
                 }));
 
-            setUnpairedDevices(unpaired);
-
             // Get active pairing sessions
             const sessions = await invoke<PairingSession[]>('get_active_pairing_sessions');
-            setActiveSessions(sessions);
+
+            // Only update state if data actually changed
+            setUnpairedDevices(prevDevices => {
+                // Quick check: different lengths mean different data
+                if (prevDevices.length !== unpaired.length) {
+                    return unpaired;
+                }
+                // Deep comparison only if lengths match
+                const hasChanged = unpaired.some((device, index) => {
+                    const prev = prevDevices[index];
+                    return !prev ||
+                           prev.id !== device.id ||
+                           prev.name !== device.name ||
+                           prev.last_seen !== device.last_seen;
+                });
+                return hasChanged ? unpaired : prevDevices;
+            });
+
+            setActiveSessions(prevSessions => {
+                // Quick check: different lengths mean different data
+                if (prevSessions.length !== sessions.length) {
+                    return sessions;
+                }
+                // Deep comparison only if lengths match
+                const hasChanged = sessions.some((session, index) => {
+                    const prev = prevSessions[index];
+                    return !prev ||
+                           prev.session_id !== session.session_id ||
+                           prev.state !== session.state ||
+                           prev.remaining_seconds !== session.remaining_seconds;
+                });
+                return hasChanged ? sessions : prevSessions;
+            });
 
         } catch (err) {
             console.error('Failed to load pairing data:', err);
             setError('Failed to load devices');
         } finally {
-            setIsLoading(false);
+            if (showLoading) {
+                setIsLoading(false);
+            }
         }
     };
 
-    // Filter devices based on search and OS filter
-    const getFilteredDevices = () => {
+    // Filter devices based on search and OS filter (memoized)
+    const filteredDevices = useMemo(() => {
         let filtered = unpairedDevices;
 
         // Apply search filter
@@ -120,55 +166,76 @@ const PairingTab: React.FC<PairingTabProps> = ({ onRefresh }) => {
         }
 
         return filtered;
-    };
+    }, [unpairedDevices, searchTerm, osFilter]);
 
     // Initialize data and set up refresh interval
     useEffect(() => {
-        loadPairingData();
+        mountedRef.current = true;
+        loadPairingData(true); // Show loading on initial load
 
-        // Refresh every 2 seconds for real-time updates
-        const interval = setInterval(loadPairingData, 2000);
-        return () => clearInterval(interval);
-    }, []);
+        // Dynamic refresh rate: faster when there are active sessions
+        const refreshInterval = activeSessions.length > 0 ? 3000 : 5000;
+        const interval = setInterval(() => loadPairingData(false), refreshInterval);
+
+        return () => {
+            mountedRef.current = false;
+            clearInterval(interval);
+        };
+    }, [activeSessions.length]); // Re-create interval when session count changes
 
     // Initiate pairing with a device
-    const handlePairDevice = async (deviceId: string) => {
+    const handlePairDevice = useCallback(async (deviceId: string) => {
         try {
+            setError(null); // Clear any previous errors
             await invoke('initiate_pairing', { deviceId });
-            loadPairingData(); // Refresh to show new session
+            loadPairingData(false); // Refresh to show new session
         } catch (err) {
             console.error('Failed to initiate pairing:', err);
-            setError(`Failed to pair with device: ${err}`);
+
+            // Set user-friendly error message
+            const errorStr = err as string;
+            if (errorStr.includes('offline') || errorStr.includes('unreachable')) {
+                setError('Device appears to be offline. Make sure the other device is running and connected to the same network.');
+            } else if (errorStr.includes('network') || errorStr.includes('connection')) {
+                setError('Network connection problem. Check that both devices are on the same network.');
+            } else if (errorStr.includes('not found')) {
+                setError('Device not found. Try refreshing the device list.');
+            } else {
+                setError(`Failed to pair with device: ${errorStr}`);
+            }
+
+            // Auto-clear error after 10 seconds
+            setTimeout(() => setError(null), 10000);
         }
-    };
+    }, []);
 
     // Confirm pairing (user verified PIN)
-    const handleConfirmPairing = async (sessionId: string) => {
+    const handleConfirmPairing = useCallback(async (sessionId: string) => {
         try {
             await invoke('confirm_pairing', { sessionId });
-            loadPairingData(); // Refresh session state
+            loadPairingData(false); // Refresh session state
         } catch (err) {
             console.error('Failed to confirm pairing:', err);
             setError(`Failed to confirm pairing: ${err}`);
         }
-    };
+    }, []);
 
     // Reject pairing
-    const handleRejectPairing = async (sessionId: string) => {
+    const handleRejectPairing = useCallback(async (sessionId: string) => {
         try {
-            await invoke('reject_pairing', { 
-                sessionId, 
-                reason: 'User rejected' 
+            await invoke('reject_pairing', {
+                sessionId,
+                reason: 'User rejected'
             });
-            loadPairingData(); // Refresh session state
+            loadPairingData(false); // Refresh session state
         } catch (err) {
             console.error('Failed to reject pairing:', err);
             setError(`Failed to reject pairing: ${err}`);
         }
-    };
+    }, []);
 
     // Get device type icon
-    const getDeviceIcon = (platform?: string) => {
+    const getDeviceIcon = useCallback((platform?: string) => {
         switch (platform?.toLowerCase()) {
             case 'android':
             case 'ios':
@@ -180,14 +247,35 @@ const PairingTab: React.FC<PairingTabProps> = ({ onRefresh }) => {
             default:
                 return <Tablet className="w-5 h-5" />;
         }
-    };
+    }, []);
 
     // Get session status info
     const getSessionStatus = (session: PairingSession) => {
         if (typeof session.state === 'object' && 'Failed' in session.state) {
+            const error = session.state.Failed;
+            let errorMessage = 'Unknown error';
+
+            if ('DeviceOffline' in error) {
+                errorMessage = 'Device is offline or app is not running';
+            } else if ('ConnectionFailed' in error) {
+                errorMessage = 'Connection failed - check network';
+            } else if ('RequestTimeout' in error) {
+                errorMessage = 'No response from device - may be offline';
+            } else if ('ConfirmationTimeout' in error) {
+                errorMessage = "Device didn't respond in time";
+            } else if ('UserRejected' in error) {
+                errorMessage = 'Pairing was rejected by the other user';
+            } else if ('CryptoError' in error) {
+                errorMessage = 'Security verification failed';
+            } else if ('ProtocolError' in error) {
+                errorMessage = `Protocol error: ${error.ProtocolError}`;
+            } else if ('Unknown' in error) {
+                errorMessage = error.Unknown || 'Unknown error';
+            }
+
             return {
                 icon: <XCircle className="w-5 h-5 text-red-500" />,
-                text: `Failed: ${session.state.Failed}`,
+                text: errorMessage,
                 color: 'text-red-500'
             };
         }
@@ -208,7 +296,7 @@ const PairingTab: React.FC<PairingTabProps> = ({ onRefresh }) => {
             case 'AwaitingApproval':
                 return {
                     icon: <Shield className="w-5 h-5 text-orange-500" />,
-                    text: `Accept from ${session.peerName}? PIN: ${session.pin}`,
+                    text: `Accept from ${session.peer_name}? PIN: ${session.pin}`,
                     color: 'text-orange-500'
                 };
             case 'Confirmed':
@@ -249,7 +337,6 @@ const PairingTab: React.FC<PairingTabProps> = ({ onRefresh }) => {
         return `${Math.floor(seconds / 86400)}d ago`;
     };
 
-    const filteredDevices = getFilteredDevices();
 
     return (
         <div className="space-y-6">
@@ -263,7 +350,7 @@ const PairingTab: React.FC<PairingTabProps> = ({ onRefresh }) => {
                         </p>
                     </div>
                     <button
-                        onClick={() => { onRefresh(); loadPairingData(); }}
+                        onClick={() => { onRefresh(); loadPairingData(true); }}
                         className="flex items-center gap-2 px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 transition-colors"
                     >
                         <RefreshCw className="w-4 h-4" />
@@ -387,6 +474,18 @@ const PairingTab: React.FC<PairingTabProps> = ({ onRefresh }) => {
                                                     <div className="text-sm text-yellow-600">
                                                         Show this PIN to {session.peer_name}
                                                     </div>
+                                                </div>
+                                            )}
+
+                                            {/* Retry button for failed sessions */}
+                                            {typeof session.state === 'object' && 'Failed' in session.state && (
+                                                <div className="flex gap-2">
+                                                    <button
+                                                        onClick={() => handlePairDevice(session.peer_device_id)}
+                                                        className="px-3 py-1 bg-blue-500 text-white rounded text-sm hover:bg-blue-600 transition-colors"
+                                                    >
+                                                        Retry
+                                                    </button>
                                                 </div>
                                             )}
                                         </div>

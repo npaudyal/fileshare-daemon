@@ -293,7 +293,7 @@ impl DiscoveryService {
     }
 
     async fn run_cleanup(discovered_devices: Arc<RwLock<HashMap<Uuid, DeviceInfo>>>) {
-        let mut interval = tokio::time::interval(Duration::from_secs(60));
+        let mut interval = tokio::time::interval(Duration::from_secs(10)); // Check every 10 seconds
 
         loop {
             interval.tick().await;
@@ -302,7 +302,7 @@ impl DiscoveryService {
                 .duration_since(UNIX_EPOCH)
                 .unwrap()
                 .as_secs();
-            let timeout_secs = 300; // 5 minutes timeout
+            let timeout_secs = 30; // 30 seconds timeout (6x broadcast interval)
 
             let mut devices = discovered_devices.write().await;
             let initial_count = devices.len();
@@ -311,7 +311,7 @@ impl DiscoveryService {
 
             let removed_count = initial_count - devices.len();
             if removed_count > 0 {
-                debug!("Cleaned up {} stale devices", removed_count);
+                info!("🧹 Cleaned up {} stale devices (offline for >{}s)", removed_count, timeout_secs);
             }
         }
     }

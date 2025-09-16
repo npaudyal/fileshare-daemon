@@ -18,7 +18,6 @@ import {
     ShieldCheck,
     ShieldX,
     Trash2,
-    UserX,
     Eye,
     Ban,
     CheckSquare,
@@ -27,7 +26,6 @@ import {
     Wifi,
     AlertTriangle
 } from 'lucide-react';
-import DeviceManagement from './DeviceManagement';
 
 interface DeviceInfo {
     id: string;
@@ -54,14 +52,11 @@ interface DeviceCardProps {
     isFavorite: boolean;
     onSelect: () => void;
     onPair: () => void;
-    onUnpair: () => void;
     onBlock: () => void;
     onUnblock: () => void;
     onForget: () => void;
     onRename: (newName: string) => void;
     onToggleFavorite: () => void;
-    onConnect: () => void;
-    onDisconnect: () => void;
 }
 
 const DeviceCard: React.FC<DeviceCardProps> = ({
@@ -70,14 +65,11 @@ const DeviceCard: React.FC<DeviceCardProps> = ({
     isFavorite,
     onSelect,
     onPair,
-    onUnpair,
     onBlock,
     onUnblock,
     onForget,
     onRename,
-    onToggleFavorite,
-    onConnect,
-    onDisconnect
+    onToggleFavorite
 }) => {
     const [editingDevice, setEditingDevice] = useState(false);
     const [newDeviceName, setNewDeviceName] = useState('');
@@ -242,18 +234,6 @@ const DeviceCard: React.FC<DeviceCardProps> = ({
                                 </button>
                             )}
 
-                            {device.is_paired && (
-                                <button
-                                    onClick={() => {
-                                        onUnpair();
-                                        setDeviceMenuOpen(false);
-                                    }}
-                                    className="w-full px-3 py-2 text-left text-sm text-gray-300 hover:bg-white/10 flex items-center space-x-2"
-                                >
-                                    <UserX className="w-4 h-4" />
-                                    <span>Unpair</span>
-                                </button>
-                            )}
 
                             {!device.is_blocked ? (
                                 <button
@@ -281,13 +261,24 @@ const DeviceCard: React.FC<DeviceCardProps> = ({
 
                             <button
                                 onClick={() => {
+                                    onToggleFavorite();
+                                    setDeviceMenuOpen(false);
+                                }}
+                                className="w-full px-3 py-2 text-left text-sm text-gray-300 hover:bg-white/10 flex items-center space-x-2"
+                            >
+                                <Star className="w-4 h-4" />
+                                <span>{isFavorite ? 'Remove from Favorites' : 'Add to Favorites'}</span>
+                            </button>
+
+                            <button
+                                onClick={() => {
                                     onForget();
                                     setDeviceMenuOpen(false);
                                 }}
                                 className="w-full px-3 py-2 text-left text-sm text-red-400 hover:bg-red-500/10 flex items-center space-x-2"
                             >
                                 <Trash2 className="w-4 h-4" />
-                                <span>Forget Device</span>
+                                <span>Remove Device</span>
                             </button>
                         </motion.div>
                     )}
@@ -351,12 +342,14 @@ const DeviceCard: React.FC<DeviceCardProps> = ({
                         )}
                         <div className="flex items-center space-x-2 mt-1">
                             {device.platform && (
-                                <span className="text-xs text-gray-400">{device.platform}</span>
+                                <>
+                                    <span className="text-xs text-gray-400">{device.platform}</span>
+                                    <span className="text-xs text-gray-500">•</span>
+                                </>
                             )}
-                            <span className="text-xs text-gray-500">•</span>
                             <span className="text-xs text-gray-400">{device.address}</span>
                             <span className="text-xs text-gray-500">•</span>
-                            <span className="text-xs text-gray-400">{getTimeAgo(device.last_seen)}</span>
+                            <span className="text-xs text-gray-400">Last online: {getTimeAgo(device.last_seen)}</span>
                         </div>
                     </div>
                 </div>
@@ -438,37 +431,9 @@ const DeviceCard: React.FC<DeviceCardProps> = ({
                             Pair
                         </motion.button>
                     )}
-                    {device.is_paired && (
-                        <motion.button
-                            whileHover={{ scale: 1.05 }}
-                            whileTap={{ scale: 0.95 }}
-                            onClick={onUnpair}
-                            className="text-xs px-3 py-1 bg-yellow-500/20 text-yellow-300 rounded hover:bg-yellow-500/30 transition-colors"
-                        >
-                            Unpair
-                        </motion.button>
-                    )}
                 </div>
             </div>
 
-            {/* Device Management Section */}
-            <motion.div
-                initial={{ height: 0, opacity: 0 }}
-                animate={{ height: 'auto', opacity: 1 }}
-                transition={{ delay: 0.1 }}
-                className="mt-3 pt-3 border-t border-white/10"
-            >
-                <DeviceManagement
-                    deviceId={device.id}
-                    deviceName={device.display_name || device.name}
-                    isFavorite={isFavorite}
-                    onToggleFavorite={onToggleFavorite}
-                    onConnectDevice={onConnect}
-                    onDisconnectDevice={onDisconnect}
-                    isConnected={device.is_connected}
-                    stats={undefined} // You can pass actual stats here if available
-                />
-            </motion.div>
 
             {/* Device Details Modal */}
             <AnimatePresence>

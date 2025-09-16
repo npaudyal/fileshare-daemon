@@ -24,8 +24,20 @@ pub enum PairingState {
     AwaitingApproval, // Target: Received request, showing PIN for user to approve/reject
     Confirmed,        // Target confirmed, completing pairing
     Completed,        // Successfully paired
-    Failed(String),   // Pairing failed
+    Failed(PairingError), // Pairing failed with specific error
     Timeout,          // Session timed out
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub enum PairingError {
+    DeviceOffline,           // Target device is not reachable
+    ConnectionFailed,        // Network connection failed
+    RequestTimeout,          // No response to initial pairing request
+    ConfirmationTimeout,     // Target didn't confirm/reject in time
+    UserRejected,           // Target user rejected the pairing
+    CryptoError,            // Cryptographic verification failed
+    ProtocolError(String),  // Protocol-level error
+    Unknown(String),        // Unknown error with description
 }
 
 impl PairingSession {
@@ -54,7 +66,7 @@ impl PairingSession {
             },
             initiated_by_us,
             created_at: now,
-            expires_at: now + 300, // 5 minutes timeout
+            expires_at: now + 15, // 15 seconds timeout for faster offline detection
             created_instant: Some(Instant::now()),
         }
     }
@@ -62,7 +74,7 @@ impl PairingSession {
     /// Check if session has expired
     pub fn is_expired(&self) -> bool {
         if let Some(created) = self.created_instant {
-            created.elapsed() > Duration::from_secs(300)
+            created.elapsed() > Duration::from_secs(15)
         } else {
             let now = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
@@ -80,8 +92,8 @@ impl PairingSession {
 
         if let Some(created) = self.created_instant {
             let elapsed = created.elapsed().as_secs();
-            if elapsed < 300 {
-                300 - elapsed
+            if elapsed < 15 {
+                15 - elapsed
             } else {
                 0
             }
@@ -154,7 +166,16 @@ impl PairingSession {
 
     /// Mark session as rejected by user
     pub fn reject(&mut self, reason: String) {
-        self.state = PairingState::Failed(reason);
+        if reason.contains("User rejected") {
+            self.state = PairingState::Failed(PairingError::UserRejected);
+        } else {
+            self.state = PairingState::Failed(PairingError::Unknown(reason));
+        }
+    }
+
+    /// Mark session as failed with specific error
+    pub fn fail_with_error(&mut self, error: PairingError) {
+        self.state = PairingState::Failed(error);
     }
 
     /// Complete the pairing
@@ -177,7 +198,16 @@ impl PairingSession {
             PairingState::AwaitingApproval => format!("Accept pairing from {}? PIN: {}", self.peer_name, self.pin),
             PairingState::Confirmed => "Completing pairing...".to_string(),
             PairingState::Completed => "Successfully paired!".to_string(),
-            PairingState::Failed(reason) => format!("Failed: {}", reason),
+            PairingState::Failed(error) => match error {
+                PairingError::DeviceOffline => "Device is offline or app is not running".to_string(),
+                PairingError::ConnectionFailed => "Connection failed - check network".to_string(),
+                PairingError::RequestTimeout => "No response from device - may be offline".to_string(),
+                PairingError::ConfirmationTimeout => "Device didn't respond in time".to_string(),
+                PairingError::UserRejected => "Pairing was rejected by the other user".to_string(),
+                PairingError::CryptoError => "Security verification failed".to_string(),
+                PairingError::ProtocolError(msg) => format!("Protocol error: {}", msg),
+                PairingError::Unknown(msg) => format!("Error: {}", msg),
+            },
             PairingState::Timeout => "Session timed out".to_string(),
         }
     }

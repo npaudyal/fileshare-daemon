@@ -1,7 +1,7 @@
 // Prevents additional console window on Windows in release
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-use fileshare_daemon::{config::Settings, service::FileshareDaemon};
+use fileshare_daemon::{config::Settings, service::FileshareDaemon, pairing::session::PairingError};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tauri::{
@@ -457,7 +457,34 @@ async fn initiate_pairing(
                     }
                     Err(e) => {
                         error!("❌ Failed to send pairing request: {}", e);
-                        Err(format!("Failed to send pairing request: {}", e))
+
+                        // Immediately mark the session as failed instead of waiting for timeout
+                        let error_type = if e.to_string().contains("Connection refused") ||
+                                          e.to_string().contains("No route to host") ||
+                                          e.to_string().contains("timeout") {
+                            PairingError::DeviceOffline
+                        } else if e.to_string().contains("Network is unreachable") {
+                            PairingError::ConnectionFailed
+                        } else {
+                            PairingError::ConnectionFailed
+                        };
+
+                        if let Err(session_err) = pm.fail_session(device_uuid, error_type).await {
+                            warn!("Failed to mark session as failed: {}", session_err);
+                        }
+
+                        // Return user-friendly error message based on error type
+                        let error_msg = if e.to_string().contains("Connection refused") ||
+                                          e.to_string().contains("No route to host") ||
+                                          e.to_string().contains("timeout") {
+                            "Device appears to be offline or unreachable"
+                        } else if e.to_string().contains("Network is unreachable") {
+                            "Network connection problem - check your connection"
+                        } else {
+                            "Failed to connect to device"
+                        };
+
+                        Err(error_msg.to_string())
                     }
                 }
             }
