@@ -1171,13 +1171,25 @@ impl PeerManager {
 
                             match pairing_result {
                                 Ok(_) => {
+                                    info!("✅ Pairing completed with device {} (as initiator)", resolved_peer_id);
+
+                                    // Save paired device to config file
+                                    if let Err(e) = crate::service::daemon_quic::FileshareDaemon::save_paired_devices_to_config_static(
+                                        pairing_manager,
+                                        &self.settings
+                                    ).await {
+                                        error!("❌ Failed to save paired device to config: {}", e);
+                                    } else {
+                                        info!("💾 Paired device saved to config successfully");
+                                    }
+
                                     // Send completion acknowledgment
                                     let complete = Message::new(MessageType::PairingComplete {
                                         session_id: *session_id,
                                         signed_acknowledgment: vec![], // TODO: Sign acknowledgment
                                     });
                                     self.send_message_to_peer(peer_id, complete).await?;
-                                    info!("✅ Pairing completed with device {}", resolved_peer_id);
+                                    info!("📤 Sent PairingComplete acknowledgment to {}", resolved_peer_id);
                                 }
                                 Err(e) => {
                                     error!("❌ Failed to complete pairing: {}", e);
@@ -1207,44 +1219,71 @@ impl PeerManager {
                 session_id,
                 signed_acknowledgment: _,
             } => {
-                info!("🎉 Pairing complete acknowledgment for session {}", session_id);
+                info!("🎉 Received PairingComplete for session {} from device {}", session_id, resolved_peer_id);
 
                 if let Some(pairing_manager) = &self.pairing_manager {
-                    // Find the correct peer device ID using session ID instead of resolved_peer_id
-                    let peer_device_id = {
+                    // Check if we're already paired with this device
+                    let already_paired = {
+                        let pm = pairing_manager.read().await;
+                        pm.is_device_paired(resolved_peer_id).await
+                    };
+
+                    if already_paired {
+                        info!("✅ Device {} is already paired, acknowledging completion", resolved_peer_id);
+                        // Still save to ensure config is updated
+                        if let Err(e) = crate::service::daemon_quic::FileshareDaemon::save_paired_devices_to_config_static(
+                            pairing_manager,
+                            &self.settings
+                        ).await {
+                            error!("❌ Failed to save paired devices to config: {}", e);
+                        }
+                        return Ok(());
+                    }
+
+                    // Find the session and complete pairing
+                    let session_info = {
                         let pm = pairing_manager.read().await;
                         let sessions = pm.get_active_sessions().await;
                         sessions.iter()
-                            .find(|session| session.session_id == *session_id)
-                            .map(|session| session.peer_device_id)
+                            .find(|s| s.session_id == *session_id)
+                            .map(|s| (s.peer_device_id, s.initiated_by_us))
                     };
 
-                    let pairing_result = match peer_device_id {
-                        Some(device_id) => {
-                            let pm = pairing_manager.write().await;
-                            pm.complete_pairing(device_id).await
-                        }
-                        None => {
-                            error!("❌ Could not find session {} for pairing completion", session_id);
-                            return Ok(());
-                        }
-                    };
-                    match pairing_result {
-                        Ok(_) => {
-                            info!("✅ Successfully completed pairing with {}", peer_device_id.unwrap());
+                    match session_info {
+                        Some((peer_device_id, initiated_by_us)) => {
+                            // Only the responder should complete pairing here
+                            // The initiator already completed when receiving PairingConfirm
+                            if !initiated_by_us {
+                                let pairing_result = {
+                                    let pm = pairing_manager.write().await;
+                                    pm.complete_pairing(peer_device_id).await
+                                };
 
-                            // Save paired device to config file
-                            if let Err(e) = crate::service::daemon_quic::FileshareDaemon::save_paired_devices_to_config_static(
-                                pairing_manager,
-                                &self.settings
-                            ).await {
-                                error!("❌ Failed to save paired device to config: {}", e);
+                                match pairing_result {
+                                    Ok(_) => {
+                                        info!("✅ Successfully completed pairing with {} (as responder)", peer_device_id);
+
+                                        // Save paired device to config file
+                                        if let Err(e) = crate::service::daemon_quic::FileshareDaemon::save_paired_devices_to_config_static(
+                                            pairing_manager,
+                                            &self.settings
+                                        ).await {
+                                            error!("❌ Failed to save paired device to config: {}", e);
+                                        } else {
+                                            info!("💾 Paired device saved to config successfully");
+                                        }
+                                    }
+                                    Err(e) => {
+                                        error!("❌ Failed to complete pairing: {}", e);
+                                    }
+                                }
                             } else {
-                                info!("💾 Paired device saved to config successfully");
+                                info!("✅ Pairing already completed as initiator for device {}", peer_device_id);
                             }
                         }
-                        Err(e) => {
-                            error!("❌ Failed to complete pairing: {}", e);
+                        None => {
+                            // Session might have been removed after completion or timeout
+                            warn!("⚠️ Session {} not found - checking if already paired", session_id);
                         }
                     }
                 } else {
