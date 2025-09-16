@@ -55,6 +55,32 @@ pub enum MessageType {
         reason: Option<String>,
     },
 
+    // Pairing messages
+    PairingRequest {
+        device_id: Uuid,
+        device_name: String,
+        public_key: Vec<u8>,
+    },
+    PairingChallenge {
+        device_id: Uuid,
+        device_name: String,
+        public_key: Vec<u8>,
+        pin: String,
+        session_id: Uuid,
+    },
+    PairingConfirm {
+        session_id: Uuid,
+        signed_challenge: Vec<u8>,
+    },
+    PairingComplete {
+        session_id: Uuid,
+        signed_acknowledgment: Vec<u8>,
+    },
+    PairingReject {
+        session_id: Uuid,
+        reason: String,
+    },
+
     // Control
     Ping,
     Pong,

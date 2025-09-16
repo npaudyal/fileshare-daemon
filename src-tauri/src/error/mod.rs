@@ -31,6 +31,12 @@ pub enum FileshareError {
     #[error("Authentication error: {0}")]
     Authentication(String),
 
+    #[error("Pairing error: {0}")]
+    Pairing(String),
+
+    #[error("Cryptographic error: {0}")]
+    Crypto(String),
+
     #[error("Unknown error: {0}")]
     Unknown(String),
 }

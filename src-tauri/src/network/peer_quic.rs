@@ -2,6 +2,7 @@ use crate::{
     config::Settings,
     http::HttpTransferManager,
     network::{discovery::DeviceInfo, protocol::*},
+    pairing::PairingManager,
     quic::{QuicConnectionManager, StreamManager},
     FileshareError, Result,
 };
@@ -69,6 +70,8 @@ pub struct PeerManager {
     incoming_stream_managers: Arc<RwLock<HashMap<Uuid, Arc<StreamManager>>>>,
     // HTTP transfer manager for file transfers
     http_transfer_manager: Arc<HttpTransferManager>,
+    // Pairing manager reference
+    pub pairing_manager: Option<Arc<RwLock<PairingManager>>>,
 }
 
 impl PeerManager {
@@ -100,6 +103,7 @@ impl PeerManager {
             temp_to_real_id_map: HashMap::new(),
             incoming_stream_managers: Arc::new(RwLock::new(HashMap::new())),
             http_transfer_manager,
+            pairing_manager: None, // Will be set later by set_pairing_manager
         };
 
         // Start accepting QUIC connections
@@ -109,6 +113,22 @@ impl PeerManager {
         peer_manager.http_transfer_manager.start_server().await?;
 
         Ok(peer_manager)
+    }
+
+    // Set the pairing manager reference after creation
+    pub fn set_pairing_manager(&mut self, pairing_manager: Arc<RwLock<PairingManager>>) {
+        self.pairing_manager = Some(pairing_manager);
+    }
+
+    // Check if a device is paired
+    pub async fn is_device_paired(&self, device_id: &Uuid) -> bool {
+        if let Some(pairing_manager) = &self.pairing_manager {
+            let pm = pairing_manager.read().await;
+            pm.is_device_paired(*device_id).await
+        } else {
+            // If no pairing manager, fall back to old behavior
+            false
+        }
     }
 
     fn start_quic_listener(&self) {
@@ -274,10 +294,12 @@ impl PeerManager {
 
     fn should_connect_to_peer(&self, device_info: &DeviceInfo) -> bool {
         if self.settings.security.require_pairing {
+            // Check if device is in paired_devices list
             self.settings
                 .security
-                .allowed_devices
-                .contains(&device_info.id)
+                .paired_devices
+                .iter()
+                .any(|pd| pd.device_id == device_info.id)
         } else {
             true
         }
@@ -945,6 +967,27 @@ impl PeerManager {
                     *file_size as f64 / (1024.0 * 1024.0)
                 );
 
+                // Check if device is paired (if pairing is required)
+                if self.settings.security.require_pairing {
+                    let is_paired = if let Some(pairing_manager) = &self.pairing_manager {
+                        let pm = pairing_manager.read().await;
+                        pm.is_device_paired(resolved_peer_id).await
+                    } else {
+                        false
+                    };
+
+                    if !is_paired {
+                        warn!("❌ Rejecting file offer from unpaired device: {}", resolved_peer_id);
+                        let response = Message::new(MessageType::FileOfferHttpResponse {
+                            request_id: *request_id,
+                            accepted: false,
+                            reason: Some("Device not paired. Pairing required for file transfers.".to_string()),
+                        });
+                        self.send_message_to_peer(peer_id, response).await?;
+                        return Ok(());
+                    }
+                }
+
                 // Determine target path - get the current directory where user wants to paste
                 let target_path = if let Ok(Some((target_path, _))) = clipboard.paste_to_current_location().await {
                     // Use the target path from the clipboard paste operation
@@ -1027,6 +1070,139 @@ impl PeerManager {
                         peer_id,
                         reason.as_deref().unwrap_or("No reason provided")
                     );
+                }
+            }
+
+            // Pairing messages
+            MessageType::PairingRequest {
+                device_id,
+                device_name,
+                public_key,
+            } => {
+                info!("📱 Received pairing request from {} ({})", device_name, device_id);
+
+                if let Some(pairing_manager) = &self.pairing_manager {
+                    let session_result = {
+                        let mut pm = pairing_manager.write().await;
+                        pm.handle_pairing_request(*device_id, device_name.clone(), public_key.clone()).await
+                    };
+                    match session_result {
+                        Ok(session) => {
+                            // Get public key separately to avoid borrow issues
+                            let public_key = {
+                                let pm = pairing_manager.read().await;
+                                pm.get_public_key()
+                            };
+
+                            // Send challenge back with PIN
+                            let challenge = Message::new(MessageType::PairingChallenge {
+                                device_id: self.settings.device.id,
+                                device_name: self.settings.device.name.clone(),
+                                public_key,
+                                pin: session.pin.clone(),
+                                session_id: session.session_id,
+                            });
+                            self.send_message_to_peer(peer_id, challenge).await?;
+                            info!("✅ Sent pairing challenge with PIN to {}", device_name);
+                        }
+                        Err(e) => {
+                            error!("❌ Failed to handle pairing request: {}", e);
+                            let reject = Message::new(MessageType::PairingReject {
+                                session_id: Uuid::new_v4(),
+                                reason: format!("{}", e),
+                            });
+                            self.send_message_to_peer(peer_id, reject).await?;
+                        }
+                    }
+                } else {
+                    warn!("⚠️ Received pairing request but pairing manager not available");
+                }
+            }
+
+            MessageType::PairingChallenge {
+                device_id,
+                device_name,
+                public_key,
+                pin,
+                session_id,
+            } => {
+                info!("🔐 Received pairing challenge from {} with PIN: {}", device_name, pin);
+
+                if let Some(pairing_manager) = &self.pairing_manager {
+                    let pm = pairing_manager.read().await;
+                    // Store the challenge info in the session
+                    if let Err(e) = pm.update_session_for_challenge(*device_id, public_key.clone(), pin.clone()).await {
+                        warn!("⚠️ Failed to update session for challenge: {}", e);
+                    }
+                } else {
+                    warn!("⚠️ Received pairing challenge but pairing manager not available");
+                }
+            }
+
+            MessageType::PairingConfirm {
+                session_id,
+                signed_challenge,
+            } => {
+                info!("✅ Received pairing confirmation for session {}", session_id);
+
+                if let Some(pairing_manager) = &self.pairing_manager {
+                    let verification_result = {
+                        let mut pm = pairing_manager.write().await;
+                        pm.verify_pairing_confirmation(resolved_peer_id, signed_challenge.clone()).await
+                    };
+                    match verification_result {
+                        Ok(()) => {
+                            // Send completion acknowledgment
+                            let complete = Message::new(MessageType::PairingComplete {
+                                session_id: *session_id,
+                                signed_acknowledgment: vec![], // TODO: Sign acknowledgment
+                            });
+                            self.send_message_to_peer(peer_id, complete).await?;
+                            info!("✅ Pairing completed with device {}", resolved_peer_id);
+                        }
+                        Err(e) => {
+                            error!("❌ Failed to verify pairing confirmation: {}", e);
+                            let reject = Message::new(MessageType::PairingReject {
+                                session_id: *session_id,
+                                reason: format!("{}", e),
+                            });
+                            self.send_message_to_peer(peer_id, reject).await?;
+                        }
+                    }
+                } else {
+                    warn!("⚠️ Received pairing confirmation but pairing manager not available");
+                }
+            }
+
+            MessageType::PairingComplete {
+                session_id,
+                signed_acknowledgment: _,
+            } => {
+                info!("🎉 Pairing complete acknowledgment for session {}", session_id);
+
+                if let Some(pairing_manager) = &self.pairing_manager {
+                    let pm = pairing_manager.read().await;
+                    pm.complete_pairing(resolved_peer_id).await.ok();
+                } else {
+                    warn!("⚠️ Received pairing complete but pairing manager not available");
+                }
+            }
+
+            MessageType::PairingReject {
+                session_id,
+                reason,
+            } => {
+                warn!("❌ Pairing rejected for session {}: {}", session_id, reason);
+
+                if let Some(pairing_manager) = &self.pairing_manager {
+                    let pm = pairing_manager.read().await;
+                    // We need to find the session_id for this peer
+                    let sessions = pm.get_active_sessions().await;
+                    if let Some(session) = sessions.iter().find(|s| s.peer_device_id == resolved_peer_id) {
+                        pm.reject_pairing(session.session_id, reason.clone()).await.ok();
+                    }
+                } else {
+                    warn!("⚠️ Received pairing rejection but pairing manager not available");
                 }
             }
 

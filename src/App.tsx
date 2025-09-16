@@ -7,6 +7,7 @@ import { Power } from 'lucide-react';
 import Header from './components/Headers';
 import Navigation from './components/Navigation';
 import DevicesList from './components/DevicesList';
+import PairingTab from './components/PairingTab';
 import AdvancedSettings from './components/AdvancedSettings';
 import EnhancedInfo from './components/EnhancedInfo';
 import TransferProgress from './components/TransferProgress';
@@ -52,7 +53,7 @@ function App() {
     // State
     const [devices, setDevices] = useState<DeviceInfo[]>([]);
     const [settings, setSettings] = useState<AppSettings | null>(null);
-    const [activeTab, setActiveTab] = useState<'devices' | 'settings' | 'info'>('devices');
+    const [activeTab, setActiveTab] = useState<'devices' | 'pairing' | 'settings' | 'info'>('devices');
     const [isLoading, setIsLoading] = useState(true);
     const [lastUpdate, setLastUpdate] = useState<Date>(new Date());
     const [connectionStatus, setConnectionStatus] = useState(false);
@@ -333,6 +334,11 @@ function App() {
     }, []);
 
     const filteredDevices = getFilteredDevices();
+    
+    // Calculate paired and unpaired device counts
+    const pairedDevices = filteredDevices.filter(device => device.is_paired);
+    const unpairedDevices = devices.filter(device => !device.is_paired);
+    const unpairedDeviceCount = unpairedDevices.length;
 
     return (
         <div className="app-container w-full h-full bg-gradient-to-br from-slate-900/95 to-slate-800/95 backdrop-blur-xl border border-white/10 shadow-2xl relative">
@@ -359,7 +365,8 @@ function App() {
                 <Navigation
                     activeTab={activeTab}
                     onTabChange={setActiveTab}
-                    deviceCount={filteredDevices.length}
+                    deviceCount={pairedDevices.length}
+                    unpairedDeviceCount={unpairedDeviceCount}
                 />
             </SlideIn>
 
@@ -370,7 +377,7 @@ function App() {
                         <FadeIn key="devices">
                             <DevicesList
                                 devices={devices}
-                                filteredDevices={filteredDevices}
+                                filteredDevices={pairedDevices}
                                 isLoading={isLoading}
                                 searchTerm={searchTerm}
                                 filterType={filterType}
@@ -386,6 +393,14 @@ function App() {
                                 onBulkAction={handleBulkAction}
                                 onRefresh={handleRefresh}
                                 deviceActions={deviceActions}
+                            />
+                        </FadeIn>
+                    )}
+
+                    {activeTab === 'pairing' && (
+                        <FadeIn key="pairing">
+                            <PairingTab 
+                                onRefresh={handleRefresh}
                             />
                         </FadeIn>
                     )}

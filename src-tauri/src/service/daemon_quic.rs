@@ -3,6 +3,7 @@ use crate::{
     config::Settings,
     hotkeys::{HotkeyEvent, HotkeyManager},
     network::{DiscoveryService, PeerManager},
+    pairing::PairingManager,
     Result,
 };
 use std::sync::Arc;
@@ -14,6 +15,7 @@ pub struct FileshareDaemon {
     settings: Arc<Settings>,
     pub discovery: Option<DiscoveryService>,
     pub peer_manager: Arc<RwLock<PeerManager>>,
+    pub pairing_manager: Arc<RwLock<PairingManager>>,
     hotkey_manager: Option<HotkeyManager>,
     clipboard: ClipboardManager,
     shutdown_tx: broadcast::Sender<()>,
@@ -26,7 +28,28 @@ impl FileshareDaemon {
         let (shutdown_tx, shutdown_rx) = broadcast::channel(1);
 
         // Initialize peer manager with QUIC
-        let peer_manager = PeerManager::new(settings.clone()).await?;
+        let mut peer_manager = PeerManager::new(settings.clone()).await?;
+
+        // Get proper config path for keypair
+        let keypair_path = if let Some(proj_dirs) = directories::ProjectDirs::from("com", "fileshare", "daemon") {
+            let config_dir = proj_dirs.config_dir();
+            std::fs::create_dir_all(config_dir).ok();
+            config_dir.join("device_keypair.pem")
+        } else {
+            std::path::PathBuf::from("/tmp/device_keypair.pem")
+        };
+
+        // Initialize pairing manager
+        let pairing_manager = PairingManager::new(
+            settings.device.id,
+            settings.device.name.clone(),
+            keypair_path,
+            settings.security.paired_devices.clone(),
+        )?;
+        let pairing_manager = Arc::new(RwLock::new(pairing_manager));
+
+        // Set pairing manager in peer manager
+        peer_manager.set_pairing_manager(pairing_manager.clone());
         let peer_manager = Arc::new(RwLock::new(peer_manager));
 
         // Initialize discovery service
@@ -47,6 +70,7 @@ impl FileshareDaemon {
             settings,
             discovery: Some(discovery),
             peer_manager,
+            pairing_manager,
             hotkey_manager: Some(hotkey_manager),
             clipboard,
             shutdown_tx,
