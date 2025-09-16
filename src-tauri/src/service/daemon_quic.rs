@@ -115,6 +115,17 @@ impl FileshareDaemon {
             .await;
         });
 
+        // Start peer cleanup service
+        let peer_manager_for_cleanup = self.peer_manager.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(30)); // Cleanup every 30 seconds
+            loop {
+                interval.tick().await;
+                let mut pm = peer_manager_for_cleanup.write().await;
+                pm.cleanup_stale_peers().await;
+            }
+        });
+
         // Start discovery service
         if let Some(discovery) = &self.discovery {
             let mut discovery_clone = discovery.clone();

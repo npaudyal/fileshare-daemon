@@ -292,7 +292,7 @@ function App() {
     };
 
     const handleSelectAll = () => {
-        const filteredDeviceIds = getFilteredDevices().map(d => d.id);
+        const filteredDeviceIds = pairedDevices.map((d: any) => d.device_id);
         setSelectedDevices(new Set(filteredDeviceIds));
         setShowBulkActions(filteredDeviceIds.length > 0);
     };

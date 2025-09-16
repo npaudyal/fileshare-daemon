@@ -202,18 +202,59 @@ impl PeerManager {
 
     pub async fn get_all_discovered_devices(&self) -> Vec<DeviceInfo> {
         let mut discovered = Vec::new();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
 
         for (_, peer) in &self.peers {
-            discovered.push(DeviceInfo {
-                id: peer.device_info.id,
-                name: peer.device_info.name.clone(),
-                addr: peer.device_info.addr,
-                last_seen: peer.device_info.last_seen,
-                version: peer.device_info.version.clone(),
-            });
+            // Only include peers that are still considered "fresh" (seen recently)
+            // This filters out stale devices without modifying the underlying data
+            if now - peer.device_info.last_seen <= 30 {
+                discovered.push(DeviceInfo {
+                    id: peer.device_info.id,
+                    name: peer.device_info.name.clone(),
+                    addr: peer.device_info.addr,
+                    last_seen: peer.device_info.last_seen,
+                    version: peer.device_info.version.clone(),
+                });
+            }
         }
 
         discovered
+    }
+
+    // Add background cleanup method for stale peers (called periodically)
+    pub async fn cleanup_stale_peers(&mut self) {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+
+        let timeout_secs = 60; // Remove after 60 seconds of no contact
+        let mut to_remove = Vec::new();
+
+        // Find peers that haven't been seen for a while
+        for (peer_id, peer) in &self.peers {
+            if now - peer.device_info.last_seen > timeout_secs {
+                to_remove.push(*peer_id);
+            }
+        }
+
+        // Remove stale peers
+        for peer_id in to_remove {
+            if let Some(peer) = self.peers.get(&peer_id) {
+                info!("🧹 Removing stale peer: {} ({})", peer.device_info.name, peer_id);
+            }
+
+            self.peers.remove(&peer_id);
+            self.stream_managers.remove(&peer_id);
+            self.quic_manager.remove_connection(peer_id).await;
+
+            // Clean up any temporary ID mappings
+            self.temp_to_real_id_map
+                .retain(|_temp_id, real_id| *real_id != peer_id);
+        }
     }
 
     pub async fn on_device_discovered(&mut self, device_info: DeviceInfo) -> Result<()> {
