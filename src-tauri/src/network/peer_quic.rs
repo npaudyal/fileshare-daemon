@@ -231,7 +231,17 @@ impl PeerManager {
                 existing_peer.connection_status,
                 ConnectionStatus::Disconnected | ConnectionStatus::Error(_)
             ) {
-                if self.should_connect_to_peer(&device_info) {
+                // When pairing is required, we still need to connect to all devices
+                // to allow pairing. File transfer restrictions are enforced at message level.
+                let should_connect = if self.settings.security.require_pairing {
+                    // Always connect to enable pairing flow
+                    true
+                } else {
+                    // When pairing not required, connect to all
+                    true
+                };
+
+                if should_connect {
                     info!(
                         "🔗 Attempting QUIC connection to existing peer: {}",
                         device_info.name
@@ -273,20 +283,14 @@ impl PeerManager {
         );
         self.peers.insert(device_info.id, peer);
 
-        // Attempt to connect
-        if self.should_connect_to_peer(&device_info) {
-            info!(
-                "🔗 Attempting QUIC connection to peer: {}",
-                device_info.name
-            );
-            if let Err(e) = self.connect_to_peer(device_info.id).await {
-                error!("❌ Failed to connect to peer {}: {}", device_info.name, e);
-            }
-        } else {
-            info!(
-                "⏭️ Skipping connection to peer {} (pairing required: {})",
-                device_info.name, self.settings.security.require_pairing
-            );
+        // Always attempt to connect to enable pairing flow
+        // File transfer restrictions will be enforced at the message handler level
+        info!(
+            "🔗 Attempting QUIC connection to peer: {} (pairing mode: {})",
+            device_info.name, self.settings.security.require_pairing
+        );
+        if let Err(e) = self.connect_to_peer(device_info.id).await {
+            error!("❌ Failed to connect to peer {}: {}", device_info.name, e);
         }
 
         Ok(())
@@ -303,6 +307,13 @@ impl PeerManager {
         } else {
             true
         }
+    }
+
+    // New method to check if we should allow connection for pairing
+    fn should_allow_pairing_connection(&self, _device_info: &DeviceInfo) -> bool {
+        // Always allow connections for pairing purposes
+        // The actual file transfer restrictions will be enforced at the message handler level
+        true
     }
 
     pub async fn connect_to_peer(&mut self, peer_id: Uuid) -> Result<()> {

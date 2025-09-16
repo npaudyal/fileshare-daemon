@@ -384,15 +384,55 @@ async fn initiate_pairing(
         .map_err(|e| format!("Invalid device ID: {}", e))?;
 
     if let Some(daemon_ref) = state.daemon_ref.lock().await.as_ref() {
-        let pm = daemon_ref.pairing_manager.write().await;
-
-        // Find device name from discovered devices
+        // Find device info from discovered devices
         let discovered = daemon_ref.get_discovered_devices().await;
-        let device_name = discovered
+        let device_info = discovered
             .iter()
             .find(|d| d.id == device_uuid)
-            .map(|d| d.name.clone())
-            .unwrap_or_else(|| "Unknown Device".to_string());
+            .ok_or_else(|| format!("Device {} not found in discovered devices", device_id))?;
+
+        let device_name = device_info.name.clone();
+
+        // Ensure QUIC connection exists before attempting pairing
+        {
+            let mut peer_manager = daemon_ref.peer_manager.write().await;
+
+            // Check if we have an authenticated connection
+            let is_connected = peer_manager.peers.get(&device_uuid)
+                .map(|peer| matches!(peer.connection_status,
+                    fileshare_daemon::network::peer_quic::ConnectionStatus::Connected |
+                    fileshare_daemon::network::peer_quic::ConnectionStatus::Authenticated))
+                .unwrap_or(false);
+
+            if !is_connected {
+                info!("🔗 No QUIC connection to device, attempting to establish connection first...");
+
+                // Trigger connection to the device
+                if let Err(e) = peer_manager.connect_to_peer(device_uuid).await {
+                    error!("❌ Failed to establish QUIC connection: {}", e);
+                    return Err(format!("Failed to establish connection with device: {}", e));
+                }
+
+                // Wait a moment for the connection to establish
+                tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+
+                // Check connection status again
+                let connected_after = peer_manager.peers.get(&device_uuid)
+                    .map(|peer| matches!(peer.connection_status,
+                        fileshare_daemon::network::peer_quic::ConnectionStatus::Connected |
+                        fileshare_daemon::network::peer_quic::ConnectionStatus::Authenticated))
+                    .unwrap_or(false);
+
+                if !connected_after {
+                    return Err("Failed to establish QUIC connection with device. Please ensure the device is online and try again.".to_string());
+                }
+
+                info!("✅ QUIC connection established successfully");
+            }
+        }
+
+        // Now proceed with pairing
+        let pm = daemon_ref.pairing_manager.write().await;
 
         match pm.initiate_pairing(device_uuid, device_name).await {
             Ok(session) => {
@@ -405,14 +445,21 @@ async fn initiate_pairing(
                         public_key: pm.get_public_key(),
                     },
                 );
-                peer_manager.send_message_to_peer(device_uuid, request).await
-                    .map_err(|e| format!("Failed to send pairing request: {}", e))?;
 
-                Ok(serde_json::json!({
-                    "session_id": session.session_id.to_string(),
-                    "pin": session.pin,
-                    "state": "initiated"
-                }))
+                match peer_manager.send_message_to_peer(device_uuid, request).await {
+                    Ok(()) => {
+                        info!("✅ Pairing request sent successfully");
+                        Ok(serde_json::json!({
+                            "session_id": session.session_id.to_string(),
+                            "pin": session.pin,
+                            "state": "initiated"
+                        }))
+                    }
+                    Err(e) => {
+                        error!("❌ Failed to send pairing request: {}", e);
+                        Err(format!("Failed to send pairing request: {}", e))
+                    }
+                }
             }
             Err(e) => Err(format!("Failed to initiate pairing: {}", e)),
         }
@@ -953,7 +1000,7 @@ async fn connect_to_peer(
 #[tauri::command]
 async fn disconnect_from_peer(
     device_id: String,
-    state: tauri::State<'_, AppState>,
+    _state: tauri::State<'_, AppState>,
 ) -> Result<(), String> {
     info!("🔌 UI requested to disconnect from device: {}", device_id);
 
