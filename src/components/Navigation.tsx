@@ -1,6 +1,7 @@
 import React from 'react';
 import { motion } from 'framer-motion';
 import { Monitor, Settings, Info, Shield } from 'lucide-react';
+import { useTheme } from '../context/ThemeContext';
 
 interface NavigationProps {
     activeTab: 'devices' | 'pairing' | 'settings' | 'info';
@@ -10,6 +11,8 @@ interface NavigationProps {
 }
 
 const Navigation: React.FC<NavigationProps> = ({ activeTab, onTabChange, deviceCount, unpairedDeviceCount }) => {
+    const { theme } = useTheme();
+
     const tabs = [
         { id: 'devices', label: 'Devices', icon: Monitor, count: deviceCount },
         { id: 'pairing', label: 'Pairing', icon: Shield, count: unpairedDeviceCount > 0 ? unpairedDeviceCount : undefined },
@@ -19,29 +22,44 @@ const Navigation: React.FC<NavigationProps> = ({ activeTab, onTabChange, deviceC
 
     return (
         <div className="w-full px-4 py-2">
-            <div className="flex items-center gap-2 p-1.5 bg-gray-900/70 backdrop-blur-sm rounded-full">
+            <div
+                className="flex items-center gap-2 p-1.5 backdrop-blur-sm rounded-full transition-all duration-300"
+                style={{ backgroundColor: `${theme.colors.backgroundSecondary}CC` }}
+            >
                 {tabs.map(({ id, label, icon: Icon, count }) => (
                     <motion.button
                         key={id}
                         whileHover={{ scale: 1.02 }}
                         whileTap={{ scale: 0.98 }}
                         onClick={() => onTabChange(id)}
-                        className={`
-                            flex-1 relative px-4 py-2 rounded-full text-sm font-medium 
-                            transition-all duration-200 flex items-center justify-center gap-1.5
-                            ${activeTab === id
-                                ? 'bg-cyan-500/20 text-cyan-400 border border-cyan-500/30'
-                                : 'text-gray-400 hover:text-gray-300 hover:bg-gray-800/60'
+                        className="flex-1 relative px-4 py-2 rounded-full text-sm font-medium transition-all duration-200 flex items-center justify-center gap-1.5"
+                        style={{
+                            backgroundColor: activeTab === id ? `${theme.colors.accent1}20` : 'transparent',
+                            color: activeTab === id ? theme.colors.accent1 : theme.colors.textSecondary,
+                            border: activeTab === id ? `1px solid ${theme.colors.accent1}40` : '1px solid transparent',
+                        }}
+                        onMouseEnter={(e) => {
+                            if (activeTab !== id) {
+                                e.currentTarget.style.backgroundColor = `${theme.colors.backgroundTertiary}`;
+                                e.currentTarget.style.color = theme.colors.text;
                             }
-                        `}
+                        }}
+                        onMouseLeave={(e) => {
+                            if (activeTab !== id) {
+                                e.currentTarget.style.backgroundColor = 'transparent';
+                                e.currentTarget.style.color = theme.colors.textSecondary;
+                            }
+                        }}
                     >
                         <Icon className="w-4 h-4" />
                         <span>{label}</span>
                         {count !== undefined && (
-                            <span className={`
-                                text-xs font-medium
-                                ${activeTab === id ? 'text-cyan-400' : 'text-gray-500'}
-                            `}>
+                            <span
+                                className="text-xs font-medium"
+                                style={{
+                                    color: activeTab === id ? theme.colors.accent1 : theme.colors.textTertiary
+                                }}
+                            >
                                 ({count})
                             </span>
                         )}

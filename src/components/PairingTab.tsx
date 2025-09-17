@@ -13,6 +13,7 @@ import {
     WifiOff,
 } from 'lucide-react';
 import { invoke } from '@tauri-apps/api/core';
+import { useTheme } from '../context/ThemeContext';
 
 // Types
 interface UnpairedDevice {
@@ -50,12 +51,14 @@ interface PairingTabProps {
 }
 
 const PairingTab: React.FC<PairingTabProps> = ({ onRefresh }) => {
+    const { theme } = useTheme();
     const [unpairedDevices, setUnpairedDevices] = useState<UnpairedDevice[]>([]);
     const [activeSessions, setActiveSessions] = useState<Map<string, PairingSession>>(new Map());
     const [isLoading, setIsLoading] = useState(true);
     const [searchTerm, setSearchTerm] = useState('');
     const [osFilter, setOsFilter] = useState<'all' | 'mac' | 'windows' | 'linux'>('all');
     const mountedRef = useRef(true);
+    const [hoveredButton, setHoveredButton] = useState<string | null>(null);
 
     // Load unpaired devices and active sessions
     const loadPairingData = async (showLoading = true) => {
@@ -199,10 +202,18 @@ const PairingTab: React.FC<PairingTabProps> = ({ onRefresh }) => {
     // Get pairing button content based on session state
     const getPairingButton = (device: UnpairedDevice, session?: PairingSession) => {
         if (!session) {
+            const buttonId = `pair-${device.id}`;
+            const isHovered = hoveredButton === buttonId;
             return (
                 <button
                     onClick={() => handlePairDevice(device.id)}
-                    className="px-3 py-1 bg-gray-700 hover:bg-gray-600 text-white rounded-full text-xs font-medium transition-colors"
+                    onMouseEnter={() => setHoveredButton(buttonId)}
+                    onMouseLeave={() => setHoveredButton(null)}
+                    className="px-3 py-1 rounded-full text-xs font-medium transition-colors"
+                    style={{
+                        backgroundColor: isHovered ? theme.colors.hover : theme.colors.backgroundTertiary,
+                        color: theme.colors.text
+                    }}
                 >
                     Pair
                 </button>
@@ -212,10 +223,18 @@ const PairingTab: React.FC<PairingTabProps> = ({ onRefresh }) => {
         // Handle different session states
         const state = session.state;
         if (typeof state === 'object' && 'Failed' in state) {
+            const buttonId = `retry-${device.id}`;
+            const isHovered = hoveredButton === buttonId;
             return (
                 <button
                     onClick={() => handlePairDevice(device.id)}
-                    className="px-3 py-1 bg-red-600 hover:bg-red-700 text-white rounded-full text-xs font-medium transition-colors flex items-center gap-1"
+                    onMouseEnter={() => setHoveredButton(buttonId)}
+                    onMouseLeave={() => setHoveredButton(null)}
+                    className="px-3 py-1 rounded-full text-xs font-medium transition-colors flex items-center gap-1"
+                    style={{
+                        backgroundColor: isHovered ? '#FF6666' : theme.colors.error,
+                        color: theme.colors.text
+                    }}
                 >
                     <XCircle className="w-3 h-3" />
                     Retry
@@ -229,7 +248,11 @@ const PairingTab: React.FC<PairingTabProps> = ({ onRefresh }) => {
                 return (
                     <button
                         disabled
-                        className="px-3 py-1 bg-gray-700 text-gray-400 rounded-full text-xs font-medium flex items-center gap-1"
+                        className="px-3 py-1 rounded-full text-xs font-medium flex items-center gap-1"
+                        style={{
+                            backgroundColor: theme.colors.backgroundTertiary,
+                            color: theme.colors.textSecondary
+                        }}
                     >
                         <Loader2 className="w-3 h-3 animate-spin" />
                         Pairing
@@ -239,24 +262,44 @@ const PairingTab: React.FC<PairingTabProps> = ({ onRefresh }) => {
                 return (
                     <button
                         disabled
-                        className="px-3 py-1 bg-blue-600 text-white rounded-full text-xs font-medium flex items-center gap-1"
+                        className="px-3 py-1 rounded-full text-xs font-medium flex items-center gap-1"
+                        style={{
+                            backgroundColor: theme.colors.accent2,
+                            color: theme.colors.text
+                        }}
                     >
                         <Key className="w-3 h-3" />
                         Pairing
                     </button>
                 );
             case 'AwaitingApproval':
+                const acceptButtonId = `accept-${session.session_id}`;
+                const rejectButtonId = `reject-${session.session_id}`;
+                const isAcceptHovered = hoveredButton === acceptButtonId;
+                const isRejectHovered = hoveredButton === rejectButtonId;
                 return (
                     <div className="flex gap-2">
                         <button
                             onClick={() => handleConfirmPairing(session.session_id)}
-                            className="px-3 py-1 bg-green-600 hover:bg-green-700 text-white rounded-full text-xs font-medium transition-colors"
+                            onMouseEnter={() => setHoveredButton(acceptButtonId)}
+                            onMouseLeave={() => setHoveredButton(null)}
+                            className="px-3 py-1 rounded-full text-xs font-medium transition-colors"
+                            style={{
+                                backgroundColor: isAcceptHovered ? '#00FF9E' : theme.colors.success,
+                                color: theme.colors.text
+                            }}
                         >
                             Accept
                         </button>
                         <button
                             onClick={() => handleRejectPairing(session.session_id)}
-                            className="px-3 py-1 bg-gray-700 hover:bg-gray-600 text-white rounded-full text-xs font-medium transition-colors"
+                            onMouseEnter={() => setHoveredButton(rejectButtonId)}
+                            onMouseLeave={() => setHoveredButton(null)}
+                            className="px-3 py-1 rounded-full text-xs font-medium transition-colors"
+                            style={{
+                                backgroundColor: isRejectHovered ? theme.colors.hover : theme.colors.backgroundTertiary,
+                                color: theme.colors.text
+                            }}
                         >
                             Reject
                         </button>
@@ -266,17 +309,29 @@ const PairingTab: React.FC<PairingTabProps> = ({ onRefresh }) => {
                 return (
                     <button
                         disabled
-                        className="px-3 py-1 bg-green-600 text-white rounded-full text-xs font-medium flex items-center gap-1"
+                        className="px-3 py-1 rounded-full text-xs font-medium flex items-center gap-1"
+                        style={{
+                            backgroundColor: theme.colors.success,
+                            color: theme.colors.text
+                        }}
                     >
                         <CheckCircle className="w-3 h-3" />
                         Paired
                     </button>
                 );
             default:
+                const defaultButtonId = `default-pair-${device.id}`;
+                const isDefaultHovered = hoveredButton === defaultButtonId;
                 return (
                     <button
                         onClick={() => handlePairDevice(device.id)}
-                        className="px-3 py-1 bg-gray-700 hover:bg-gray-600 text-white rounded-full text-xs font-medium transition-colors"
+                        onMouseEnter={() => setHoveredButton(defaultButtonId)}
+                        onMouseLeave={() => setHoveredButton(null)}
+                        className="px-3 py-1 rounded-full text-xs font-medium transition-colors"
+                        style={{
+                            backgroundColor: isDefaultHovered ? theme.colors.hover : theme.colors.backgroundTertiary,
+                            color: theme.colors.text
+                        }}
                     >
                         Pair
                     </button>
@@ -286,65 +341,68 @@ const PairingTab: React.FC<PairingTabProps> = ({ onRefresh }) => {
 
     return (
         <div className="space-y-4">
-            <h2 className="text-lg font-medium text-white">Available Devices</h2>
+            <h2 className="text-lg font-medium" style={{ color: theme.colors.text }}>Available Devices</h2>
 
             {/* Search Bar */}
             <div className="relative">
-                <Search className="absolute left-3 top-1/2 transform -translate-y-1/2 text-gray-400 w-4 h-4" />
+                <Search className="absolute left-3 top-1/2 transform -translate-y-1/2 w-4 h-4" style={{ color: theme.colors.textSecondary }} />
                 <input
                     type="text"
                     placeholder="Search Devices..."
                     value={searchTerm}
                     onChange={(e) => setSearchTerm(e.target.value)}
-                    className="w-full pl-10 pr-4 py-2 bg-gray-800/50 border border-gray-700 rounded-lg text-white placeholder-gray-500 focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent text-sm"
+                    className="w-full pl-10 pr-4 py-2 rounded-lg text-sm focus:outline-none focus:ring-2 focus:border-transparent placeholder-color"
+                    style={{
+                        backgroundColor: theme.colors.backgroundSecondary + '80',
+                        borderColor: theme.colors.border,
+                        borderWidth: '1px',
+                        color: theme.colors.text,
+                        ['--placeholder-color' as any]: theme.colors.textTertiary
+                    }}
                 />
             </div>
 
             {/* OS Filter Buttons */}
             <div className="flex items-center gap-2">
-                <button
-                    onClick={() => setOsFilter('all')}
-                    className={`px-4 py-1.5 rounded-full text-sm font-medium transition-colors ${osFilter === 'all'
-                        ? 'bg-blue-600 text-white'
-                        : 'bg-gray-800 text-gray-400 hover:text-white hover:bg-gray-700'
-                        }`}
-                >
-                    All
-                </button>
-                <button
-                    onClick={() => setOsFilter('mac')}
-                    className={`px-4 py-1.5 rounded-full text-sm font-medium transition-colors ${osFilter === 'mac'
-                        ? 'bg-blue-600 text-white'
-                        : 'bg-gray-800 text-gray-400 hover:text-white hover:bg-gray-700'
-                        }`}
-                >
-                    Mac
-                </button>
-                <button
-                    onClick={() => setOsFilter('windows')}
-                    className={`px-4 py-1.5 rounded-full text-sm font-medium transition-colors ${osFilter === 'windows'
-                        ? 'bg-blue-600 text-white'
-                        : 'bg-gray-800 text-gray-400 hover:text-white hover:bg-gray-700'
-                        }`}
-                >
-                    Windows
-                </button>
-                <button
-                    onClick={() => setOsFilter('linux')}
-                    className={`px-4 py-1.5 rounded-full text-sm font-medium transition-colors ${osFilter === 'linux'
-                        ? 'bg-blue-600 text-white'
-                        : 'bg-gray-800 text-gray-400 hover:text-white hover:bg-gray-700'
-                        }`}
-                >
-                    Linux
-                </button>
+                {[{ key: 'all', label: 'All' }, { key: 'mac', label: 'Mac' }, { key: 'windows', label: 'Windows' }, { key: 'linux', label: 'Linux' }].map(({ key, label }) => {
+                    const isActive = osFilter === key;
+                    const buttonId = `filter-${key}`;
+                    const isHovered = hoveredButton === buttonId;
+                    return (
+                        <button
+                            key={key}
+                            onClick={() => setOsFilter(key as any)}
+                            onMouseEnter={() => setHoveredButton(buttonId)}
+                            onMouseLeave={() => setHoveredButton(null)}
+                            className="px-4 py-1.5 rounded-full text-sm font-medium transition-colors"
+                            style={{
+                                backgroundColor: isActive
+                                    ? theme.colors.accent2
+                                    : isHovered
+                                        ? theme.colors.backgroundTertiary
+                                        : theme.colors.backgroundSecondary,
+                                color: isActive
+                                    ? theme.colors.text
+                                    : isHovered
+                                        ? theme.colors.text
+                                        : theme.colors.textSecondary
+                            }}
+                        >
+                            {label}
+                        </button>
+                    );
+                })}
             </div>
 
             {/* Device List */}
             {isLoading ? (
                 <div className="space-y-2">
                     {[...Array(3)].map((_, i) => (
-                        <div key={i} className="bg-gray-800/30 rounded-lg h-12 animate-pulse" />
+                        <div
+                            key={i}
+                            className="rounded-lg h-12 animate-pulse"
+                            style={{ backgroundColor: theme.colors.backgroundSecondary + '50' }}
+                        />
                     ))}
                 </div>
             ) : filteredDevices.length === 0 ? (
@@ -353,14 +411,14 @@ const PairingTab: React.FC<PairingTabProps> = ({ onRefresh }) => {
                     animate={{ opacity: 1, scale: 1 }}
                     className="text-center py-6 mt-12"
                 >
-                    <WifiOff className="w-12 h-12 text-gray-400 mx-auto mb-3" />
-                    <p className="text-gray-400 text-sm">
+                    <WifiOff className="w-12 h-12 mx-auto mb-3" style={{ color: theme.colors.textSecondary }} />
+                    <p className="text-sm" style={{ color: theme.colors.textSecondary }}>
                         {searchTerm
                             ? 'No devices match your search'
                             : 'No unpaired devices found'
                         }
                     </p>
-                    <p className="text-gray-500 text-xs mt-1">
+                    <p className="text-xs mt-1" style={{ color: theme.colors.textTertiary }}>
                         {searchTerm
                             ? 'Try adjusting your search'
                             : 'Make sure other devices are running Yeet'
@@ -370,7 +428,17 @@ const PairingTab: React.FC<PairingTabProps> = ({ onRefresh }) => {
                         whileHover={{ scale: 1.05 }}
                         whileTap={{ scale: 0.95 }}
                         onClick={onRefresh}
-                        className="mt-3 px-3 py-1 text-xs bg-blue-500/20 text-blue-300 rounded hover:bg-blue-500/30 transition-colors"
+                        className="mt-3 px-3 py-1 text-xs rounded transition-colors"
+                        style={{
+                            backgroundColor: theme.colors.accent2 + '20',
+                            color: theme.colors.accent2
+                        }}
+                        onMouseEnter={(e) => {
+                            e.currentTarget.style.backgroundColor = theme.colors.accent2 + '30';
+                        }}
+                        onMouseLeave={(e) => {
+                            e.currentTarget.style.backgroundColor = theme.colors.accent2 + '20';
+                        }}
                     >
                         Refresh
                     </motion.button>
@@ -380,7 +448,8 @@ const PairingTab: React.FC<PairingTabProps> = ({ onRefresh }) => {
                     <motion.div
                         initial={{ opacity: 0 }}
                         animate={{ opacity: 1 }}
-                        className="text-xs text-gray-500 mb-2"
+                        className="text-xs mb-2"
+                        style={{ color: theme.colors.textTertiary }}
                     >
                         Showing {filteredDevices.length} device{filteredDevices.length !== 1 ? 's' : ''}
                     </motion.div>
@@ -393,14 +462,24 @@ const PairingTab: React.FC<PairingTabProps> = ({ onRefresh }) => {
                         return (
                             <div key={device.id} className="space-y-2">
                                 <motion.div
-                                    className="bg-gray-800/30 border border-gray-700 rounded-lg px-4 py-3 hover:bg-gray-800/50 transition-colors"
+                                    className="rounded-lg px-4 py-3 transition-colors border"
+                                    style={{
+                                        backgroundColor: theme.colors.backgroundSecondary + '50',
+                                        borderColor: theme.colors.border
+                                    }}
+                                    onMouseEnter={(e) => {
+                                        e.currentTarget.style.backgroundColor = theme.colors.backgroundSecondary + '80';
+                                    }}
+                                    onMouseLeave={(e) => {
+                                        e.currentTarget.style.backgroundColor = theme.colors.backgroundSecondary + '50';
+                                    }}
                                 >
                                     <div className="flex items-center justify-between">
                                         <div className="flex items-center gap-3">
-                                            <div className="text-gray-400">
+                                            <div style={{ color: theme.colors.textSecondary }}>
                                                 {getDeviceIcon(device.platform)}
                                             </div>
-                                            <span className="text-white text-sm font-medium">{device.name}</span>
+                                            <span className="text-sm font-medium" style={{ color: theme.colors.text }}>{device.name}</span>
                                         </div>
                                         {getPairingButton(device, session)}
                                     </div>
@@ -413,20 +492,24 @@ const PairingTab: React.FC<PairingTabProps> = ({ onRefresh }) => {
                                             initial={{ opacity: 0, height: 0 }}
                                             animate={{ opacity: 1, height: 'auto' }}
                                             exit={{ opacity: 0, height: 0 }}
-                                            className="bg-gray-800/50 border border-gray-700 rounded-lg p-4 ml-4"
+                                            className="rounded-lg p-4 ml-4 border"
+                                            style={{
+                                                backgroundColor: theme.colors.backgroundSecondary + '80',
+                                                borderColor: theme.colors.border
+                                            }}
                                         >
                                             <div className="flex items-start gap-3">
-                                                <Key className="w-4 h-4 text-gray-400 mt-1" />
+                                                <Key className="w-4 h-4 mt-1" style={{ color: theme.colors.textSecondary }} />
                                                 <div className="flex-1">
-                                                    <h4 className="text-white text-sm font-medium mb-1">Your Pairing PIN</h4>
-                                                    <p className="text-xs text-gray-500 mb-3">
+                                                    <h4 className="text-sm font-medium mb-1" style={{ color: theme.colors.text }}>Your Pairing PIN</h4>
+                                                    <p className="text-xs mb-3" style={{ color: theme.colors.textTertiary }}>
                                                         Share this PIN with devices that want to pair with you
                                                     </p>
-                                                    <div className="text-2xl font-mono font-bold text-white mb-2">
+                                                    <div className="text-2xl font-mono font-bold mb-2" style={{ color: theme.colors.text }}>
                                                         {session.pin}
                                                     </div>
                                                     {session.remaining_seconds > 0 && (
-                                                        <div className="flex items-center gap-1 text-xs text-gray-500">
+                                                        <div className="flex items-center gap-1 text-xs" style={{ color: theme.colors.textTertiary }}>
                                                             <Clock className="w-3 h-3" />
                                                             <span>
                                                                 {Math.floor(session.remaining_seconds / 60)}:
@@ -445,16 +528,20 @@ const PairingTab: React.FC<PairingTabProps> = ({ onRefresh }) => {
                                             initial={{ opacity: 0, height: 0 }}
                                             animate={{ opacity: 1, height: 'auto' }}
                                             exit={{ opacity: 0, height: 0 }}
-                                            className="bg-yellow-900/20 border border-yellow-700 rounded-lg p-4 ml-4"
+                                            className="rounded-lg p-4 ml-4 border"
+                                            style={{
+                                                backgroundColor: theme.colors.warning + '20',
+                                                borderColor: theme.colors.warning + '70'
+                                            }}
                                         >
                                             <div className="flex items-start gap-3">
-                                                <Key className="w-4 h-4 text-yellow-400 mt-1" />
+                                                <Key className="w-4 h-4 mt-1" style={{ color: theme.colors.warning }} />
                                                 <div className="flex-1">
-                                                    <h4 className="text-white text-sm font-medium mb-1">Verify PIN</h4>
-                                                    <p className="text-xs text-gray-500 mb-3">
+                                                    <h4 className="text-sm font-medium mb-1" style={{ color: theme.colors.text }}>Verify PIN</h4>
+                                                    <p className="text-xs mb-3" style={{ color: theme.colors.textTertiary }}>
                                                         Make sure this matches the PIN shown on {session.peer_name}
                                                     </p>
-                                                    <div className="text-2xl font-mono font-bold text-yellow-400 mb-2">
+                                                    <div className="text-2xl font-mono font-bold mb-2" style={{ color: theme.colors.warning }}>
                                                         {session.pin}
                                                     </div>
                                                 </div>

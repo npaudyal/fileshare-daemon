@@ -12,6 +12,7 @@ import {
     Minimize2
 } from 'lucide-react';
 import { invoke } from '@tauri-apps/api/core';
+import { useTheme } from '../context/ThemeContext';
 
 interface Transfer {
     id: string;
@@ -33,8 +34,10 @@ interface TransferProgressProps {
 }
 
 const TransferProgress: React.FC<TransferProgressProps> = ({ isVisible, onToggle }) => {
+    const { theme } = useTheme();
     const [transfers, setTransfers] = useState<Transfer[]>([]);
     const [isMinimized, setIsMinimized] = useState(false);
+    const [hoveredButton, setHoveredButton] = useState<string | null>(null);
 
     useEffect(() => {
         if (isVisible) {
@@ -93,11 +96,11 @@ const TransferProgress: React.FC<TransferProgressProps> = ({ isVisible, onToggle
 
     const getStatusColor = (status: string) => {
         switch (status) {
-            case 'active': return 'text-blue-400';
-            case 'paused': return 'text-yellow-400';
-            case 'completed': return 'text-green-400';
-            case 'error': return 'text-red-400';
-            default: return 'text-gray-400';
+            case 'active': return theme.colors.accent2;
+            case 'paused': return theme.colors.warning;
+            case 'completed': return theme.colors.success;
+            case 'error': return theme.colors.error;
+            default: return theme.colors.textSecondary;
         }
     };
 
@@ -112,16 +115,27 @@ const TransferProgress: React.FC<TransferProgressProps> = ({ isVisible, onToggle
                 initial={{ opacity: 0, y: 50 }}
                 animate={{ opacity: 1, y: 0 }}
                 exit={{ opacity: 0, y: 50 }}
-                className="fixed bottom-4 right-4 z-50 bg-slate-800/95 backdrop-blur-xl rounded-lg border border-white/10 shadow-2xl"
-                style={{ width: isMinimized ? '300px' : '400px' }}
+                className="fixed bottom-4 right-4 z-50 backdrop-blur-xl rounded-lg border shadow-2xl"
+                style={{
+                    backgroundColor: theme.colors.backgroundSecondary + 'F0',
+                    borderColor: theme.colors.border,
+                    boxShadow: `0 25px 50px -12px ${theme.colors.shadowStrong}`,
+                    width: isMinimized ? '300px' : '400px'
+                }}
             >
                 {/* Header */}
-                <div className="flex items-center justify-between p-3 border-b border-white/10">
+                <div className="flex items-center justify-between p-3 border-b" style={{ borderColor: theme.colors.border }}>
                     <div className="flex items-center space-x-2">
-                        <Download className="w-4 h-4 text-blue-400" />
-                        <span className="text-white font-medium text-sm">Transfers</span>
+                        <Download className="w-4 h-4" style={{ color: theme.colors.accent2 }} />
+                        <span className="font-medium text-sm" style={{ color: theme.colors.text }}>Transfers</span>
                         {activeTransfers.length > 0 && (
-                            <span className="bg-blue-500 text-white text-xs px-2 py-1 rounded-full">
+                            <span
+                                className="text-xs px-2 py-1 rounded-full"
+                                style={{
+                                    backgroundColor: theme.colors.accent2,
+                                    color: theme.colors.text
+                                }}
+                            >
                                 {activeTransfers.length}
                             </span>
                         )}
@@ -129,13 +143,23 @@ const TransferProgress: React.FC<TransferProgressProps> = ({ isVisible, onToggle
                     <div className="flex items-center space-x-1">
                         <button
                             onClick={() => setIsMinimized(!isMinimized)}
-                            className="p-1 text-gray-400 hover:text-white transition-colors"
+                            onMouseEnter={() => setHoveredButton('minimize')}
+                            onMouseLeave={() => setHoveredButton(null)}
+                            className="p-1 transition-colors"
+                            style={{
+                                color: hoveredButton === 'minimize' ? theme.colors.text : theme.colors.textSecondary
+                            }}
                         >
                             <Minimize2 className="w-4 h-4" />
                         </button>
                         <button
                             onClick={onToggle}
-                            className="p-1 text-gray-400 hover:text-white transition-colors"
+                            onMouseEnter={() => setHoveredButton('close')}
+                            onMouseLeave={() => setHoveredButton(null)}
+                            className="p-1 transition-colors"
+                            style={{
+                                color: hoveredButton === 'close' ? theme.colors.text : theme.colors.textSecondary
+                            }}
                         >
                             <X className="w-4 h-4" />
                         </button>
@@ -152,25 +176,26 @@ const TransferProgress: React.FC<TransferProgressProps> = ({ isVisible, onToggle
                         {/* Active Transfers */}
                         {activeTransfers.length > 0 && (
                             <div className="p-3 space-y-3">
-                                <h4 className="text-xs font-medium text-gray-400 uppercase tracking-wide">
+                                <h4 className="text-xs font-medium uppercase tracking-wide" style={{ color: theme.colors.textSecondary }}>
                                     Active ({activeTransfers.length})
                                 </h4>
                                 {activeTransfers.map((transfer) => (
                                     <motion.div
                                         key={transfer.id}
                                         layout
-                                        className="bg-white/5 rounded-lg p-3 space-y-2"
+                                        className="rounded-lg p-3 space-y-2"
+                                        style={{ backgroundColor: theme.colors.backgroundTertiary + '80' }}
                                     >
                                         <div className="flex items-center justify-between">
                                             <div className="flex items-center space-x-2 min-w-0 flex-1">
                                                 {transfer.direction === 'upload' ? (
-                                                    <Upload className="w-4 h-4 text-green-400 flex-shrink-0" />
+                                                    <Upload className="w-4 h-4 flex-shrink-0" style={{ color: theme.colors.success }} />
                                                 ) : (
-                                                    <Download className="w-4 h-4 text-blue-400 flex-shrink-0" />
+                                                    <Download className="w-4 h-4 flex-shrink-0" style={{ color: theme.colors.accent2 }} />
                                                 )}
                                                 <div className="min-w-0 flex-1">
-                                                    <p className="text-white text-sm truncate">{transfer.fileName}</p>
-                                                    <p className="text-gray-400 text-xs">
+                                                    <p className="text-sm truncate" style={{ color: theme.colors.text }}>{transfer.fileName}</p>
+                                                    <p className="text-xs" style={{ color: theme.colors.textSecondary }}>
                                                         {transfer.direction === 'upload' ? 'to' : 'from'} {transfer.peerName}
                                                     </p>
                                                 </div>
@@ -178,7 +203,12 @@ const TransferProgress: React.FC<TransferProgressProps> = ({ isVisible, onToggle
                                             <div className="flex items-center space-x-1">
                                                 <button
                                                     onClick={() => handlePauseResume(transfer.id)}
-                                                    className="p-1 text-gray-400 hover:text-white transition-colors"
+                                                    onMouseEnter={() => setHoveredButton(`pause-${transfer.id}`)}
+                                                    onMouseLeave={() => setHoveredButton(null)}
+                                                    className="p-1 transition-colors"
+                                                    style={{
+                                                        color: hoveredButton === `pause-${transfer.id}` ? theme.colors.text : theme.colors.textSecondary
+                                                    }}
                                                 >
                                                     {transfer.status === 'paused' ? (
                                                         <Play className="w-3 h-3" />
@@ -188,7 +218,12 @@ const TransferProgress: React.FC<TransferProgressProps> = ({ isVisible, onToggle
                                                 </button>
                                                 <button
                                                     onClick={() => handleCancel(transfer.id)}
-                                                    className="p-1 text-gray-400 hover:text-red-400 transition-colors"
+                                                    onMouseEnter={() => setHoveredButton(`cancel-${transfer.id}`)}
+                                                    onMouseLeave={() => setHoveredButton(null)}
+                                                    className="p-1 transition-colors"
+                                                    style={{
+                                                        color: hoveredButton === `cancel-${transfer.id}` ? theme.colors.error : theme.colors.textSecondary
+                                                    }}
                                                 >
                                                     <X className="w-3 h-3" />
                                                 </button>
@@ -198,22 +233,26 @@ const TransferProgress: React.FC<TransferProgressProps> = ({ isVisible, onToggle
                                         {/* Progress Bar */}
                                         <div className="space-y-1">
                                             <div className="flex justify-between text-xs">
-                                                <span className={getStatusColor(transfer.status)}>
+                                                <span style={{ color: getStatusColor(transfer.status) }}>
                                                     {transfer.progress.toFixed(1)}%
                                                 </span>
-                                                <span className="text-gray-400">
+                                                <span style={{ color: theme.colors.textSecondary }}>
                                                     {formatSpeed(transfer.speed)} • {formatTimeRemaining(transfer)}
                                                 </span>
                                             </div>
-                                            <div className="w-full bg-gray-700 rounded-full h-1.5">
+                                            <div
+                                                className="w-full rounded-full h-1.5"
+                                                style={{ backgroundColor: theme.colors.backgroundTertiary }}
+                                            >
                                                 <motion.div
-                                                    className="bg-blue-500 h-1.5 rounded-full"
+                                                    className="h-1.5 rounded-full"
+                                                    style={{ backgroundColor: theme.colors.accent2 }}
                                                     initial={{ width: 0 }}
                                                     animate={{ width: `${transfer.progress}%` }}
                                                     transition={{ duration: 0.3 }}
                                                 />
                                             </div>
-                                            <div className="flex justify-between text-xs text-gray-400">
+                                            <div className="flex justify-between text-xs" style={{ color: theme.colors.textSecondary }}>
                                                 <span>{formatBytes(transfer.fileSize * transfer.progress / 100)}</span>
                                                 <span>{formatBytes(transfer.fileSize)}</span>
                                             </div>
@@ -225,26 +264,27 @@ const TransferProgress: React.FC<TransferProgressProps> = ({ isVisible, onToggle
 
                         {/* Recent Transfers */}
                         {completedTransfers.length > 0 && (
-                            <div className="p-3 border-t border-white/10 space-y-2">
-                                <h4 className="text-xs font-medium text-gray-400 uppercase tracking-wide">
+                            <div className="p-3 border-t space-y-2" style={{ borderColor: theme.colors.border }}>
+                                <h4 className="text-xs font-medium uppercase tracking-wide" style={{ color: theme.colors.textSecondary }}>
                                     Recent
                                 </h4>
                                 {completedTransfers.slice(0, 3).map((transfer) => (
                                     <motion.div
                                         key={transfer.id}
                                         layout
-                                        className="flex items-center space-x-3 p-2 bg-white/5 rounded"
+                                        className="flex items-center space-x-3 p-2 rounded"
+                                        style={{ backgroundColor: theme.colors.backgroundTertiary + '50' }}
                                     >
                                         <div className="flex-shrink-0">
                                             {transfer.status === 'completed' ? (
-                                                <CheckCircle className="w-4 h-4 text-green-400" />
+                                                <CheckCircle className="w-4 h-4" style={{ color: theme.colors.success }} />
                                             ) : (
-                                                <XCircle className="w-4 h-4 text-red-400" />
+                                                <XCircle className="w-4 h-4" style={{ color: theme.colors.error }} />
                                             )}
                                         </div>
                                         <div className="min-w-0 flex-1">
-                                            <p className="text-white text-sm truncate">{transfer.fileName}</p>
-                                            <p className="text-gray-400 text-xs">
+                                            <p className="text-sm truncate" style={{ color: theme.colors.text }}>{transfer.fileName}</p>
+                                            <p className="text-xs" style={{ color: theme.colors.textSecondary }}>
                                                 {transfer.status === 'completed' ? 'Completed' : 'Failed'}
                                             </p>
                                         </div>
@@ -255,8 +295,8 @@ const TransferProgress: React.FC<TransferProgressProps> = ({ isVisible, onToggle
 
                         {transfers.length === 0 && (
                             <div className="p-6 text-center">
-                                <FileText className="w-8 h-8 text-gray-400 mx-auto mb-2" />
-                                <p className="text-gray-400 text-sm">No transfers</p>
+                                <FileText className="w-8 h-8 mx-auto mb-2" style={{ color: theme.colors.textSecondary }} />
+                                <p className="text-sm" style={{ color: theme.colors.textSecondary }}>No transfers</p>
                             </div>
                         )}
                     </motion.div>

@@ -5,6 +5,7 @@ import { StaggeredList } from './AnimatedComponents';
 import DeviceCard from './DeviceCard';
 import DeviceControls from './DeviceControls';
 import { DeviceCardSkeleton } from './LoadingStates';
+import { useTheme } from '../context/ThemeContext';
 
 interface DeviceInfo {
     id: string;
@@ -67,6 +68,7 @@ const DevicesList: React.FC<DevicesListProps> = ({
     onRefresh,
     deviceActions
 }) => {
+    const { theme } = useTheme();
     return (
         <div>
             <DeviceControls
@@ -93,14 +95,14 @@ const DevicesList: React.FC<DevicesListProps> = ({
                         animate={{ opacity: 1, scale: 1 }}
                         className="text-center py-8 mt-16"
                     >
-                        <WifiOff className="w-12 h-12 text-gray-400 mx-auto mb-3" />
-                        <p className="text-gray-400 text-sm">
+                        <WifiOff className="w-12 h-12 mx-auto mb-3" style={{ color: theme.colors.textSecondary }} />
+                        <p className="text-sm" style={{ color: theme.colors.textSecondary }}>
                             {searchTerm
                                 ? 'No devices match your search'
                                 : 'No paired devices'
                             }
                         </p>
-                        <p className="text-gray-500 text-xs mt-1">
+                        <p className="text-xs mt-1" style={{ color: theme.colors.textTertiary }}>
                             {searchTerm
                                 ? 'Try adjusting your search'
                                 : 'Go to the Pairing tab to pair devices'
@@ -110,7 +112,20 @@ const DevicesList: React.FC<DevicesListProps> = ({
                             whileHover={{ scale: 1.05 }}
                             whileTap={{ scale: 0.95 }}
                             onClick={onRefresh}
-                            className="mt-3 px-3 py-1 text-xs bg-blue-500/20 text-blue-300 rounded hover:bg-blue-500/30 transition-colors"
+                            className="mt-3 px-3 py-1 text-xs rounded transition-all duration-200"
+                            style={{
+                                backgroundColor: theme.colors.accent2 + '20',
+                                color: theme.colors.accent2,
+                                border: `1px solid ${theme.colors.accent2}40`
+                            }}
+                            onMouseEnter={(e) => {
+                                e.currentTarget.style.backgroundColor = theme.colors.accent2 + '30';
+                                e.currentTarget.style.boxShadow = `0 0 12px ${theme.colors.accent2}40`;
+                            }}
+                            onMouseLeave={(e) => {
+                                e.currentTarget.style.backgroundColor = theme.colors.accent2 + '20';
+                                e.currentTarget.style.boxShadow = 'none';
+                            }}
                         >
                             Refresh
                         </motion.button>
@@ -122,10 +137,10 @@ const DevicesList: React.FC<DevicesListProps> = ({
                             animate={{ opacity: 1 }}
                             className="flex items-center justify-between mb-3"
                         >
-                            <span className="text-xs text-gray-400">
+                            <span className="text-xs" style={{ color: theme.colors.textSecondary }}>
                                 {devices.filter(d => d.is_connected).length} connected
                             </span>
-                            <span className="text-xs text-gray-500">
+                            <span className="text-xs" style={{ color: theme.colors.textTertiary }}>
                                 Showing {filteredDevices.length} paired device{filteredDevices.length !== 1 ? 's' : ''}
                             </span>
                         </motion.div>

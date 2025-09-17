@@ -1,5 +1,6 @@
 import React, { useState } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
+import { useTheme } from '../context/ThemeContext';
 
 // Install framer-motion first: npm install framer-motion
 
@@ -117,13 +118,43 @@ export const FloatingButton: React.FC<FloatingButtonProps> = ({
     variant = 'primary',
     disabled = false
 }) => {
+    const { theme } = useTheme();
     const [isHovered, setIsHovered] = useState(false);
 
-    const variants = {
-        primary: 'bg-blue-500 hover:bg-blue-600 text-white shadow-blue-500/25',
-        secondary: 'bg-gray-500 hover:bg-gray-600 text-white shadow-gray-500/25',
-        danger: 'bg-red-500 hover:bg-red-600 text-white shadow-red-500/25'
+    const getVariantColors = (variant: string) => {
+        switch (variant) {
+            case 'primary':
+                return {
+                    bg: theme.colors.accent2,
+                    bgHover: theme.colors.accent2 + 'DD',
+                    text: theme.colors.text,
+                    shadow: theme.colors.accent2 + '40'
+                };
+            case 'secondary':
+                return {
+                    bg: theme.colors.textSecondary,
+                    bgHover: theme.colors.textSecondary + 'DD',
+                    text: theme.colors.text,
+                    shadow: theme.colors.textSecondary + '40'
+                };
+            case 'danger':
+                return {
+                    bg: theme.colors.error,
+                    bgHover: theme.colors.error + 'DD',
+                    text: theme.colors.text,
+                    shadow: theme.colors.error + '40'
+                };
+            default:
+                return {
+                    bg: theme.colors.accent2,
+                    bgHover: theme.colors.accent2 + 'DD',
+                    text: theme.colors.text,
+                    shadow: theme.colors.accent2 + '40'
+                };
+        }
     };
+
+    const colors = getVariantColors(variant);
 
     return (
         <motion.button
@@ -131,17 +162,17 @@ export const FloatingButton: React.FC<FloatingButtonProps> = ({
             disabled={disabled}
             onHoverStart={() => setIsHovered(true)}
             onHoverEnd={() => setIsHovered(false)}
-            className={`
-                relative flex items-center space-x-2 px-4 py-2 rounded-full
-                shadow-lg transition-all duration-200 disabled:opacity-50
-                ${variants[variant]}
-            `}
+            className="relative flex items-center space-x-2 px-4 py-2 rounded-full shadow-lg transition-all duration-200 disabled:opacity-50"
+            style={{
+                backgroundColor: isHovered ? colors.bgHover : colors.bg,
+                color: colors.text
+            }}
             whileHover={{ scale: 1.05, y: -2 }}
             whileTap={{ scale: 0.95 }}
             animate={{
                 boxShadow: isHovered
-                    ? '0 20px 25px -5px rgba(0, 0, 0, 0.1), 0 10px 10px -5px rgba(0, 0, 0, 0.04)'
-                    : '0 10px 15px -3px rgba(0, 0, 0, 0.1), 0 4px 6px -2px rgba(0, 0, 0, 0.05)'
+                    ? `0 20px 25px -5px ${colors.shadow}, 0 10px 10px -5px ${theme.colors.shadow}`
+                    : `0 10px 15px -3px ${colors.shadow}, 0 4px 6px -2px ${theme.colors.shadow}`
             }}
         >
             <motion.div

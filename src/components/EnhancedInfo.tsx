@@ -14,6 +14,7 @@ import {
     Zap
 } from 'lucide-react';
 import { invoke } from '@tauri-apps/api/core';
+import { useTheme } from '../context/ThemeContext';
 
 interface SystemInfo {
     platform: string;
@@ -31,6 +32,7 @@ interface NetworkMetrics {
 }
 
 const EnhancedInfo: React.FC = () => {
+    const { theme } = useTheme();
     const [systemInfo, setSystemInfo] = useState<SystemInfo | null>(null);
     const [networkMetrics, setNetworkMetrics] = useState<NetworkMetrics | null>(null);
     const [isLoading, setIsLoading] = useState(true);
@@ -103,7 +105,13 @@ const EnhancedInfo: React.FC = () => {
     if (isLoading) {
         return (
             <div className="flex items-center justify-center py-8">
-                <div className="w-8 h-8 border-2 border-blue-400 border-t-transparent rounded-full animate-spin"></div>
+                <div
+                    className="w-8 h-8 border-2 border-t-transparent rounded-full animate-spin"
+                    style={{
+                        borderColor: theme.colors.accent2,
+                        borderTopColor: 'transparent'
+                    }}
+                ></div>
             </div>
         );
     }
@@ -111,21 +119,39 @@ const EnhancedInfo: React.FC = () => {
     return (
         <div className="space-y-4">
             {/* Hotkeys */}
-            <div className="bg-blue-500/10 border border-blue-500/20 rounded-lg p-4">
-                <h3 className="text-blue-300 font-medium mb-3 flex items-center">
+            <div
+                className="rounded-lg p-4 border"
+                style={{
+                    backgroundColor: theme.colors.accent2 + '10',
+                    borderColor: theme.colors.accent2 + '30'
+                }}
+            >
+                <h3 className="font-medium mb-3 flex items-center" style={{ color: theme.colors.accent2 }}>
                     <Keyboard className="w-4 h-4 mr-2" />
                     Hotkeys
                 </h3>
                 <div className="space-y-2">
                     <div className="flex justify-between items-center">
-                        <span className="text-gray-300 text-sm">Copy file:</span>
-                        <kbd className="bg-black/30 px-2 py-1 rounded text-xs text-white font-mono">
+                        <span className="text-sm" style={{ color: theme.colors.textSecondary }}>Copy file:</span>
+                        <kbd
+                            className="px-2 py-1 rounded text-xs font-mono"
+                            style={{
+                                backgroundColor: theme.colors.backgroundTertiary,
+                                color: theme.colors.text
+                            }}
+                        >
                             {hotkeys.copy}
                         </kbd>
                     </div>
                     <div className="flex justify-between items-center">
-                        <span className="text-gray-300 text-sm">Paste file:</span>
-                        <kbd className="bg-black/30 px-2 py-1 rounded text-xs text-white font-mono">
+                        <span className="text-sm" style={{ color: theme.colors.textSecondary }}>Paste file:</span>
+                        <kbd
+                            className="px-2 py-1 rounded text-xs font-mono"
+                            style={{
+                                backgroundColor: theme.colors.backgroundTertiary,
+                                color: theme.colors.text
+                            }}
+                        >
                             {hotkeys.paste}
                         </kbd>
                     </div>
@@ -133,103 +159,121 @@ const EnhancedInfo: React.FC = () => {
             </div>
 
             {/* System Information */}
-            <div className="bg-green-500/10 border border-green-500/20 rounded-lg p-4">
-                <h3 className="text-green-300 font-medium mb-3 flex items-center">
+            <div
+                className="rounded-lg p-4 border"
+                style={{
+                    backgroundColor: theme.colors.success + '10',
+                    borderColor: theme.colors.success + '30'
+                }}
+            >
+                <h3 className="font-medium mb-3 flex items-center" style={{ color: theme.colors.success }}>
                     <Monitor className="w-4 h-4 mr-2" />
                     System Information
                 </h3>
                 {systemInfo && (
                     <div className="space-y-2 text-sm">
                         <div className="flex justify-between">
-                            <span className="text-gray-300 flex items-center">
+                            <span className="flex items-center" style={{ color: theme.colors.textSecondary }}>
                                 <Globe className="w-3 h-3 mr-1" />
                                 Platform:
                             </span>
-                            <span className="text-white">{systemInfo.platform}</span>
+                            <span style={{ color: theme.colors.text }}>{systemInfo.platform}</span>
                         </div>
                         <div className="flex justify-between">
-                            <span className="text-gray-300 flex items-center">
+                            <span className="flex items-center" style={{ color: theme.colors.textSecondary }}>
                                 <Cpu className="w-3 h-3 mr-1" />
                                 Architecture:
                             </span>
-                            <span className="text-white">{systemInfo.arch}</span>
+                            <span style={{ color: theme.colors.text }}>{systemInfo.arch}</span>
                         </div>
                         <div className="flex justify-between">
-                            <span className="text-gray-300 flex items-center">
+                            <span className="flex items-center" style={{ color: theme.colors.textSecondary }}>
                                 <HardDrive className="w-3 h-3 mr-1" />
                                 Memory:
                             </span>
-                            <span className="text-white">{formatBytes(systemInfo.memory)}</span>
+                            <span style={{ color: theme.colors.text }}>{formatBytes(systemInfo.memory)}</span>
                         </div>
                         <div className="flex justify-between">
-                            <span className="text-gray-300 flex items-center">
+                            <span className="flex items-center" style={{ color: theme.colors.textSecondary }}>
                                 <Clock className="w-3 h-3 mr-1" />
                                 Uptime:
                             </span>
-                            <span className="text-white">{formatUptime(systemInfo.uptime)}</span>
+                            <span style={{ color: theme.colors.text }}>{formatUptime(systemInfo.uptime)}</span>
                         </div>
                     </div>
                 )}
             </div>
 
             {/* Network Metrics */}
-            <div className="bg-purple-500/10 border border-purple-500/20 rounded-lg p-4">
-                <h3 className="text-purple-300 font-medium mb-3 flex items-center">
+            <div
+                className="rounded-lg p-4 border"
+                style={{
+                    backgroundColor: theme.colors.hover + '10',
+                    borderColor: theme.colors.hover + '30'
+                }}
+            >
+                <h3 className="font-medium mb-3 flex items-center" style={{ color: theme.colors.hover }}>
                     <Activity className="w-4 h-4 mr-2" />
                     Network Activity
                 </h3>
                 {networkMetrics && (
                     <div className="space-y-2 text-sm">
                         <div className="flex justify-between">
-                            <span className="text-gray-300 flex items-center">
+                            <span className="flex items-center" style={{ color: theme.colors.textSecondary }}>
                                 <Download className="w-3 h-3 mr-1" />
                                 Downloaded:
                             </span>
-                            <span className="text-green-400">{formatBytes(networkMetrics.bytesReceived)}</span>
+                            <span style={{ color: theme.colors.success }}>{formatBytes(networkMetrics.bytesReceived)}</span>
                         </div>
                         <div className="flex justify-between">
-                            <span className="text-gray-300 flex items-center">
+                            <span className="flex items-center" style={{ color: theme.colors.textSecondary }}>
                                 <Upload className="w-3 h-3 mr-1" />
                                 Uploaded:
                             </span>
-                            <span className="text-blue-400">{formatBytes(networkMetrics.bytesSent)}</span>
+                            <span style={{ color: theme.colors.accent2 }}>{formatBytes(networkMetrics.bytesSent)}</span>
                         </div>
                         <div className="flex justify-between">
-                            <span className="text-gray-300 flex items-center">
+                            <span className="flex items-center" style={{ color: theme.colors.textSecondary }}>
                                 <Users className="w-3 h-3 mr-1" />
                                 Total transfers:
                             </span>
-                            <span className="text-white">{networkMetrics.transfersTotal}</span>
+                            <span style={{ color: theme.colors.text }}>{networkMetrics.transfersTotal}</span>
                         </div>
                         <div className="flex justify-between">
-                            <span className="text-gray-300 flex items-center">
+                            <span className="flex items-center" style={{ color: theme.colors.textSecondary }}>
                                 <Zap className="w-3 h-3 mr-1" />
                                 Avg speed:
                             </span>
-                            <span className="text-yellow-400">{formatBytes(networkMetrics.avgSpeed)}/s</span>
+                            <span style={{ color: theme.colors.warning }}>{formatBytes(networkMetrics.avgSpeed)}/s</span>
                         </div>
                     </div>
                 )}
             </div>
 
             {/* App Information */}
-            <div className="bg-gray-500/10 border border-gray-500/20 rounded-lg p-4">
-                <h3 className="text-gray-300 font-medium mb-3 flex items-center">
+            <div
+                className="rounded-lg p-4 border"
+                style={{
+                    backgroundColor: theme.colors.textSecondary + '10',
+                    borderColor: theme.colors.textSecondary + '30'
+                }}
+            >
+                <h3 className="font-medium mb-3 flex items-center" style={{ color: theme.colors.textSecondary }}>
                     <Shield className="w-4 h-4 mr-2" />
                     Application
                 </h3>
                 <div className="space-y-2 text-sm">
                     <div className="flex justify-between">
-                        <span className="text-gray-300">Version:</span>
-                        <span className="text-white">0.1.0</span>
+                        <span style={{ color: theme.colors.textSecondary }}>Version:</span>
+                        <span style={{ color: theme.colors.text }}>0.1.0</span>
                     </div>
                     <div className="flex justify-between">
-                        <span className="text-gray-300">Build:</span>
-                        <span className="text-white">Enhanced Device Management</span>
+                        <span style={{ color: theme.colors.textSecondary }}>Build:</span>
+                        <span style={{ color: theme.colors.text }}>Enhanced Device Management</span>
                     </div>
                     <div className="flex justify-between">
-                        <span className="text-gray-300">Protocol:</span>
-                        <span className="text-white">Fileshare v2</span>
+                        <span style={{ color: theme.colors.textSecondary }}>Protocol:</span>
+                        <span style={{ color: theme.colors.text }}>Fileshare v2</span>
                     </div>
                 </div>
             </div>

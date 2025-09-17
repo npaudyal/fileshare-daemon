@@ -8,41 +8,69 @@
     box-sizing: border-box;
 }
 
-/* Root styling for consistent dark theme */
+/* CSS Variables for theming */
+:root {
+    /* These will be overridden by ThemeContext */
+    --color-background: #0D0D0D;
+    --color-backgroundSecondary: #1A1A1A;
+    --color-backgroundTertiary: #242424;
+    --color-text: #FFFFFF;
+    --color-textSecondary: #B3B3B3;
+    --color-textTertiary: #808080;
+    --color-accent1: #00FF85;
+    --color-accent2: #1E90FF;
+    --color-hover: #FF0099;
+    --color-border: rgba(255, 255, 255, 0.1);
+    --color-borderHover: rgba(255, 255, 255, 0.2);
+    --color-success: #00FF85;
+    --color-warning: #FFD700;
+    --color-error: #FF4444;
+    --color-info: #1E90FF;
+    --color-shadow: rgba(0, 0, 0, 0.5);
+    --color-shadowStrong: rgba(0, 0, 0, 0.8);
+    --gradient-primary: linear-gradient(135deg, #0D0D0D 0%, #1A1A1A 100%);
+    --gradient-accent: linear-gradient(135deg, #00FF85 0%, #1E90FF 100%);
+    --gradient-hover: linear-gradient(135deg, #FF0099 0%, #1E90FF 100%);
+}
+
+/* Root styling with theme support */
 html,
 body {
-    background-color: #0f172a;
-    color: white;
+    background-color: var(--color-background);
+    color: var(--color-text);
     font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "SF Pro Display", "Segoe UI", Roboto, sans-serif;
     -webkit-app-region: no-drag;
     overflow: hidden;
+    transition: background-color 0.3s ease, color 0.3s ease;
 }
 
 /* App container with native window integration */
 .app-container {
     width: 100vw;
     height: 100vh;
-    background: linear-gradient(135deg, #0f172a 0%, #1e293b 100%);
+    background: var(--gradient-primary);
     display: flex;
     flex-direction: column;
     overflow: hidden;
+    transition: background 0.3s ease;
 }
 
 /* Fix any potential white backgrounds */
 #root {
     width: 100%;
     height: 100%;
-    background-color: #0f172a;
+    background-color: var(--color-background);
+    transition: background-color 0.3s ease;
 }
 
-/* Ensure all backgrounds are dark */
+/* Ensure all backgrounds follow theme */
 .bg-white {
-    background-color: rgba(15, 23, 42, 0.8) !important;
+    background-color: var(--color-backgroundSecondary) !important;
 }
 
 .bg-gray-50,
 .bg-gray-100 {
-    background-color: rgba(30, 41, 59, 0.5) !important;
+    background-color: var(--color-backgroundTertiary) !important;
 }
 
 /* Fix empty state backgrounds */
@@ -168,6 +196,11 @@ body {
     animation: bounce 1s ease-in-out;
 }
 
+/* Placeholder color helper */
+.placeholder-color::placeholder {
+    color: var(--placeholder-color);
+}
+
 /* Enhanced scrollbars */
 ::-webkit-scrollbar {
     width: 6px;
@@ -175,17 +208,17 @@ body {
 }
 
 ::-webkit-scrollbar-track {
-    background: rgba(148, 163, 184, 0.1);
+    background: var(--color-backgroundSecondary);
     border-radius: 3px;
 }
 
 ::-webkit-scrollbar-thumb {
-    background: linear-gradient(to bottom, rgba(59, 130, 246, 0.5), rgba(139, 92, 246, 0.5));
+    background: var(--gradient-accent);
     border-radius: 3px;
 }
 
 ::-webkit-scrollbar-thumb:hover {
-    background: linear-gradient(to bottom, rgba(59, 130, 246, 0.7), rgba(139, 92, 246, 0.7));
+    background: var(--gradient-hover);
 }
 
 /* Button enhancements */

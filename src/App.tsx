@@ -11,10 +11,12 @@ import PairingTab from './components/PairingTab';
 import AdvancedSettings from './components/AdvancedSettings';
 import EnhancedInfo from './components/EnhancedInfo';
 import TransferProgress from './components/TransferProgress';
+import ThemeToggle from './components/ThemeToggle';
 import { FadeIn, SlideIn } from './components/AnimatedComponents';
 import { LoadingOverlay } from './components/LoadingStates';
 import { useToast } from './hooks/useToast';
 import { useDebounce } from './hooks/useDebounce';
+import { useTheme } from './context/ThemeContext';
 
 // Types
 interface DeviceInfo {
@@ -50,6 +52,8 @@ interface AppSettings {
 }
 
 function App() {
+    const { theme } = useTheme();
+
     // State
     const [devices, setDevices] = useState<DeviceInfo[]>([]);
     const [settings, setSettings] = useState<AppSettings | null>(null);
@@ -316,7 +320,14 @@ function App() {
     const unpairedDevices = getUnpairedDevices();
 
     return (
-        <div className="app-container w-full h-full bg-gradient-to-br from-slate-900/95 to-slate-800/95 backdrop-blur-xl border border-white/10 shadow-2xl relative">
+        <div
+            className="app-container w-full h-full backdrop-blur-xl shadow-2xl relative transition-all duration-300"
+            style={{
+                background: theme.gradients.primary,
+                borderColor: theme.colors.border,
+                border: '1px solid',
+            }}
+        >
             <LoadingOverlay isVisible={isLoading && devices.length === 0} message="Loading devices..." />
 
             {/* Header */}
@@ -400,16 +411,40 @@ function App() {
 
             {/* Footer */}
             <SlideIn direction="up">
-                <div className="p-4 border-t border-white/10">
-                    <motion.button
-                        whileHover={{ scale: 1.02 }}
-                        whileTap={{ scale: 0.98 }}
-                        onClick={() => invoke('quit_app')}
-                        className="w-full flex items-center justify-center space-x-2 text-gray-400 hover:text-red-400 transition-colors py-2"
-                    >
-                        <Power className="w-4 h-4" />
-                        <span className="text-sm">Quit Fileshare</span>
-                    </motion.button>
+                <div
+                    className="p-4 border-t transition-all duration-300"
+                    style={{ borderColor: theme.colors.border }}
+                >
+                    <div className="flex items-center justify-between">
+                        {/* Theme Switcher - Left Side */}
+                        <ThemeToggle />
+
+                        {/* Quit Button - Right Side */}
+                        <motion.button
+                            whileHover={{ scale: 1.02 }}
+                            whileTap={{ scale: 0.98 }}
+                            onClick={() => invoke('quit_app')}
+                            className="flex items-center space-x-2 px-4 py-2 rounded-lg transition-all duration-300"
+                            style={{
+                                color: theme.colors.textSecondary,
+                                backgroundColor: theme.colors.backgroundSecondary,
+                                border: `1px solid ${theme.colors.border}`,
+                            }}
+                            onMouseEnter={(e) => {
+                                e.currentTarget.style.color = theme.colors.error;
+                                e.currentTarget.style.borderColor = theme.colors.error;
+                                e.currentTarget.style.boxShadow = `0 0 12px ${theme.colors.error}40`;
+                            }}
+                            onMouseLeave={(e) => {
+                                e.currentTarget.style.color = theme.colors.textSecondary;
+                                e.currentTarget.style.borderColor = theme.colors.border;
+                                e.currentTarget.style.boxShadow = 'none';
+                            }}
+                        >
+                            <Power className="w-4 h-4" />
+                            <span className="text-sm font-medium">Quit Fileshare</span>
+                        </motion.button>
+                    </div>
                 </div>
             </SlideIn>
         </div>
