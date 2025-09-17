@@ -1,18 +1,16 @@
 import React, { useState, useEffect, useCallback, useMemo, useRef } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
 import {
-    Wifi,
-    Shield,
-    Clock,
-    Smartphone,
+    Search,
     Monitor,
+    Smartphone,
     Tablet,
-    AlertCircle,
+    Key,
+    Clock,
+    Loader2,
     CheckCircle,
     XCircle,
-    RefreshCw,
-    Search,
-    Filter,
+    WifiOff,
 } from 'lucide-react';
 import { invoke } from '@tauri-apps/api/core';
 
@@ -53,22 +51,20 @@ interface PairingTabProps {
 
 const PairingTab: React.FC<PairingTabProps> = ({ onRefresh }) => {
     const [unpairedDevices, setUnpairedDevices] = useState<UnpairedDevice[]>([]);
-    const [activeSessions, setActiveSessions] = useState<PairingSession[]>([]);
+    const [activeSessions, setActiveSessions] = useState<Map<string, PairingSession>>(new Map());
     const [isLoading, setIsLoading] = useState(true);
-    const [error, setError] = useState<string | null>(null);
     const [searchTerm, setSearchTerm] = useState('');
-    const [osFilter, setOsFilter] = useState<'all' | 'windows' | 'macos' | 'linux'>('all');
+    const [osFilter, setOsFilter] = useState<'all' | 'mac' | 'windows' | 'linux'>('all');
     const mountedRef = useRef(true);
 
-    // Load unpaired devices and active sessions with smart updates
+    // Load unpaired devices and active sessions
     const loadPairingData = async (showLoading = true) => {
-        if (!mountedRef.current) return; // Prevent state updates if unmounted
+        if (!mountedRef.current) return;
 
         try {
             if (showLoading) {
                 setIsLoading(true);
             }
-            setError(null);
 
             // Get all discovered devices
             const allDevices = await invoke<any[]>('get_discovered_devices');
@@ -92,42 +88,17 @@ const PairingTab: React.FC<PairingTabProps> = ({ onRefresh }) => {
             // Get active pairing sessions
             const sessions = await invoke<PairingSession[]>('get_active_pairing_sessions');
 
-            // Only update state if data actually changed
-            setUnpairedDevices(prevDevices => {
-                // Quick check: different lengths mean different data
-                if (prevDevices.length !== unpaired.length) {
-                    return unpaired;
-                }
-                // Deep comparison only if lengths match
-                const hasChanged = unpaired.some((device, index) => {
-                    const prev = prevDevices[index];
-                    return !prev ||
-                           prev.id !== device.id ||
-                           prev.name !== device.name ||
-                           prev.last_seen !== device.last_seen;
-                });
-                return hasChanged ? unpaired : prevDevices;
+            // Create a map of device ID to session
+            const sessionMap = new Map<string, PairingSession>();
+            sessions.forEach(session => {
+                sessionMap.set(session.peer_device_id, session);
             });
 
-            setActiveSessions(prevSessions => {
-                // Quick check: different lengths mean different data
-                if (prevSessions.length !== sessions.length) {
-                    return sessions;
-                }
-                // Deep comparison only if lengths match
-                const hasChanged = sessions.some((session, index) => {
-                    const prev = prevSessions[index];
-                    return !prev ||
-                           prev.session_id !== session.session_id ||
-                           prev.state !== session.state ||
-                           prev.remaining_seconds !== session.remaining_seconds;
-                });
-                return hasChanged ? sessions : prevSessions;
-            });
+            setUnpairedDevices(unpaired);
+            setActiveSessions(sessionMap);
 
         } catch (err) {
             console.error('Failed to load pairing data:', err);
-            setError('Failed to load devices');
         } finally {
             if (showLoading) {
                 setIsLoading(false);
@@ -135,7 +106,7 @@ const PairingTab: React.FC<PairingTabProps> = ({ onRefresh }) => {
         }
     };
 
-    // Filter devices based on search and OS filter (memoized)
+    // Filter devices based on search and OS filter
     const filteredDevices = useMemo(() => {
         let filtered = unpairedDevices;
 
@@ -143,8 +114,7 @@ const PairingTab: React.FC<PairingTabProps> = ({ onRefresh }) => {
         if (searchTerm) {
             filtered = filtered.filter(device =>
                 device.name.toLowerCase().includes(searchTerm.toLowerCase()) ||
-                device.address.includes(searchTerm) ||
-                (device.platform && device.platform.toLowerCase().includes(searchTerm.toLowerCase()))
+                device.address.includes(searchTerm)
             );
         }
 
@@ -153,10 +123,10 @@ const PairingTab: React.FC<PairingTabProps> = ({ onRefresh }) => {
             filtered = filtered.filter(device => {
                 const platform = device.platform?.toLowerCase();
                 switch (osFilter) {
+                    case 'mac':
+                        return platform === 'macos' || platform === 'darwin';
                     case 'windows':
                         return platform === 'windows';
-                    case 'macos':
-                        return platform === 'macos' || platform === 'darwin';
                     case 'linux':
                         return platform === 'linux';
                     default:
@@ -171,52 +141,34 @@ const PairingTab: React.FC<PairingTabProps> = ({ onRefresh }) => {
     // Initialize data and set up refresh interval
     useEffect(() => {
         mountedRef.current = true;
-        loadPairingData(true); // Show loading on initial load
+        loadPairingData(true);
 
-        // Dynamic refresh rate: faster when there are active sessions
-        const refreshInterval = activeSessions.length > 0 ? 3000 : 5000;
+        const refreshInterval = 2000;
         const interval = setInterval(() => loadPairingData(false), refreshInterval);
 
         return () => {
             mountedRef.current = false;
             clearInterval(interval);
         };
-    }, [activeSessions.length]); // Re-create interval when session count changes
+    }, []);
 
     // Initiate pairing with a device
     const handlePairDevice = useCallback(async (deviceId: string) => {
         try {
-            setError(null); // Clear any previous errors
             await invoke('initiate_pairing', { deviceId });
-            loadPairingData(false); // Refresh to show new session
+            loadPairingData(false);
         } catch (err) {
             console.error('Failed to initiate pairing:', err);
-
-            // Set user-friendly error message
-            const errorStr = err as string;
-            if (errorStr.includes('offline') || errorStr.includes('unreachable')) {
-                setError('Device appears to be offline. Make sure the other device is running and connected to the same network.');
-            } else if (errorStr.includes('network') || errorStr.includes('connection')) {
-                setError('Network connection problem. Check that both devices are on the same network.');
-            } else if (errorStr.includes('not found')) {
-                setError('Device not found. Try refreshing the device list.');
-            } else {
-                setError(`Failed to pair with device: ${errorStr}`);
-            }
-
-            // Auto-clear error after 10 seconds
-            setTimeout(() => setError(null), 10000);
         }
     }, []);
 
-    // Confirm pairing (user verified PIN)
+    // Confirm pairing
     const handleConfirmPairing = useCallback(async (sessionId: string) => {
         try {
             await invoke('confirm_pairing', { sessionId });
-            loadPairingData(false); // Refresh session state
+            loadPairingData(false);
         } catch (err) {
             console.error('Failed to confirm pairing:', err);
-            setError(`Failed to confirm pairing: ${err}`);
         }
     }, []);
 
@@ -227,341 +179,294 @@ const PairingTab: React.FC<PairingTabProps> = ({ onRefresh }) => {
                 sessionId,
                 reason: 'User rejected'
             });
-            loadPairingData(false); // Refresh session state
+            loadPairingData(false);
         } catch (err) {
             console.error('Failed to reject pairing:', err);
-            setError(`Failed to reject pairing: ${err}`);
         }
     }, []);
 
-    // Get device type icon
+    // Get device icon
     const getDeviceIcon = useCallback((platform?: string) => {
-        switch (platform?.toLowerCase()) {
-            case 'android':
-            case 'ios':
-                return <Smartphone className="w-5 h-5" />;
-            case 'windows':
-            case 'macos':
-            case 'linux':
-                return <Monitor className="w-5 h-5" />;
-            default:
-                return <Tablet className="w-5 h-5" />;
+        const platform_lower = platform?.toLowerCase();
+        if (platform_lower === 'android' || platform_lower === 'ios') {
+            return <Smartphone className="w-4 h-4" />;
+        } else if (platform_lower === 'windows' || platform_lower === 'macos' || platform_lower === 'darwin' || platform_lower === 'linux') {
+            return <Monitor className="w-4 h-4" />;
         }
+        return <Tablet className="w-4 h-4" />;
     }, []);
 
-    // Get session status info
-    const getSessionStatus = (session: PairingSession) => {
-        if (typeof session.state === 'object' && 'Failed' in session.state) {
-            const error = session.state.Failed;
-            let errorMessage = 'Unknown error';
-
-            if ('DeviceOffline' in error) {
-                errorMessage = 'Device is offline or app is not running';
-            } else if ('ConnectionFailed' in error) {
-                errorMessage = 'Connection failed - check network';
-            } else if ('RequestTimeout' in error) {
-                errorMessage = 'No response from device - may be offline';
-            } else if ('ConfirmationTimeout' in error) {
-                errorMessage = "Device didn't respond in time";
-            } else if ('UserRejected' in error) {
-                errorMessage = 'Pairing was rejected by the other user';
-            } else if ('CryptoError' in error) {
-                errorMessage = 'Security verification failed';
-            } else if ('ProtocolError' in error) {
-                errorMessage = `Protocol error: ${error.ProtocolError}`;
-            } else if ('Unknown' in error) {
-                errorMessage = error.Unknown || 'Unknown error';
-            }
-
-            return {
-                icon: <XCircle className="w-5 h-5 text-red-500" />,
-                text: errorMessage,
-                color: 'text-red-500'
-            };
+    // Get pairing button content based on session state
+    const getPairingButton = (device: UnpairedDevice, session?: PairingSession) => {
+        if (!session) {
+            return (
+                <button
+                    onClick={() => handlePairDevice(device.id)}
+                    className="px-3 py-1 bg-gray-700 hover:bg-gray-600 text-white rounded-full text-xs font-medium transition-colors"
+                >
+                    Pair
+                </button>
+            );
         }
 
-        switch (session.state) {
+        // Handle different session states
+        const state = session.state;
+        if (typeof state === 'object' && 'Failed' in state) {
+            return (
+                <button
+                    onClick={() => handlePairDevice(device.id)}
+                    className="px-3 py-1 bg-red-600 hover:bg-red-700 text-white rounded-full text-xs font-medium transition-colors flex items-center gap-1"
+                >
+                    <XCircle className="w-3 h-3" />
+                    Retry
+                </button>
+            );
+        }
+
+        switch (state) {
             case 'Initiated':
-                return {
-                    icon: <Clock className="w-5 h-5 text-blue-500" />,
-                    text: 'Sending pairing request...',
-                    color: 'text-blue-500'
-                };
-            case 'DisplayingPin':
-                return {
-                    icon: <Shield className="w-5 h-5 text-yellow-500" />,
-                    text: `Show this PIN: ${session.pin}`,
-                    color: 'text-yellow-500'
-                };
-            case 'AwaitingApproval':
-                return {
-                    icon: <Shield className="w-5 h-5 text-orange-500" />,
-                    text: `Accept from ${session.peer_name}? PIN: ${session.pin}`,
-                    color: 'text-orange-500'
-                };
             case 'Confirmed':
-                return {
-                    icon: <RefreshCw className="w-5 h-5 text-blue-500 animate-spin" />,
-                    text: 'Completing pairing...',
-                    color: 'text-blue-500'
-                };
+                return (
+                    <button
+                        disabled
+                        className="px-3 py-1 bg-gray-700 text-gray-400 rounded-full text-xs font-medium flex items-center gap-1"
+                    >
+                        <Loader2 className="w-3 h-3 animate-spin" />
+                        Pairing
+                    </button>
+                );
+            case 'DisplayingPin':
+                return (
+                    <button
+                        disabled
+                        className="px-3 py-1 bg-blue-600 text-white rounded-full text-xs font-medium flex items-center gap-1"
+                    >
+                        <Key className="w-3 h-3" />
+                        Pairing
+                    </button>
+                );
+            case 'AwaitingApproval':
+                return (
+                    <div className="flex gap-2">
+                        <button
+                            onClick={() => handleConfirmPairing(session.session_id)}
+                            className="px-3 py-1 bg-green-600 hover:bg-green-700 text-white rounded-full text-xs font-medium transition-colors"
+                        >
+                            Accept
+                        </button>
+                        <button
+                            onClick={() => handleRejectPairing(session.session_id)}
+                            className="px-3 py-1 bg-gray-700 hover:bg-gray-600 text-white rounded-full text-xs font-medium transition-colors"
+                        >
+                            Reject
+                        </button>
+                    </div>
+                );
             case 'Completed':
-                return {
-                    icon: <CheckCircle className="w-5 h-5 text-green-500" />,
-                    text: 'Successfully paired!',
-                    color: 'text-green-500'
-                };
-            case 'Timeout':
-                return {
-                    icon: <XCircle className="w-5 h-5 text-red-500" />,
-                    text: 'Session timed out',
-                    color: 'text-red-500'
-                };
+                return (
+                    <button
+                        disabled
+                        className="px-3 py-1 bg-green-600 text-white rounded-full text-xs font-medium flex items-center gap-1"
+                    >
+                        <CheckCircle className="w-3 h-3" />
+                        Paired
+                    </button>
+                );
             default:
-                return {
-                    icon: <Clock className="w-5 h-5 text-gray-500" />,
-                    text: 'Unknown status',
-                    color: 'text-gray-500'
-                };
+                return (
+                    <button
+                        onClick={() => handlePairDevice(device.id)}
+                        className="px-3 py-1 bg-gray-700 hover:bg-gray-600 text-white rounded-full text-xs font-medium transition-colors"
+                    >
+                        Pair
+                    </button>
+                );
         }
     };
-
-    // Format time ago
-    const formatTimeAgo = (timestamp: number) => {
-        const now = Math.floor(Date.now() / 1000);
-        const seconds = now - timestamp;
-        
-        if (seconds < 60) return 'Just now';
-        if (seconds < 3600) return `${Math.floor(seconds / 60)}m ago`;
-        if (seconds < 86400) return `${Math.floor(seconds / 3600)}h ago`;
-        return `${Math.floor(seconds / 86400)}d ago`;
-    };
-
 
     return (
-        <div className="space-y-6">
-            {/* Header */}
-            <div className="space-y-4">
-                <div className="flex items-center justify-between">
-                    <div>
-                        <h2 className="text-xl font-semibold text-white">Device Pairing</h2>
-                        <p className="text-sm text-gray-400">
-                            Pair with devices to enable secure file sharing
-                        </p>
-                    </div>
-                    <button
-                        onClick={() => { onRefresh(); loadPairingData(true); }}
-                        className="flex items-center gap-2 px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 transition-colors"
-                    >
-                        <RefreshCw className="w-4 h-4" />
-                        Refresh
-                    </button>
-                </div>
+        <div className="space-y-4">
+            <h2 className="text-lg font-medium text-white">Available Devices</h2>
 
-                {/* Search and Filters */}
-                <div className="flex flex-col sm:flex-row gap-4">
-                    {/* Search Bar */}
-                    <div className="relative flex-1">
-                        <Search className="absolute left-3 top-1/2 transform -translate-y-1/2 text-gray-400 w-4 h-4" />
-                        <input
-                            type="text"
-                            placeholder="Search devices by name, address..."
-                            value={searchTerm}
-                            onChange={(e) => setSearchTerm(e.target.value)}
-                            className="w-full pl-10 pr-4 py-2 bg-white/10 border border-white/20 rounded-lg text-white placeholder-gray-400 focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent"
-                        />
-                    </div>
-
-                    {/* OS Filter */}
-                    <div className="relative">
-                        <select
-                            value={osFilter}
-                            onChange={(e) => setOsFilter(e.target.value as any)}
-                            className="appearance-none bg-white/10 border border-white/20 rounded-lg px-4 py-2 pr-8 text-white focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent"
-                        >
-                            <option value="all" className="bg-gray-800">All OS</option>
-                            <option value="windows" className="bg-gray-800">Windows</option>
-                            <option value="macos" className="bg-gray-800">macOS</option>
-                            <option value="linux" className="bg-gray-800">Linux</option>
-                        </select>
-                        <Filter className="absolute right-2 top-1/2 transform -translate-y-1/2 text-gray-400 w-4 h-4 pointer-events-none" />
-                    </div>
-                </div>
+            {/* Search Bar */}
+            <div className="relative">
+                <Search className="absolute left-3 top-1/2 transform -translate-y-1/2 text-gray-400 w-4 h-4" />
+                <input
+                    type="text"
+                    placeholder="Search Devices..."
+                    value={searchTerm}
+                    onChange={(e) => setSearchTerm(e.target.value)}
+                    className="w-full pl-10 pr-4 py-2 bg-gray-800/50 border border-gray-700 rounded-lg text-white placeholder-gray-500 focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent text-sm"
+                />
             </div>
 
-            {/* Error Message */}
-            {error && (
-                <motion.div
-                    initial={{ opacity: 0, y: -10 }}
-                    animate={{ opacity: 1, y: 0 }}
-                    className="bg-red-500/10 border border-red-500/20 rounded-lg p-4 flex items-center gap-3"
+            {/* OS Filter Buttons */}
+            <div className="flex items-center gap-2">
+                <button
+                    onClick={() => setOsFilter('all')}
+                    className={`px-4 py-1.5 rounded-full text-sm font-medium transition-colors ${osFilter === 'all'
+                        ? 'bg-blue-600 text-white'
+                        : 'bg-gray-800 text-gray-400 hover:text-white hover:bg-gray-700'
+                        }`}
                 >
-                    <AlertCircle className="w-5 h-5 text-red-400" />
-                    <span className="text-red-300">{error}</span>
-                    <button
-                        onClick={() => setError(null)}
-                        className="ml-auto text-red-400 hover:text-red-300"
-                    >
-                        <XCircle className="w-5 h-5" />
-                    </button>
-                </motion.div>
-            )}
+                    All
+                </button>
+                <button
+                    onClick={() => setOsFilter('mac')}
+                    className={`px-4 py-1.5 rounded-full text-sm font-medium transition-colors ${osFilter === 'mac'
+                        ? 'bg-blue-600 text-white'
+                        : 'bg-gray-800 text-gray-400 hover:text-white hover:bg-gray-700'
+                        }`}
+                >
+                    Mac
+                </button>
+                <button
+                    onClick={() => setOsFilter('windows')}
+                    className={`px-4 py-1.5 rounded-full text-sm font-medium transition-colors ${osFilter === 'windows'
+                        ? 'bg-blue-600 text-white'
+                        : 'bg-gray-800 text-gray-400 hover:text-white hover:bg-gray-700'
+                        }`}
+                >
+                    Windows
+                </button>
+                <button
+                    onClick={() => setOsFilter('linux')}
+                    className={`px-4 py-1.5 rounded-full text-sm font-medium transition-colors ${osFilter === 'linux'
+                        ? 'bg-blue-600 text-white'
+                        : 'bg-gray-800 text-gray-400 hover:text-white hover:bg-gray-700'
+                        }`}
+                >
+                    Linux
+                </button>
+            </div>
 
-            {/* Active Pairing Sessions */}
-            <AnimatePresence>
-                {activeSessions.length > 0 && (
-                    <motion.div
-                        initial={{ opacity: 0, height: 0 }}
-                        animate={{ opacity: 1, height: 'auto' }}
-                        exit={{ opacity: 0, height: 0 }}
-                        className="space-y-3"
+            {/* Device List */}
+            {isLoading ? (
+                <div className="space-y-2">
+                    {[...Array(3)].map((_, i) => (
+                        <div key={i} className="bg-gray-800/30 rounded-lg h-12 animate-pulse" />
+                    ))}
+                </div>
+            ) : filteredDevices.length === 0 ? (
+                <motion.div
+                    initial={{ opacity: 0, scale: 0.8 }}
+                    animate={{ opacity: 1, scale: 1 }}
+                    className="text-center py-6 mt-12"
+                >
+                    <WifiOff className="w-12 h-12 text-gray-400 mx-auto mb-3" />
+                    <p className="text-gray-400 text-sm">
+                        {searchTerm
+                            ? 'No devices match your search'
+                            : 'No unpaired devices found'
+                        }
+                    </p>
+                    <p className="text-gray-500 text-xs mt-1">
+                        {searchTerm
+                            ? 'Try adjusting your search'
+                            : 'Make sure other devices are running Yeet'
+                        }
+                    </p>
+                    <motion.button
+                        whileHover={{ scale: 1.05 }}
+                        whileTap={{ scale: 0.95 }}
+                        onClick={onRefresh}
+                        className="mt-3 px-3 py-1 text-xs bg-blue-500/20 text-blue-300 rounded hover:bg-blue-500/30 transition-colors"
                     >
-                        <h3 className="text-lg font-medium text-white">Active Pairing Sessions</h3>
-                        {activeSessions.map((session) => {
-                            const status = getSessionStatus(session);
-                            return (
+                        Refresh
+                    </motion.button>
+                </motion.div>
+            ) : (
+                <div className="space-y-2">
+                    <motion.div
+                        initial={{ opacity: 0 }}
+                        animate={{ opacity: 1 }}
+                        className="text-xs text-gray-500 mb-2"
+                    >
+                        Showing {filteredDevices.length} device{filteredDevices.length !== 1 ? 's' : ''}
+                    </motion.div>
+
+                    {filteredDevices.map((device) => {
+                        const session = activeSessions.get(device.id);
+                        const showPin = session?.state === 'DisplayingPin' && session.initiated_by_us;
+                        const showApprovalPin = session?.state === 'AwaitingApproval' && !session.initiated_by_us;
+
+                        return (
+                            <div key={device.id} className="space-y-2">
                                 <motion.div
-                                    key={session.session_id}
-                                    layout
-                                    className="bg-white/10 border border-white/20 rounded-lg p-4 backdrop-blur-sm"
+                                    className="bg-gray-800/30 border border-gray-700 rounded-lg px-4 py-3 hover:bg-gray-800/50 transition-colors"
                                 >
                                     <div className="flex items-center justify-between">
                                         <div className="flex items-center gap-3">
-                                            <div className="text-gray-300">
-                                                {getDeviceIcon()}
+                                            <div className="text-gray-400">
+                                                {getDeviceIcon(device.platform)}
                                             </div>
-                                            <div>
-                                                <h4 className="font-medium text-white">{session.peer_name}</h4>
-                                                <div className={`flex items-center gap-2 text-sm ${status.color}`}>
-                                                    {status.icon}
-                                                    {status.text}
-                                                </div>
-                                            </div>
+                                            <span className="text-white text-sm font-medium">{device.name}</span>
                                         </div>
-                                        
-                                        <div className="flex items-center gap-3">
-                                            {session.remaining_seconds > 0 && (
-                                                <span className="text-sm text-gray-500">
-                                                    {Math.floor(session.remaining_seconds / 60)}:
-                                                    {(session.remaining_seconds % 60).toString().padStart(2, '0')}
-                                                </span>
-                                            )}
-                                            
-                                            {/* Only targets (AwaitingApproval) can confirm/reject */}
-                                            {session.state === 'AwaitingApproval' && (
-                                                <div className="flex gap-2">
-                                                    <button
-                                                        onClick={() => handleConfirmPairing(session.session_id)}
-                                                        className="px-3 py-1 bg-green-500 text-white rounded text-sm hover:bg-green-600 transition-colors"
-                                                    >
-                                                        Accept
-                                                    </button>
-                                                    <button
-                                                        onClick={() => handleRejectPairing(session.session_id)}
-                                                        className="px-3 py-1 bg-red-500 text-white rounded text-sm hover:bg-red-600 transition-colors"
-                                                    >
-                                                        Reject
-                                                    </button>
-                                                </div>
-                                            )}
-
-                                            {/* Initiators display PIN but can't confirm */}
-                                            {session.state === 'DisplayingPin' && (
-                                                <div className="text-center p-4 bg-yellow-50 rounded-lg border border-yellow-200">
-                                                    <div className="text-2xl font-mono font-bold text-yellow-800 mb-2">
-                                                        {session.pin}
-                                                    </div>
-                                                    <div className="text-sm text-yellow-600">
-                                                        Show this PIN to {session.peer_name}
-                                                    </div>
-                                                </div>
-                                            )}
-
-                                            {/* Retry button for failed sessions */}
-                                            {typeof session.state === 'object' && 'Failed' in session.state && (
-                                                <div className="flex gap-2">
-                                                    <button
-                                                        onClick={() => handlePairDevice(session.peer_device_id)}
-                                                        className="px-3 py-1 bg-blue-500 text-white rounded text-sm hover:bg-blue-600 transition-colors"
-                                                    >
-                                                        Retry
-                                                    </button>
-                                                </div>
-                                            )}
-                                        </div>
+                                        {getPairingButton(device, session)}
                                     </div>
                                 </motion.div>
-                            );
-                        })}
-                    </motion.div>
-                )}
-            </AnimatePresence>
 
-            {/* Discovered Devices */}
-            <div className="space-y-3">
-                <h3 className="text-lg font-medium text-white">Discovered Devices</h3>
-
-                {isLoading ? (
-                    <div className="space-y-3">
-                        {[...Array(3)].map((_, i) => (
-                            <div key={i} className="bg-white/10 rounded-lg h-16 animate-pulse" />
-                        ))}
-                    </div>
-                ) : filteredDevices.length === 0 ? (
-                    <motion.div
-                        initial={{ opacity: 0 }}
-                        animate={{ opacity: 1 }}
-                        className="text-center py-8 text-gray-400"
-                    >
-                        <Wifi className="w-12 h-12 mx-auto mb-3 text-gray-500" />
-                        <p className="text-white">No unpaired devices found</p>
-                        <p className="text-sm">Make sure other devices are running Fileshare</p>
-                    </motion.div>
-                ) : (
-                    <motion.div
-                        className="space-y-3"
-                        initial={{ opacity: 0 }}
-                        animate={{ opacity: 1 }}
-                    >
-                        {filteredDevices.map((device, index) => (
-                            <motion.div
-                                key={device.id}
-                                initial={{ opacity: 0, y: 20 }}
-                                animate={{ opacity: 1, y: 0 }}
-                                transition={{ delay: index * 0.1 }}
-                                className="bg-white/10 border border-white/20 rounded-lg p-4 hover:bg-white/15 transition-all backdrop-blur-sm"
-                            >
-                                <div className="flex items-center justify-between">
-                                    <div className="flex items-center gap-3">
-                                        <div className="text-gray-300">
-                                            {getDeviceIcon(device.platform)}
-                                        </div>
-                                        <div>
-                                            <h4 className="font-medium text-white">{device.name}</h4>
-                                            <div className="flex items-center gap-4 text-sm text-gray-400">
-                                                <span>{device.address}</span>
-                                                <span>v{device.version}</span>
-                                                {device.platform && (
-                                                    <span className="capitalize">{device.platform}</span>
-                                                )}
-                                                <span>{formatTimeAgo(device.last_seen)}</span>
+                                {/* PIN Display for Initiator */}
+                                <AnimatePresence>
+                                    {showPin && (
+                                        <motion.div
+                                            initial={{ opacity: 0, height: 0 }}
+                                            animate={{ opacity: 1, height: 'auto' }}
+                                            exit={{ opacity: 0, height: 0 }}
+                                            className="bg-gray-800/50 border border-gray-700 rounded-lg p-4 ml-4"
+                                        >
+                                            <div className="flex items-start gap-3">
+                                                <Key className="w-4 h-4 text-gray-400 mt-1" />
+                                                <div className="flex-1">
+                                                    <h4 className="text-white text-sm font-medium mb-1">Your Pairing PIN</h4>
+                                                    <p className="text-xs text-gray-500 mb-3">
+                                                        Share this PIN with devices that want to pair with you
+                                                    </p>
+                                                    <div className="text-2xl font-mono font-bold text-white mb-2">
+                                                        {session.pin}
+                                                    </div>
+                                                    {session.remaining_seconds > 0 && (
+                                                        <div className="flex items-center gap-1 text-xs text-gray-500">
+                                                            <Clock className="w-3 h-3" />
+                                                            <span>
+                                                                {Math.floor(session.remaining_seconds / 60)}:
+                                                                {(session.remaining_seconds % 60).toString().padStart(2, '0')} remaining
+                                                            </span>
+                                                        </div>
+                                                    )}
+                                                </div>
                                             </div>
-                                        </div>
-                                    </div>
+                                        </motion.div>
+                                    )}
 
-                                    <button
-                                        onClick={() => handlePairDevice(device.id)}
-                                        className="px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 transition-colors flex items-center gap-2"
-                                    >
-                                        <Shield className="w-4 h-4" />
-                                        Pair
-                                    </button>
-                                </div>
-                            </motion.div>
-                        ))}
-                    </motion.div>
-                )}
-            </div>
+                                    {/* PIN Display for Approval */}
+                                    {showApprovalPin && (
+                                        <motion.div
+                                            initial={{ opacity: 0, height: 0 }}
+                                            animate={{ opacity: 1, height: 'auto' }}
+                                            exit={{ opacity: 0, height: 0 }}
+                                            className="bg-yellow-900/20 border border-yellow-700 rounded-lg p-4 ml-4"
+                                        >
+                                            <div className="flex items-start gap-3">
+                                                <Key className="w-4 h-4 text-yellow-400 mt-1" />
+                                                <div className="flex-1">
+                                                    <h4 className="text-white text-sm font-medium mb-1">Verify PIN</h4>
+                                                    <p className="text-xs text-gray-500 mb-3">
+                                                        Make sure this matches the PIN shown on {session.peer_name}
+                                                    </p>
+                                                    <div className="text-2xl font-mono font-bold text-yellow-400 mb-2">
+                                                        {session.pin}
+                                                    </div>
+                                                </div>
+                                            </div>
+                                        </motion.div>
+                                    )}
+                                </AnimatePresence>
+                            </div>
+                        );
+                    })}
+                </div>
+            )}
         </div>
     );
 };

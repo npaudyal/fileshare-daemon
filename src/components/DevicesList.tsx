@@ -91,7 +91,7 @@ const DevicesList: React.FC<DevicesListProps> = ({
                     <motion.div
                         initial={{ opacity: 0, scale: 0.8 }}
                         animate={{ opacity: 1, scale: 1 }}
-                        className="text-center py-8 mt-20"
+                        className="text-center py-8 mt-16"
                     >
                         <WifiOff className="w-12 h-12 text-gray-400 mx-auto mb-3" />
                         <p className="text-gray-400 text-sm">

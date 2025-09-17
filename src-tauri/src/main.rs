@@ -1,7 +1,9 @@
 // Prevents additional console window on Windows in release
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-use fileshare_daemon::{config::Settings, service::FileshareDaemon, pairing::session::PairingError};
+use fileshare_daemon::{
+    config::Settings, pairing::session::PairingError, service::FileshareDaemon,
+};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tauri::{
@@ -228,8 +230,7 @@ async fn test_file_transfer(state: tauri::State<'_, AppState>) -> Result<String,
             "📊 Transfer System Status:\n\
             Connections: {} total ({} healthy)\n\
             System: Ready with optimized QUIC streaming (unlimited file size)",
-            stats.total,
-            stats.authenticated
+            stats.total, stats.authenticated
         ))
     } else {
         Err("Daemon not ready".to_string())
@@ -380,8 +381,8 @@ async fn initiate_pairing(
 ) -> Result<serde_json::Value, String> {
     info!("🔐 Initiating pairing with device: {}", device_id);
 
-    let device_uuid = uuid::Uuid::parse_str(&device_id)
-        .map_err(|e| format!("Invalid device ID: {}", e))?;
+    let device_uuid =
+        uuid::Uuid::parse_str(&device_id).map_err(|e| format!("Invalid device ID: {}", e))?;
 
     if let Some(daemon_ref) = state.daemon_ref.lock().await.as_ref() {
         // Find device info from discovered devices
@@ -398,14 +399,21 @@ async fn initiate_pairing(
             let mut peer_manager = daemon_ref.peer_manager.write().await;
 
             // Check if we have an authenticated connection
-            let is_connected = peer_manager.peers.get(&device_uuid)
-                .map(|peer| matches!(peer.connection_status,
+            let is_connected =
+                peer_manager
+                    .peers
+                    .get(&device_uuid)
+                    .map(|peer| {
+                        matches!(peer.connection_status,
                     fileshare_daemon::network::peer_quic::ConnectionStatus::Connected |
-                    fileshare_daemon::network::peer_quic::ConnectionStatus::Authenticated))
-                .unwrap_or(false);
+                    fileshare_daemon::network::peer_quic::ConnectionStatus::Authenticated)
+                    })
+                    .unwrap_or(false);
 
             if !is_connected {
-                info!("🔗 No QUIC connection to device, attempting to establish connection first...");
+                info!(
+                    "🔗 No QUIC connection to device, attempting to establish connection first..."
+                );
 
                 // Trigger connection to the device
                 if let Err(e) = peer_manager.connect_to_peer(device_uuid).await {
@@ -417,10 +425,14 @@ async fn initiate_pairing(
                 tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
 
                 // Check connection status again
-                let connected_after = peer_manager.peers.get(&device_uuid)
-                    .map(|peer| matches!(peer.connection_status,
+                let connected_after = peer_manager
+                    .peers
+                    .get(&device_uuid)
+                    .map(|peer| {
+                        matches!(peer.connection_status,
                         fileshare_daemon::network::peer_quic::ConnectionStatus::Connected |
-                        fileshare_daemon::network::peer_quic::ConnectionStatus::Authenticated))
+                        fileshare_daemon::network::peer_quic::ConnectionStatus::Authenticated)
+                    })
                     .unwrap_or(false);
 
                 if !connected_after {
@@ -446,7 +458,10 @@ async fn initiate_pairing(
                     },
                 );
 
-                match peer_manager.send_message_to_peer(device_uuid, request).await {
+                match peer_manager
+                    .send_message_to_peer(device_uuid, request)
+                    .await
+                {
                     Ok(()) => {
                         info!("✅ Pairing request sent successfully");
                         Ok(serde_json::json!({
@@ -459,9 +474,10 @@ async fn initiate_pairing(
                         error!("❌ Failed to send pairing request: {}", e);
 
                         // Immediately mark the session as failed instead of waiting for timeout
-                        let error_type = if e.to_string().contains("Connection refused") ||
-                                          e.to_string().contains("No route to host") ||
-                                          e.to_string().contains("timeout") {
+                        let error_type = if e.to_string().contains("Connection refused")
+                            || e.to_string().contains("No route to host")
+                            || e.to_string().contains("timeout")
+                        {
                             PairingError::DeviceOffline
                         } else if e.to_string().contains("Network is unreachable") {
                             PairingError::ConnectionFailed
@@ -474,9 +490,10 @@ async fn initiate_pairing(
                         }
 
                         // Return user-friendly error message based on error type
-                        let error_msg = if e.to_string().contains("Connection refused") ||
-                                          e.to_string().contains("No route to host") ||
-                                          e.to_string().contains("timeout") {
+                        let error_msg = if e.to_string().contains("Connection refused")
+                            || e.to_string().contains("No route to host")
+                            || e.to_string().contains("timeout")
+                        {
                             "Device appears to be offline or unreachable"
                         } else if e.to_string().contains("Network is unreachable") {
                             "Network connection problem - check your connection"
@@ -502,8 +519,8 @@ async fn confirm_pairing(
 ) -> Result<(), String> {
     info!("✅ Confirming pairing for session: {}", session_id);
 
-    let session_uuid = uuid::Uuid::parse_str(&session_id)
-        .map_err(|e| format!("Invalid session ID: {}", e))?;
+    let session_uuid =
+        uuid::Uuid::parse_str(&session_id).map_err(|e| format!("Invalid session ID: {}", e))?;
 
     if let Some(daemon_ref) = state.daemon_ref.lock().await.as_ref() {
         let mut pm = daemon_ref.pairing_manager.write().await;
@@ -521,7 +538,9 @@ async fn confirm_pairing(
                             signed_challenge: signature,
                         },
                     );
-                    peer_manager.send_message_to_peer(session.peer_device_id, confirm).await
+                    peer_manager
+                        .send_message_to_peer(session.peer_device_id, confirm)
+                        .await
                         .map_err(|e| format!("Failed to send pairing confirmation: {}", e))?;
 
                     info!("✅ Pairing confirmation sent by target device, waiting for completion acknowledgment from initiator");
@@ -544,8 +563,8 @@ async fn reject_pairing(
 ) -> Result<(), String> {
     info!("❌ Rejecting pairing for session: {}", session_id);
 
-    let session_uuid = uuid::Uuid::parse_str(&session_id)
-        .map_err(|e| format!("Invalid session ID: {}", e))?;
+    let session_uuid =
+        uuid::Uuid::parse_str(&session_id).map_err(|e| format!("Invalid session ID: {}", e))?;
 
     if let Some(daemon_ref) = state.daemon_ref.lock().await.as_ref() {
         let mut pm = daemon_ref.pairing_manager.write().await;
@@ -563,7 +582,9 @@ async fn reject_pairing(
                             reason: reject_reason,
                         },
                     );
-                    peer_manager.send_message_to_peer(session.peer_device_id, reject).await
+                    peer_manager
+                        .send_message_to_peer(session.peer_device_id, reject)
+                        .await
                         .map_err(|e| format!("Failed to send pairing rejection: {}", e))?;
                 }
 
@@ -1322,7 +1343,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .setup(|app| {
             let _main_window = WebviewWindowBuilder::new(app, "main", WebviewUrl::default())
                 .title("Fileshare") // This will appear in native title bar
-                .inner_size(700.0, 700.0)
+                .inner_size(800.0, 600.0)
                 .center()
                 .decorations(true)
                 .resizable(false)
