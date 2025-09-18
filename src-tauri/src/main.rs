@@ -3,7 +3,6 @@
 
 use fileshare_daemon::{
     config::Settings, pairing::session::PairingError, service::FileshareDaemon,
-    transfer::Transfer,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -1196,103 +1195,29 @@ async fn refresh_devices(_state: tauri::State<'_, AppState>) -> Result<(), Strin
 // Transfer progress and control commands
 #[tauri::command]
 async fn get_active_transfers(
-    state: tauri::State<'_, AppState>,
-) -> Result<Vec<Transfer>, String> {
-    if let Some(daemon_ref) = state.daemon_ref.lock().await.as_ref() {
-        let transfers = daemon_ref.transfer_manager.get_active_transfers().await;
-        Ok(transfers)
-    } else {
-        Ok(Vec::new())
-    }
-}
-
-#[tauri::command]
-async fn get_all_transfers(
-    state: tauri::State<'_, AppState>,
-) -> Result<Vec<Transfer>, String> {
-    if let Some(daemon_ref) = state.daemon_ref.lock().await.as_ref() {
-        let transfers = daemon_ref.transfer_manager.get_all_transfers().await;
-        Ok(transfers)
-    } else {
-        Ok(Vec::new())
-    }
+    _state: tauri::State<'_, AppState>,
+) -> Result<Vec<serde_json::Value>, String> {
+    // With optimized QUIC transfers, we don't track transfers in the old way
+    // Transfers are handled directly by stream managers
+    Ok(Vec::new())
 }
 
 #[tauri::command]
 async fn toggle_transfer_pause(
-    transfer_id: String,
-    state: tauri::State<'_, AppState>,
+    _transfer_id: String,
+    _state: tauri::State<'_, AppState>,
 ) -> Result<(), String> {
-    let uuid = Uuid::parse_str(&transfer_id).map_err(|e| e.to_string())?;
-    if let Some(daemon_ref) = state.daemon_ref.lock().await.as_ref() {
-        daemon_ref.transfer_manager.toggle_transfer_pause(uuid).await
-            .map_err(|e| e.to_string())?;
-        info!("Toggled pause for transfer: {}", transfer_id);
-    }
-    Ok(())
+    // Optimized QUIC transfers don't support pause/resume yet
+    Err("Transfer pause/resume not supported with optimized QUIC transfers".to_string())
 }
 
 #[tauri::command]
 async fn cancel_transfer(
-    transfer_id: String,
-    state: tauri::State<'_, AppState>,
+    _transfer_id: String,
+    _state: tauri::State<'_, AppState>,
 ) -> Result<(), String> {
-    let uuid = Uuid::parse_str(&transfer_id).map_err(|e| e.to_string())?;
-    if let Some(daemon_ref) = state.daemon_ref.lock().await.as_ref() {
-        daemon_ref.transfer_manager.cancel_transfer(uuid).await
-            .map_err(|e| e.to_string())?;
-        info!("Cancelled transfer: {}", transfer_id);
-    }
-    Ok(())
-}
-
-#[tauri::command]
-async fn get_transfer_status(
-    transfer_id: String,
-    state: tauri::State<'_, AppState>,
-) -> Result<Option<Transfer>, String> {
-    let uuid = Uuid::parse_str(&transfer_id).map_err(|e| e.to_string())?;
-    if let Some(daemon_ref) = state.daemon_ref.lock().await.as_ref() {
-        let transfer = daemon_ref.transfer_manager.get_transfer(uuid).await;
-        Ok(transfer)
-    } else {
-        Ok(None)
-    }
-}
-
-#[tauri::command]
-async fn open_transfer_window(
-    transfer_id: String,
-    app: tauri::AppHandle,
-) -> Result<(), String> {
-    // Create transfer progress window
-    let window_label = format!("transfer-{}", transfer_id);
-
-    if let Some(_existing_window) = app.get_webview_window(&window_label) {
-        // Window already exists, just focus it
-        return Ok(());
-    }
-
-    let _transfer_window = WebviewWindowBuilder::new(
-        &app,
-        &window_label,
-        WebviewUrl::App("transfer-progress.html".into())
-    )
-    .title("File Transfer")
-    .inner_size(450.0, 250.0)
-    .min_inner_size(400.0, 200.0)
-    .center()
-    .decorations(false)
-    .always_on_top(true)
-    .resizable(true)
-    .visible(true)
-    .focused(true)
-    .shadow(true)
-    .build()
-    .map_err(|e| e.to_string())?;
-
-    info!("Opened transfer progress window for: {}", transfer_id);
-    Ok(())
+    // Optimized QUIC transfers don't support cancellation yet
+    Err("Transfer cancellation not supported with optimized QUIC transfers".to_string())
 }
 
 #[tauri::command]
@@ -1410,11 +1335,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             test_hotkey_system,
             test_isolated_hotkey,
             get_active_transfers,
-            get_all_transfers,
-            get_transfer_status,
             toggle_transfer_pause,
             cancel_transfer,
-            open_transfer_window,
             quit_app,
             hide_window
         ])

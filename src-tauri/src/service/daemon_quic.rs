@@ -4,7 +4,6 @@ use crate::{
     hotkeys::{HotkeyEvent, HotkeyManager},
     network::{DiscoveryService, PeerManager},
     pairing::PairingManager,
-    transfer::{TransferManager, TransferDirection},
     Result,
 };
 use std::sync::Arc;
@@ -17,7 +16,6 @@ pub struct FileshareDaemon {
     pub discovery: Option<DiscoveryService>,
     pub peer_manager: Arc<RwLock<PeerManager>>,
     pub pairing_manager: Arc<RwLock<PairingManager>>,
-    pub transfer_manager: Arc<TransferManager>,
     hotkey_manager: Option<HotkeyManager>,
     clipboard: ClipboardManager,
     shutdown_tx: broadcast::Sender<()>,
@@ -68,15 +66,11 @@ impl FileshareDaemon {
         // Initialize clipboard manager with device ID
         let clipboard = ClipboardManager::new(settings.device.id);
 
-        // Initialize transfer manager
-        let transfer_manager = Arc::new(TransferManager::new());
-
         Ok(Self {
             settings,
             discovery: Some(discovery),
             peer_manager,
             pairing_manager,
-            transfer_manager,
             hotkey_manager: Some(hotkey_manager),
             clipboard,
             shutdown_tx,
@@ -106,7 +100,6 @@ impl FileshareDaemon {
         let mut hotkey_manager = HotkeyManager::new()?;
         let peer_manager_for_hotkeys = self.peer_manager.clone();
         let clipboard_for_hotkeys = self.clipboard.clone();
-        let transfer_manager_for_hotkeys = self.transfer_manager.clone();
 
         tokio::spawn(async move {
             if let Err(e) = hotkey_manager.start().await {
@@ -118,7 +111,6 @@ impl FileshareDaemon {
                 &mut hotkey_manager,
                 peer_manager_for_hotkeys,
                 clipboard_for_hotkeys,
-                transfer_manager_for_hotkeys,
             )
             .await;
         });
@@ -296,14 +288,13 @@ impl FileshareDaemon {
         let hotkey_handle = {
             let peer_manager = self.peer_manager.clone();
             let clipboard = self.clipboard.clone();
-            let transfer_manager = self.transfer_manager.clone();
             let mut hotkey_manager = self.hotkey_manager.take().unwrap();
             let mut shutdown_rx = self.shutdown_tx.subscribe();
 
             tokio::spawn(async move {
                 info!("🎹 Starting hotkey event handler...");
                 tokio::select! {
-                    _ = Self::handle_hotkey_events(&mut hotkey_manager, peer_manager, clipboard, transfer_manager) => {
+                    _ = Self::handle_hotkey_events(&mut hotkey_manager, peer_manager, clipboard) => {
                         info!("🎹 Hotkey handler stopped");
                     }
                     _ = shutdown_rx.recv() => {
@@ -336,7 +327,6 @@ impl FileshareDaemon {
         hotkey_manager: &mut HotkeyManager,
         peer_manager: Arc<RwLock<PeerManager>>,
         clipboard: ClipboardManager,
-        transfer_manager: Arc<TransferManager>,
     ) {
         info!("🎹 Enhanced hotkey event handler active and listening...");
 
@@ -361,7 +351,6 @@ impl FileshareDaemon {
                         if let Err(e) = Self::handle_paste_operation(
                             clipboard.clone(),
                             peer_manager.clone(),
-                            transfer_manager.clone(),
                         )
                         .await
                         {
@@ -490,7 +479,6 @@ impl FileshareDaemon {
     async fn handle_paste_operation(
         clipboard: ClipboardManager,
         peer_manager: Arc<RwLock<PeerManager>>,
-        transfer_manager: Arc<TransferManager>,
     ) -> Result<()> {
         info!("📁 Handling paste operation with QUIC");
 
@@ -524,19 +512,10 @@ impl FileshareDaemon {
             );
 
             // Get the source file path and validate size
-            let (source_file_path, file_size, file_name) = {
+            let (source_file_path, file_size) = {
                 let clipboard_state = clipboard.network_clipboard.read().await;
                 let item = clipboard_state.as_ref().unwrap();
-                let file_name = item.file_path.file_name()
-                    .and_then(|n| n.to_str())
-                    .unwrap_or("unknown")
-                    .to_string();
-
-                (
-                    item.file_path.to_string_lossy().to_string(),
-                    item.file_size,
-                    file_name,
-                )
+                (item.file_path.to_string_lossy().to_string(), item.file_size)
             };
 
             let file_size_mb = file_size as f64 / (1024.0 * 1024.0);
@@ -544,18 +523,6 @@ impl FileshareDaemon {
                 "📊 Requesting file transfer: {:.1} MB (QUIC parallel streams)",
                 file_size_mb
             );
-
-            // Create transfer record
-            let transfer_id = transfer_manager.create_transfer(
-                file_name,
-                target_path.clone(),
-                file_size,
-                TransferDirection::Download,
-                source_device,
-                format!("Device {}", source_device), // Simple peer name for now
-            ).await;
-
-            info!("📊 Created transfer record: {}", transfer_id);
 
             // Send file request to source device
             let request_id = uuid::Uuid::new_v4();
