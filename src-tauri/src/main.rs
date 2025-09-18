@@ -3,6 +3,8 @@
 
 use fileshare_daemon::{
     config::Settings, pairing::session::PairingError, service::FileshareDaemon,
+    transfer::{TransferManager, TransferInfo, TransferDetails, TransferPriority},
+    windows::spawn_transfer_window,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -723,6 +725,7 @@ struct AppState {
     settings: Arc<RwLock<Settings>>,
     daemon_ref: Arc<Mutex<Option<Arc<FileshareDaemon>>>>,
     device_manager: Arc<RwLock<DeviceManager>>,
+    transfer_manager: Arc<RwLock<Option<Arc<TransferManager>>>>,
 }
 
 // Enhanced device discovery with metadata
@@ -1195,29 +1198,179 @@ async fn refresh_devices(_state: tauri::State<'_, AppState>) -> Result<(), Strin
 // Transfer progress and control commands
 #[tauri::command]
 async fn get_active_transfers(
-    _state: tauri::State<'_, AppState>,
-) -> Result<Vec<serde_json::Value>, String> {
-    // With optimized QUIC transfers, we don't track transfers in the old way
-    // Transfers are handled directly by stream managers
-    Ok(Vec::new())
+    state: tauri::State<'_, AppState>,
+) -> Result<Vec<TransferInfo>, String> {
+    let manager_lock = state.transfer_manager.read().await;
+    if let Some(manager) = manager_lock.as_ref() {
+        Ok(manager.get_active_transfers().await)
+    } else {
+        Ok(Vec::new())
+    }
 }
 
 #[tauri::command]
-async fn toggle_transfer_pause(
-    _transfer_id: String,
-    _state: tauri::State<'_, AppState>,
+async fn get_all_transfers(
+    state: tauri::State<'_, AppState>,
+) -> Result<Vec<TransferInfo>, String> {
+    let manager_lock = state.transfer_manager.read().await;
+    if let Some(manager) = manager_lock.as_ref() {
+        Ok(manager.get_all_transfers().await)
+    } else {
+        Ok(Vec::new())
+    }
+}
+
+#[tauri::command]
+async fn pause_transfer(
+    transfer_id: String,
+    state: tauri::State<'_, AppState>,
 ) -> Result<(), String> {
-    // Optimized QUIC transfers don't support pause/resume yet
-    Err("Transfer pause/resume not supported with optimized QUIC transfers".to_string())
+    let id = Uuid::parse_str(&transfer_id)
+        .map_err(|e| format!("Invalid transfer ID: {}", e))?;
+
+    let manager_lock = state.transfer_manager.read().await;
+    if let Some(manager) = manager_lock.as_ref() {
+        manager.pause_transfer(id).await
+            .map_err(|e| format!("Failed to pause transfer: {}", e))
+    } else {
+        Err("Transfer manager not initialized".to_string())
+    }
+}
+
+#[tauri::command]
+async fn resume_transfer(
+    transfer_id: String,
+    state: tauri::State<'_, AppState>,
+) -> Result<(), String> {
+    let id = Uuid::parse_str(&transfer_id)
+        .map_err(|e| format!("Invalid transfer ID: {}", e))?;
+
+    let manager_lock = state.transfer_manager.read().await;
+    if let Some(manager) = manager_lock.as_ref() {
+        manager.resume_transfer(id).await
+            .map_err(|e| format!("Failed to resume transfer: {}", e))
+    } else {
+        Err("Transfer manager not initialized".to_string())
+    }
 }
 
 #[tauri::command]
 async fn cancel_transfer(
-    _transfer_id: String,
-    _state: tauri::State<'_, AppState>,
+    transfer_id: String,
+    state: tauri::State<'_, AppState>,
 ) -> Result<(), String> {
-    // Optimized QUIC transfers don't support cancellation yet
-    Err("Transfer cancellation not supported with optimized QUIC transfers".to_string())
+    let id = Uuid::parse_str(&transfer_id)
+        .map_err(|e| format!("Invalid transfer ID: {}", e))?;
+
+    let manager_lock = state.transfer_manager.read().await;
+    if let Some(manager) = manager_lock.as_ref() {
+        manager.cancel_transfer(id).await
+            .map_err(|e| format!("Failed to cancel transfer: {}", e))
+    } else {
+        Err("Transfer manager not initialized".to_string())
+    }
+}
+
+#[tauri::command]
+async fn get_transfer_details(
+    transfer_id: String,
+    state: tauri::State<'_, AppState>,
+) -> Result<Option<TransferDetails>, String> {
+    let id = Uuid::parse_str(&transfer_id)
+        .map_err(|e| format!("Invalid transfer ID: {}", e))?;
+
+    let manager_lock = state.transfer_manager.read().await;
+    if let Some(manager) = manager_lock.as_ref() {
+        Ok(manager.get_transfer_details(id).await)
+    } else {
+        Ok(None)
+    }
+}
+
+#[tauri::command]
+async fn set_transfer_priority(
+    transfer_id: String,
+    priority: u8,
+    state: tauri::State<'_, AppState>,
+) -> Result<(), String> {
+    let id = Uuid::parse_str(&transfer_id)
+        .map_err(|e| format!("Invalid transfer ID: {}", e))?;
+
+    let priority = match priority {
+        0 => TransferPriority::Low,
+        1 => TransferPriority::Normal,
+        2 => TransferPriority::High,
+        3 => TransferPriority::Critical,
+        _ => return Err("Invalid priority level".to_string()),
+    };
+
+    let manager_lock = state.transfer_manager.read().await;
+    if let Some(manager) = manager_lock.as_ref() {
+        manager.set_priority(id, priority).await
+            .map_err(|e| format!("Failed to set priority: {}", e))
+    } else {
+        Err("Transfer manager not initialized".to_string())
+    }
+}
+
+#[tauri::command]
+async fn set_bandwidth_limit(
+    limit_bytes_per_sec: Option<u64>,
+    state: tauri::State<'_, AppState>,
+) -> Result<(), String> {
+    let manager_lock = state.transfer_manager.read().await;
+    if let Some(manager) = manager_lock.as_ref() {
+        manager.set_bandwidth_limit(limit_bytes_per_sec).await;
+        Ok(())
+    } else {
+        Err("Transfer manager not initialized".to_string())
+    }
+}
+
+#[tauri::command]
+async fn open_transfer_window(
+    app: tauri::AppHandle,
+    transfer_id: Option<String>,
+) -> Result<(), String> {
+    let id = if let Some(id_str) = transfer_id {
+        Some(Uuid::parse_str(&id_str)
+            .map_err(|e| format!("Invalid transfer ID: {}", e))?)
+    } else {
+        None
+    };
+
+    spawn_transfer_window(app, id).await
+}
+
+// Keep the legacy command for compatibility
+#[tauri::command]
+async fn toggle_transfer_pause(
+    transfer_id: String,
+    state: tauri::State<'_, AppState>,
+) -> Result<(), String> {
+    // Determine current state and toggle
+    let id = Uuid::parse_str(&transfer_id)
+        .map_err(|e| format!("Invalid transfer ID: {}", e))?;
+
+    let manager_lock = state.transfer_manager.read().await;
+    if let Some(manager) = manager_lock.as_ref() {
+        if let Some(details) = manager.get_transfer_details(id).await {
+            match details.info.state {
+                fileshare_daemon::transfer::TransferState::Paused => {
+                    manager.resume_transfer(id).await
+                        .map_err(|e| format!("Failed to resume transfer: {}", e))
+                }
+                _ => {
+                    manager.pause_transfer(id).await
+                        .map_err(|e| format!("Failed to pause transfer: {}", e))
+                }
+            }
+        } else {
+            Err("Transfer not found".to_string())
+        }
+    } else {
+        Err("Transfer manager not initialized".to_string())
+    }
 }
 
 #[tauri::command]
@@ -1295,6 +1448,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         settings: Arc::new(RwLock::new(settings)),
         daemon_ref: Arc::new(Mutex::new(None)),
         device_manager: Arc::new(RwLock::new(DeviceManager::default())),
+        transfer_manager: Arc::new(RwLock::new(None)),
     };
 
     tauri::Builder::default()
@@ -1334,9 +1488,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             get_active_pairing_sessions,
             test_hotkey_system,
             test_isolated_hotkey,
+            // Transfer commands
             get_active_transfers,
-            toggle_transfer_pause,
+            get_all_transfers,
+            pause_transfer,
+            resume_transfer,
             cancel_transfer,
+            toggle_transfer_pause,
+            get_transfer_details,
+            set_transfer_priority,
+            set_bandwidth_limit,
+            open_transfer_window,
             quit_app,
             hide_window
         ])
@@ -1433,13 +1595,23 @@ async fn start_daemon(app_handle: tauri::AppHandle) -> Result<(), Box<dyn std::e
     };
 
     // Create the daemon wrapped in Arc for shared ownership
-    let daemon = Arc::new(
-        FileshareDaemon::new(settings)
-            .await
-            .map_err(|e| format!("Failed to create daemon: {}", e))?,
-    );
+    let mut daemon = FileshareDaemon::new(settings)
+        .await
+        .map_err(|e| format!("Failed to create daemon: {}", e))?;
 
     info!("✅ Daemon created successfully");
+
+    // Create and store transfer manager
+    let transfer_manager = Arc::new(TransferManager::new(Some(app_handle.clone())));
+    {
+        let mut manager_ref = state.transfer_manager.write().await;
+        *manager_ref = Some(transfer_manager.clone());
+    }
+    info!("✅ Transfer manager created and stored");
+
+    // Set transfer manager in daemon
+    daemon.set_transfer_manager(transfer_manager.clone());
+    let daemon = Arc::new(daemon);
 
     // Store daemon reference for UI access
     {

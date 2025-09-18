@@ -7,6 +7,8 @@ pub mod network;
 pub mod pairing;
 pub mod quic;
 pub mod service;
+pub mod transfer;
 pub mod utils;
+pub mod windows;
 
 pub use error::{FileshareError, Result};

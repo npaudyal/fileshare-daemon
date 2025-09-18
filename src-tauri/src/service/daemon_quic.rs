@@ -4,6 +4,8 @@ use crate::{
     hotkeys::{HotkeyEvent, HotkeyManager},
     network::{DiscoveryService, PeerManager},
     pairing::PairingManager,
+    transfer::{Transfer, TransferManager, TransferDirection},
+    windows::spawn_transfer_window,
     Result,
 };
 use std::sync::Arc;
@@ -16,6 +18,7 @@ pub struct FileshareDaemon {
     pub discovery: Option<DiscoveryService>,
     pub peer_manager: Arc<RwLock<PeerManager>>,
     pub pairing_manager: Arc<RwLock<PairingManager>>,
+    pub transfer_manager: Option<Arc<TransferManager>>,
     hotkey_manager: Option<HotkeyManager>,
     clipboard: ClipboardManager,
     shutdown_tx: broadcast::Sender<()>,
@@ -71,6 +74,7 @@ impl FileshareDaemon {
             discovery: Some(discovery),
             peer_manager,
             pairing_manager,
+            transfer_manager: None, // Will be set externally
             hotkey_manager: Some(hotkey_manager),
             clipboard,
             shutdown_tx,
@@ -89,8 +93,13 @@ impl FileshareDaemon {
         &self.settings
     }
 
+    // Setter for transfer manager (for external initialization)
+    pub fn set_transfer_manager(&mut self, transfer_manager: Arc<TransferManager>) {
+        self.transfer_manager = Some(transfer_manager);
+    }
+
     // Enhanced daemon startup with health monitoring
-    pub async fn start_background_services(mut self: Arc<Self>) -> Result<()> {
+    pub async fn start_background_services(self: Arc<Self>) -> Result<()> {
         info!("🚀 Starting Enhanced Fileshare Daemon with QUIC support...");
         info!("📱 Device ID: {}", self.settings.device.id);
         info!("🏷️ Device Name: {}", self.settings.device.name);
@@ -100,6 +109,7 @@ impl FileshareDaemon {
         let mut hotkey_manager = HotkeyManager::new()?;
         let peer_manager_for_hotkeys = self.peer_manager.clone();
         let clipboard_for_hotkeys = self.clipboard.clone();
+        let transfer_manager_for_hotkeys = self.transfer_manager.clone();
 
         tokio::spawn(async move {
             if let Err(e) = hotkey_manager.start().await {
@@ -111,6 +121,8 @@ impl FileshareDaemon {
                 &mut hotkey_manager,
                 peer_manager_for_hotkeys,
                 clipboard_for_hotkeys,
+                transfer_manager_for_hotkeys,
+                None, // We don't have app handle here, will need to pass it differently
             )
             .await;
         });
@@ -294,7 +306,7 @@ impl FileshareDaemon {
             tokio::spawn(async move {
                 info!("🎹 Starting hotkey event handler...");
                 tokio::select! {
-                    _ = Self::handle_hotkey_events(&mut hotkey_manager, peer_manager, clipboard) => {
+                    _ = Self::handle_hotkey_events(&mut hotkey_manager, peer_manager, clipboard, self.transfer_manager.clone(), None) => {
                         info!("🎹 Hotkey handler stopped");
                     }
                     _ = shutdown_rx.recv() => {
@@ -327,6 +339,8 @@ impl FileshareDaemon {
         hotkey_manager: &mut HotkeyManager,
         peer_manager: Arc<RwLock<PeerManager>>,
         clipboard: ClipboardManager,
+        transfer_manager: Option<Arc<TransferManager>>,
+        app_handle: Option<tauri::AppHandle>,
     ) {
         info!("🎹 Enhanced hotkey event handler active and listening...");
 
@@ -351,6 +365,8 @@ impl FileshareDaemon {
                         if let Err(e) = Self::handle_paste_operation(
                             clipboard.clone(),
                             peer_manager.clone(),
+                            transfer_manager.clone(),
+                            app_handle.clone(),
                         )
                         .await
                         {
@@ -479,6 +495,8 @@ impl FileshareDaemon {
     async fn handle_paste_operation(
         clipboard: ClipboardManager,
         peer_manager: Arc<RwLock<PeerManager>>,
+        transfer_manager: Option<Arc<TransferManager>>,
+        app_handle: Option<tauri::AppHandle>,
     ) -> Result<()> {
         info!("📁 Handling paste operation with QUIC");
 
@@ -512,10 +530,23 @@ impl FileshareDaemon {
             );
 
             // Get the source file path and validate size
-            let (source_file_path, file_size) = {
+            let (source_file_path, file_size, peer_name) = {
                 let clipboard_state = clipboard.network_clipboard.read().await;
                 let item = clipboard_state.as_ref().unwrap();
-                (item.file_path.to_string_lossy().to_string(), item.file_size)
+                let peer_name = {
+                    let pm = peer_manager.read().await;
+                    // Try to get peer name from connected peers or discovered devices
+                    pm.get_connected_peers()
+                        .iter()
+                        .find(|peer| peer.device_info.id == source_device)
+                        .map(|peer| peer.device_info.name.clone())
+                        .unwrap_or_else(|| "Unknown Device".to_string())
+                };
+                (
+                    item.file_path.to_string_lossy().to_string(),
+                    item.file_size,
+                    peer_name,
+                )
             };
 
             let file_size_mb = file_size as f64 / (1024.0 * 1024.0);
@@ -523,6 +554,39 @@ impl FileshareDaemon {
                 "📊 Requesting file transfer: {:.1} MB (QUIC parallel streams)",
                 file_size_mb
             );
+
+            // Create transfer in transfer manager if available
+            let transfer_id = if let Some(manager) = &transfer_manager {
+                let file_name = std::path::Path::new(&source_file_path)
+                    .file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .to_string();
+
+                let transfer = Transfer::new(
+                    file_name,
+                    file_size,
+                    TransferDirection::Download,
+                    source_device,
+                    peer_name,
+                    target_path.clone(),
+                );
+
+                let id = transfer.id;
+                manager.add_transfer(transfer).await
+                    .map_err(|e| crate::FileshareError::Transfer(format!("Failed to create transfer: {}", e)))?;
+
+                // Open transfer window if app handle is available
+                if let Some(app_handle) = &app_handle {
+                    if let Err(e) = spawn_transfer_window(app_handle.clone(), Some(id)).await {
+                        warn!("Failed to open transfer window: {}", e);
+                    }
+                }
+
+                Some(id)
+            } else {
+                None
+            };
 
             // Send file request to source device
             let request_id = uuid::Uuid::new_v4();
@@ -538,9 +602,15 @@ impl FileshareDaemon {
             pm.send_message_to_peer(source_device, message).await?;
 
             // Show notification that transfer is starting
+            let notification_message = if transfer_id.is_some() {
+                "Transfer started! Check the progress window for details."
+            } else {
+                "Requesting file from source device with parallel streams..."
+            };
+
             notify_rust::Notification::new()
-                .summary("QUIC File Transfer Starting")
-                .body("Requesting file from source device with parallel streams...")
+                .summary("File Transfer Starting")
+                .body(notification_message)
                 .timeout(notify_rust::Timeout::Milliseconds(3000))
                 .show()
                 .map_err(|e| {

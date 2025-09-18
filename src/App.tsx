@@ -59,9 +59,9 @@ function App() {
     const [settings, setSettings] = useState<AppSettings | null>(null);
     const [activeTab, setActiveTab] = useState<'devices' | 'pairing' | 'settings' | 'info'>('devices');
     const [isLoading, setIsLoading] = useState(true);
-    const [lastUpdate, setLastUpdate] = useState<Date>(new Date());
-    const [connectionStatus, setConnectionStatus] = useState(false);
-    const [isRefreshing, setIsRefreshing] = useState(false);
+    const [_lastUpdate, setLastUpdate] = useState<Date>(new Date());
+    const [_connectionStatus, setConnectionStatus] = useState(false);
+    const [_isRefreshing, setIsRefreshing] = useState(false);
 
     // Device management state
     const [selectedDevices, setSelectedDevices] = useState<Set<string>>(new Set());
