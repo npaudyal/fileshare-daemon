@@ -50,14 +50,14 @@ interface DeviceCardProps {
 const DeviceCard: React.FC<DeviceCardProps> = ({
     device,
     isSelected,
-    isFavorite: _isFavorite,
-    onSelect: _onSelect,
-    onPair: _onPair,
+    isFavorite,
+    onSelect,
+    onPair,
     onBlock,
     onUnblock,
     onForget,
     onRename,
-    onToggleFavorite: _onToggleFavorite
+    onToggleFavorite
 }) => {
     const { theme } = useTheme();
     const [editingDevice, setEditingDevice] = useState(false);
