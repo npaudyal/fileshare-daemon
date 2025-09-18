@@ -1623,7 +1623,7 @@ async fn start_daemon(app_handle: tauri::AppHandle) -> Result<(), Box<dyn std::e
 
     // Start background services using shared ownership
     daemon
-        .start_background_services()
+        .start_background_services(Some(app_handle.clone()))
         .await
         .map_err(|e| format!("Failed to start background services: {}", e))?;
 

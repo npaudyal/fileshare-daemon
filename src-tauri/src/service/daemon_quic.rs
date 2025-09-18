@@ -99,7 +99,7 @@ impl FileshareDaemon {
     }
 
     // Enhanced daemon startup with health monitoring
-    pub async fn start_background_services(self: Arc<Self>) -> Result<()> {
+    pub async fn start_background_services(self: Arc<Self>, app_handle: Option<tauri::AppHandle>) -> Result<()> {
         info!("🚀 Starting Enhanced Fileshare Daemon with QUIC support...");
         info!("📱 Device ID: {}", self.settings.device.id);
         info!("🏷️ Device Name: {}", self.settings.device.name);
@@ -122,7 +122,7 @@ impl FileshareDaemon {
                 peer_manager_for_hotkeys,
                 clipboard_for_hotkeys,
                 transfer_manager_for_hotkeys,
-                None, // We don't have app handle here, will need to pass it differently
+                app_handle.clone(),
             )
             .await;
         });

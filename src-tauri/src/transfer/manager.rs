@@ -310,27 +310,31 @@ impl TransferManager {
     }
 
     async fn validate_transfer(&self, transfer: &Transfer) -> Result<()> {
-        // Check disk space
-        let available = fs2::available_space(&transfer.target_path)
-            .map_err(|e| FileshareError::FileOperation(e.to_string()))?;
-
-        if available < transfer.file_size {
-            return Err(FileshareError::Transfer("Insufficient disk space".to_string()));
-        }
-
-        // Check write permissions
+        // Get parent directory first
         let parent = transfer.target_path.parent()
             .ok_or_else(|| FileshareError::FileOperation("Invalid target path".to_string()))?;
 
+        // Ensure parent directory exists
         if !parent.exists() {
             tokio::fs::create_dir_all(parent).await
-                .map_err(|e| FileshareError::FileOperation(e.to_string()))?;
+                .map_err(|e| FileshareError::FileOperation(format!("Failed to create directory: {}", e)))?;
+        }
+
+        // Check disk space on parent directory
+        let available = fs2::available_space(parent)
+            .map_err(|e| FileshareError::FileOperation(format!("Failed to check disk space: {}", e)))?;
+
+        if available < transfer.file_size {
+            return Err(FileshareError::Transfer(format!(
+                "Insufficient disk space: need {} bytes, available {} bytes",
+                transfer.file_size, available
+            )));
         }
 
         // Test write permission
         let test_file = parent.join(format!(".transfer_test_{}", Uuid::new_v4()));
         tokio::fs::write(&test_file, b"test").await
-            .map_err(|_| FileshareError::FileOperation("No write permission".to_string()))?;
+            .map_err(|e| FileshareError::FileOperation(format!("No write permission: {}", e)))?;
         let _ = tokio::fs::remove_file(&test_file).await;
 
         Ok(())
