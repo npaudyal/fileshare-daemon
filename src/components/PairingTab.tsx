@@ -2,18 +2,13 @@ import React, { useState, useEffect, useCallback, useMemo, useRef } from 'react'
 import { motion, AnimatePresence } from 'framer-motion';
 import {
     Search,
-    Monitor,
-    Smartphone,
-    Tablet,
     Key,
     Clock,
-    Loader2,
-    CheckCircle,
-    XCircle,
     WifiOff,
 } from 'lucide-react';
 import { invoke } from '@tauri-apps/api/core';
 import { useTheme } from '../context/ThemeContext';
+import UnpairedDeviceCard from './UnpairedDeviceCard';
 
 // Types
 interface UnpairedDevice {
@@ -58,7 +53,6 @@ const PairingTab: React.FC<PairingTabProps> = ({ onRefresh }) => {
     const [searchTerm, setSearchTerm] = useState('');
     const [osFilter, setOsFilter] = useState<'all' | 'mac' | 'windows' | 'linux'>('all');
     const mountedRef = useRef(true);
-    const [hoveredButton, setHoveredButton] = useState<string | null>(null);
 
     // Load unpaired devices and active sessions
     const loadPairingData = async (showLoading = true) => {
@@ -188,156 +182,6 @@ const PairingTab: React.FC<PairingTabProps> = ({ onRefresh }) => {
         }
     }, []);
 
-    // Get device icon
-    const getDeviceIcon = useCallback((platform?: string) => {
-        const platform_lower = platform?.toLowerCase();
-        if (platform_lower === 'android' || platform_lower === 'ios') {
-            return <Smartphone className="w-4 h-4" />;
-        } else if (platform_lower === 'windows' || platform_lower === 'macos' || platform_lower === 'darwin' || platform_lower === 'linux') {
-            return <Monitor className="w-4 h-4" />;
-        }
-        return <Tablet className="w-4 h-4" />;
-    }, []);
-
-    // Get pairing button content based on session state
-    const getPairingButton = (device: UnpairedDevice, session?: PairingSession) => {
-        if (!session) {
-            const buttonId = `pair-${device.id}`;
-            const isHovered = hoveredButton === buttonId;
-            return (
-                <button
-                    onClick={() => handlePairDevice(device.id)}
-                    onMouseEnter={() => setHoveredButton(buttonId)}
-                    onMouseLeave={() => setHoveredButton(null)}
-                    className="px-3 py-1 rounded-full text-xs font-medium transition-colors"
-                    style={{
-                        backgroundColor: isHovered ? theme.colors.hover : theme.colors.backgroundTertiary,
-                        color: theme.colors.text
-                    }}
-                >
-                    Pair
-                </button>
-            );
-        }
-
-        // Handle different session states
-        const state = session.state;
-        if (typeof state === 'object' && 'Failed' in state) {
-            const buttonId = `retry-${device.id}`;
-            const isHovered = hoveredButton === buttonId;
-            return (
-                <button
-                    onClick={() => handlePairDevice(device.id)}
-                    onMouseEnter={() => setHoveredButton(buttonId)}
-                    onMouseLeave={() => setHoveredButton(null)}
-                    className="px-3 py-1 rounded-full text-xs font-medium transition-colors flex items-center gap-1"
-                    style={{
-                        backgroundColor: isHovered ? '#FF6666' : theme.colors.error,
-                        color: theme.colors.text
-                    }}
-                >
-                    <XCircle className="w-3 h-3" />
-                    Retry
-                </button>
-            );
-        }
-
-        switch (state) {
-            case 'Initiated':
-            case 'Confirmed':
-                return (
-                    <button
-                        disabled
-                        className="px-3 py-1 rounded-full text-xs font-medium flex items-center gap-1"
-                        style={{
-                            backgroundColor: theme.colors.backgroundTertiary,
-                            color: theme.colors.textSecondary
-                        }}
-                    >
-                        <Loader2 className="w-3 h-3 animate-spin" />
-                        Pairing
-                    </button>
-                );
-            case 'DisplayingPin':
-                return (
-                    <button
-                        disabled
-                        className="px-3 py-1 rounded-full text-xs font-medium flex items-center gap-1"
-                        style={{
-                            backgroundColor: theme.colors.accent2,
-                            color: theme.colors.text
-                        }}
-                    >
-                        <Key className="w-3 h-3" />
-                        Pairing
-                    </button>
-                );
-            case 'AwaitingApproval':
-                const acceptButtonId = `accept-${session.session_id}`;
-                const rejectButtonId = `reject-${session.session_id}`;
-                const isAcceptHovered = hoveredButton === acceptButtonId;
-                const isRejectHovered = hoveredButton === rejectButtonId;
-                return (
-                    <div className="flex gap-2">
-                        <button
-                            onClick={() => handleConfirmPairing(session.session_id)}
-                            onMouseEnter={() => setHoveredButton(acceptButtonId)}
-                            onMouseLeave={() => setHoveredButton(null)}
-                            className="px-3 py-1 rounded-full text-xs font-medium transition-colors"
-                            style={{
-                                backgroundColor: isAcceptHovered ? '#00FF9E' : theme.colors.success,
-                                color: theme.colors.text
-                            }}
-                        >
-                            Accept
-                        </button>
-                        <button
-                            onClick={() => handleRejectPairing(session.session_id)}
-                            onMouseEnter={() => setHoveredButton(rejectButtonId)}
-                            onMouseLeave={() => setHoveredButton(null)}
-                            className="px-3 py-1 rounded-full text-xs font-medium transition-colors"
-                            style={{
-                                backgroundColor: isRejectHovered ? theme.colors.hover : theme.colors.backgroundTertiary,
-                                color: theme.colors.text
-                            }}
-                        >
-                            Reject
-                        </button>
-                    </div>
-                );
-            case 'Completed':
-                return (
-                    <button
-                        disabled
-                        className="px-3 py-1 rounded-full text-xs font-medium flex items-center gap-1"
-                        style={{
-                            backgroundColor: theme.colors.success,
-                            color: theme.colors.text
-                        }}
-                    >
-                        <CheckCircle className="w-3 h-3" />
-                        Paired
-                    </button>
-                );
-            default:
-                const defaultButtonId = `default-pair-${device.id}`;
-                const isDefaultHovered = hoveredButton === defaultButtonId;
-                return (
-                    <button
-                        onClick={() => handlePairDevice(device.id)}
-                        onMouseEnter={() => setHoveredButton(defaultButtonId)}
-                        onMouseLeave={() => setHoveredButton(null)}
-                        className="px-3 py-1 rounded-full text-xs font-medium transition-colors"
-                        style={{
-                            backgroundColor: isDefaultHovered ? theme.colors.hover : theme.colors.backgroundTertiary,
-                            color: theme.colors.text
-                        }}
-                    >
-                        Pair
-                    </button>
-                );
-        }
-    };
 
     return (
         <div className="space-y-4">
@@ -366,30 +210,37 @@ const PairingTab: React.FC<PairingTabProps> = ({ onRefresh }) => {
             <div className="flex items-center gap-2">
                 {[{ key: 'all', label: 'All' }, { key: 'mac', label: 'Mac' }, { key: 'windows', label: 'Windows' }, { key: 'linux', label: 'Linux' }].map(({ key, label }) => {
                     const isActive = osFilter === key;
-                    const buttonId = `filter-${key}`;
-                    const isHovered = hoveredButton === buttonId;
                     return (
-                        <button
+                        <motion.button
                             key={key}
+                            whileHover={{ scale: 1.05 }}
+                            whileTap={{ scale: 0.95 }}
                             onClick={() => setOsFilter(key as any)}
-                            onMouseEnter={() => setHoveredButton(buttonId)}
-                            onMouseLeave={() => setHoveredButton(null)}
-                            className="px-4 py-1.5 rounded-full text-sm font-medium transition-colors"
+                            className="px-4 py-1.5 rounded-full text-sm font-medium transition-all duration-200"
                             style={{
                                 backgroundColor: isActive
-                                    ? theme.colors.accent2
-                                    : isHovered
-                                        ? theme.colors.backgroundTertiary
-                                        : theme.colors.backgroundSecondary,
+                                    ? theme.colors.accent2 + '20'
+                                    : theme.colors.backgroundSecondary,
                                 color: isActive
-                                    ? theme.colors.text
-                                    : isHovered
-                                        ? theme.colors.text
-                                        : theme.colors.textSecondary
+                                    ? theme.colors.accent2
+                                    : theme.colors.textSecondary,
+                                border: `1px solid ${isActive ? theme.colors.accent2 + '40' : theme.colors.border}`
+                            }}
+                            onMouseEnter={(e) => {
+                                if (!isActive) {
+                                    e.currentTarget.style.backgroundColor = theme.colors.backgroundTertiary;
+                                    e.currentTarget.style.color = theme.colors.text;
+                                }
+                            }}
+                            onMouseLeave={(e) => {
+                                if (!isActive) {
+                                    e.currentTarget.style.backgroundColor = theme.colors.backgroundSecondary;
+                                    e.currentTarget.style.color = theme.colors.textSecondary;
+                                }
                             }}
                         >
                             {label}
-                        </button>
+                        </motion.button>
                     );
                 })}
             </div>
@@ -461,29 +312,13 @@ const PairingTab: React.FC<PairingTabProps> = ({ onRefresh }) => {
 
                         return (
                             <div key={device.id} className="space-y-2">
-                                <motion.div
-                                    className="rounded-lg px-4 py-3 transition-colors border"
-                                    style={{
-                                        backgroundColor: theme.colors.backgroundSecondary + '50',
-                                        borderColor: theme.colors.border
-                                    }}
-                                    onMouseEnter={(e) => {
-                                        e.currentTarget.style.backgroundColor = theme.colors.backgroundSecondary + '80';
-                                    }}
-                                    onMouseLeave={(e) => {
-                                        e.currentTarget.style.backgroundColor = theme.colors.backgroundSecondary + '50';
-                                    }}
-                                >
-                                    <div className="flex items-center justify-between">
-                                        <div className="flex items-center gap-3">
-                                            <div style={{ color: theme.colors.textSecondary }}>
-                                                {getDeviceIcon(device.platform)}
-                                            </div>
-                                            <span className="text-sm font-medium" style={{ color: theme.colors.text }}>{device.name}</span>
-                                        </div>
-                                        {getPairingButton(device, session)}
-                                    </div>
-                                </motion.div>
+                                <UnpairedDeviceCard
+                                    device={device}
+                                    session={session}
+                                    onPair={handlePairDevice}
+                                    onConfirm={handleConfirmPairing}
+                                    onReject={handleRejectPairing}
+                                />
 
                                 {/* PIN Display for Initiator */}
                                 <AnimatePresence>
