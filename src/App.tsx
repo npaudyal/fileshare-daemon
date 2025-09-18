@@ -84,20 +84,66 @@ function App() {
     // Load data functions
     const loadDevices = useCallback(async () => {
         try {
-            // Get all discovered devices
+            // Get all discovered devices (currently online/broadcasting)
             const discoveredDevices = await invoke<DeviceInfo[]>('get_discovered_devices');
+            const discoveredMap = new Map(discoveredDevices.map(d => [d.id, d]));
 
-            // Get paired devices separately to ensure we have the most up-to-date data
+            // Get paired devices from storage (persistent)
             const pairedDevicesData = await invoke<any[]>('get_paired_devices');
-            const pairedDeviceIds = new Set(pairedDevicesData.map(d => d.device_id));
 
-            // Mark devices as paired based on the paired devices list
-            const devicesWithPairingStatus = discoveredDevices.map(device => ({
-                ...device,
-                is_paired: pairedDeviceIds.has(device.id)
-            }));
+            // Create a merged list: all paired devices + discovered unpaired devices
+            const mergedDevices: DeviceInfo[] = [];
 
-            setDevices(devicesWithPairingStatus);
+            // First, add all paired devices with their online/offline status
+            for (const pairedDevice of pairedDevicesData) {
+                const discovered = discoveredMap.get(pairedDevice.device_id);
+
+                if (discovered) {
+                    // Device is paired AND currently discovered (online)
+                    mergedDevices.push({
+                        ...discovered,
+                        is_paired: true,
+                        is_connected: true,
+                        display_name: pairedDevice.name || discovered.display_name,
+                        trust_level: pairedDevice.trust_level || discovered.trust_level,
+                        last_seen: discovered.last_seen // Use current last seen time
+                    });
+                } else {
+                    // Device is paired but NOT currently discovered (offline)
+                    mergedDevices.push({
+                        id: pairedDevice.device_id,
+                        name: pairedDevice.name,
+                        display_name: pairedDevice.name,
+                        device_type: 'desktop', // Default, will be updated when device comes online
+                        is_paired: true,
+                        is_connected: false,
+                        is_blocked: false,
+                        trust_level: pairedDevice.trust_level || 'Trusted',
+                        last_seen: pairedDevice.last_seen || 0,
+                        first_seen: pairedDevice.paired_at || 0,
+                        connection_count: 0,
+                        address: 'Unknown',
+                        version: 'Unknown',
+                        platform: undefined,
+                        last_transfer_time: undefined,
+                        total_transfers: 0
+                    });
+                }
+            }
+
+            // Then, add discovered devices that are not paired
+            const pairedIds = new Set(pairedDevicesData.map(d => d.device_id));
+            for (const discovered of discoveredDevices) {
+                if (!pairedIds.has(discovered.id)) {
+                    mergedDevices.push({
+                        ...discovered,
+                        is_paired: false,
+                        is_connected: true // If discovered, it's online
+                    });
+                }
+            }
+
+            setDevices(mergedDevices);
             setLastUpdate(new Date());
         } catch (error) {
             console.error('Failed to load devices:', error);

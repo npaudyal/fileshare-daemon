@@ -131,37 +131,23 @@ const DevicesList: React.FC<DevicesListProps> = ({
                         </motion.button>
                     </motion.div>
                 ) : (
-                    <>
-                        <motion.div
-                            initial={{ opacity: 0 }}
-                            animate={{ opacity: 1 }}
-                            className="flex items-center justify-between mb-3"
-                        >
-                            <span className="text-xs" style={{ color: theme.colors.textSecondary }}>
-                                {devices.filter(d => d.is_connected).length} connected
-                            </span>
-                            <span className="text-xs" style={{ color: theme.colors.textTertiary }}>
-                                Showing {filteredDevices.length} paired device{filteredDevices.length !== 1 ? 's' : ''}
-                            </span>
-                        </motion.div>
-                        <StaggeredList>
-                            {filteredDevices.map((device) => (
-                                <DeviceCard
-                                    key={device.id}
-                                    device={device}
-                                    isSelected={selectedDevices.has(device.id)}
-                                    isFavorite={favoriteDevices.has(device.id)}
-                                    onSelect={() => onDeviceSelect(device.id)}
-                                    onPair={() => deviceActions.onPair(device.id)}
-                                    onBlock={() => deviceActions.onBlock(device.id)}
-                                    onUnblock={() => deviceActions.onUnblock(device.id)}
-                                    onForget={() => deviceActions.onForget(device.id)}
-                                    onRename={(newName) => deviceActions.onRename(device.id, newName)}
-                                    onToggleFavorite={() => deviceActions.onToggleFavorite(device.id)}
-                                />
-                            ))}
-                        </StaggeredList>
-                    </>
+                    <StaggeredList>
+                        {filteredDevices.map((device) => (
+                            <DeviceCard
+                                key={device.id}
+                                device={device}
+                                isSelected={selectedDevices.has(device.id)}
+                                isFavorite={favoriteDevices.has(device.id)}
+                                onSelect={() => onDeviceSelect(device.id)}
+                                onPair={() => deviceActions.onPair(device.id)}
+                                onBlock={() => deviceActions.onBlock(device.id)}
+                                onUnblock={() => deviceActions.onUnblock(device.id)}
+                                onForget={() => deviceActions.onForget(device.id)}
+                                onRename={(newName) => deviceActions.onRename(device.id, newName)}
+                                onToggleFavorite={() => deviceActions.onToggleFavorite(device.id)}
+                            />
+                        ))}
+                    </StaggeredList>
                 )}
             </div>
         </div>
