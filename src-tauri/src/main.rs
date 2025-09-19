@@ -1253,6 +1253,14 @@ async fn hide_window(app: tauri::AppHandle) -> Result<(), String> {
 }
 
 #[tauri::command]
+async fn minimize_window(app: tauri::AppHandle) -> Result<(), String> {
+    if let Some(window) = app.get_webview_window("main") {
+        window.minimize().map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
+#[tauri::command]
 async fn bring_window_to_front(app: tauri::AppHandle) -> Result<(), String> {
     if let Some(window) = app.get_webview_window("main") {
         // First ensure window is visible
@@ -1433,6 +1441,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             create_mock_transfer,
             quit_app,
             hide_window,
+            minimize_window,
             bring_window_to_front
         ])
         .setup(|app| {

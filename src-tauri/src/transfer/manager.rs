@@ -118,7 +118,7 @@ impl TransferManager {
 
             info!("✅ Transfer {} completed: {}", transfer_id, filename);
 
-            self.check_and_switch_to_normal_mode();
+            self.check_and_minimize_window();
         }
     }
 
@@ -140,7 +140,7 @@ impl TransferManager {
 
             error!("❌ Transfer {} failed: {} - {}", transfer_id, filename, error);
 
-            self.check_and_switch_to_normal_mode();
+            self.check_and_minimize_window();
         }
     }
 
@@ -191,7 +191,7 @@ impl TransferManager {
 
             info!("🚫 Transfer {} cancelled: {}", transfer_id, filename);
 
-            self.check_and_switch_to_normal_mode();
+            self.check_and_minimize_window();
 
             self.transfers.remove(&transfer_id);
             self.speed_calculators.remove(&transfer_id);
@@ -268,16 +268,27 @@ impl TransferManager {
         }
     }
 
-    fn check_and_switch_to_normal_mode(&self) {
+    fn check_and_minimize_window(&self) {
         let active_transfers = self.get_active_transfers();
         if active_transfers.is_empty() {
+            let app_handle = self.app_handle.clone();
             let manager = self.clone();
             tokio::spawn(async move {
+                // Wait a moment for user to see the completion
                 tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
 
                 let active_transfers = manager.get_active_transfers();
                 if active_transfers.is_empty() {
+                    // Switch back to normal mode
                     manager.set_window_mode(WindowMode::Normal).await;
+
+                    // Minimize the window
+                    if let Some(app_handle) = app_handle {
+                        if let Some(window) = app_handle.get_webview_window("main") {
+                            let _ = window.minimize();
+                            info!("🪟 Window minimized after transfer completion");
+                        }
+                    }
                 }
             });
         }
