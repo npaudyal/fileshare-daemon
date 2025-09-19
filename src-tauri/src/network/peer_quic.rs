@@ -1099,15 +1099,33 @@ impl PeerManager {
                 let filename_clone = filename.clone();
                 let file_size_val = *file_size;
                 let transfer_manager_clone = self.transfer_manager.clone();
+                let transfer_id_clone = transfer_id.clone();
 
                 tokio::spawn(async move {
-                        // For now, we'll track progress through polling since HTTP client doesn't support callbacks yet
-                    // Start the download
-                    let download_result = http_client
-                        .download_file(
+                    // Create progress callback
+                    let progress_callback = if let (Some(tid), Some(tm)) = (transfer_id_clone.as_ref(), transfer_manager_clone.as_ref()) {
+                        let tid = *tid;
+                        let tm = tm.clone();
+                        Some(Arc::new(move |transferred: u64, _total: u64| {
+                            let tm = tm.clone();
+                            let tid = tid.clone();
+                            tokio::spawn(async move {
+                                let transfer_manager = tm.read().await;
+                                transfer_manager.update_progress(tid, transferred).await;
+                            });
+                        }) as crate::http::client::ProgressCallback)
+                    } else {
+                        None
+                    };
+
+                    // Use HttpFileClient directly with progress tracking
+                    let http_file_client = crate::http::client::HttpFileClient::new();
+                    let download_result = http_file_client
+                        .download_file_with_progress(
                             download_url_clone.clone(),
                             target_path.clone(),
                             Some(file_size_val),
+                            progress_callback,
                         )
                         .await;
 

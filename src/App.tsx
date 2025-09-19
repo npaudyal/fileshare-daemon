@@ -11,11 +11,15 @@ import PairingTab from './components/PairingTab';
 import AdvancedSettings from './components/AdvancedSettings';
 import EnhancedInfo from './components/EnhancedInfo';
 import TransferProgress from './components/TransferProgress';
+import TransferProgressView from './components/TransferProgressView';
+import ViewTransition from './components/ViewTransition';
 import ThemeToggle from './components/ThemeToggle';
 import { FadeIn, SlideIn } from './components/AnimatedComponents';
 import { LoadingOverlay } from './components/LoadingStates';
 import { useToast } from './hooks/useToast';
 import { useDebounce } from './hooks/useDebounce';
+import { useTransferView } from './hooks/useTransferView';
+import { useViewStore } from './stores/viewStore';
 import { useTheme } from './context/ThemeContext';
 
 // Types
@@ -53,6 +57,8 @@ interface AppSettings {
 
 function App() {
     const { theme } = useTheme();
+    const { windowMode, isTransitioning } = useViewStore();
+    const { hasActiveTransfers } = useTransferView();
 
     // State
     const [devices, setDevices] = useState<DeviceInfo[]>([]);
@@ -374,26 +380,33 @@ function App() {
                 border: '1px solid',
             }}
         >
-            <LoadingOverlay isVisible={isLoading && devices.length === 0} message="Loading devices..." />
+            {/* Transfer View */}
+            <ViewTransition mode="Transfer">
+                <TransferProgressView />
+            </ViewTransition>
 
-            {/* Header */}
-            <FadeIn>
-                <Header deviceName={settings?.device_name} />
-            </FadeIn>
+            {/* Normal View */}
+            <ViewTransition mode="Normal">
+                <div className="w-full h-full flex flex-col">
+                    <LoadingOverlay isVisible={isLoading && devices.length === 0} message="Loading devices..." />
 
+                    {/* Header */}
+                    <FadeIn>
+                        <Header deviceName={settings?.device_name} />
+                    </FadeIn>
 
-            {/* Navigation */}
-            <SlideIn direction="up">
-                <Navigation
-                    activeTab={activeTab}
-                    onTabChange={setActiveTab}
-                    deviceCount={pairedDevices.length}
-                    unpairedDeviceCount={unpairedDevices.length}
-                />
-            </SlideIn>
+                    {/* Navigation */}
+                    <SlideIn direction="up">
+                        <Navigation
+                            activeTab={activeTab}
+                            onTabChange={setActiveTab}
+                            deviceCount={pairedDevices.length}
+                            unpairedDeviceCount={unpairedDevices.length}
+                        />
+                    </SlideIn>
 
-            {/* Content */}
-            <div className="p-4 min-h-[375px] overflow-y-auto">
+                    {/* Content */}
+                    <div className="p-4 min-h-[375px] overflow-y-auto">
                 <AnimatePresence mode="wait">
                     {activeTab === 'devices' && (
                         <FadeIn key="devices">
@@ -443,24 +456,24 @@ function App() {
                         </FadeIn>
                     )}
                 </AnimatePresence>
-            </div>
+                    </div>
 
-            {/* Transfer Progress */}
-            <AnimatePresence>
-                {showTransferProgress && (
-                    <TransferProgress
-                        isVisible={showTransferProgress}
-                        onToggle={() => setShowTransferProgress(false)}
-                    />
-                )}
-            </AnimatePresence>
+                    {/* Transfer Progress */}
+                    <AnimatePresence>
+                        {showTransferProgress && (
+                            <TransferProgress
+                                isVisible={showTransferProgress}
+                                onToggle={() => setShowTransferProgress(false)}
+                            />
+                        )}
+                    </AnimatePresence>
 
-            {/* Footer */}
-            <SlideIn direction="up">
-                <div
-                    className="p-4 border-t transition-all duration-300"
-                    style={{ borderColor: theme.colors.border }}
-                >
+                    {/* Footer */}
+                    <SlideIn direction="up">
+                        <div
+                            className="p-4 border-t transition-all duration-300"
+                            style={{ borderColor: theme.colors.border }}
+                        >
                     <div className="flex items-center justify-between">
                         {/* Theme Switcher - Left Side */}
                         <ThemeToggle />
@@ -493,6 +506,8 @@ function App() {
                     </div>
                 </div>
             </SlideIn>
+                </div>
+            </ViewTransition>
         </div>
     );
 }

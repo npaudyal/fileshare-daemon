@@ -15,6 +15,9 @@ use futures::future::join_all;
 
 use crate::{FileshareError, Result};
 
+// Progress callback type - receives (transferred_bytes, total_bytes)
+pub type ProgressCallback = Arc<dyn Fn(u64, u64) -> () + Send + Sync>;
+
 // Optimized buffer sizes for LAN transfers
 const DOWNLOAD_BUFFER_SIZE: usize = 8 * 1024 * 1024; // 8MB buffer for optimal performance
 const WRITE_THRESHOLD: usize = 2 * 1024 * 1024; // Write every 2MB for continuous streaming
@@ -50,6 +53,17 @@ impl HttpFileClient {
         target_path: PathBuf,
         expected_size: Option<u64>,
     ) -> Result<()> {
+        self.download_file_with_progress(url, target_path, expected_size, None).await
+    }
+
+    /// Download a file from the given URL with progress callback
+    pub async fn download_file_with_progress(
+        &self,
+        url: String,
+        target_path: PathBuf,
+        expected_size: Option<u64>,
+        progress_callback: Option<ProgressCallback>,
+    ) -> Result<()> {
         // First, get file size if not provided
         let file_size = if let Some(size) = expected_size {
             size
@@ -59,11 +73,11 @@ impl HttpFileClient {
 
         // Decide whether to use parallel downloads based on file size
         if file_size > LARGE_FILE_THRESHOLD {
-            info!("📊 Large file detected ({:.1} MB), using parallel downloads", 
+            info!("📊 Large file detected ({:.1} MB), using parallel downloads",
                   file_size as f64 / (1024.0 * 1024.0));
-            self.download_file_parallel(url, target_path, file_size).await
+            self.download_file_parallel_with_progress(url, target_path, file_size, progress_callback).await
         } else {
-            self.download_file_single(url, target_path, Some(file_size)).await
+            self.download_file_single_with_progress(url, target_path, Some(file_size), progress_callback).await
         }
     }
 
@@ -97,6 +111,17 @@ impl HttpFileClient {
         url: String,
         target_path: PathBuf,
         file_size: u64,
+    ) -> Result<()> {
+        self.download_file_parallel_with_progress(url, target_path, file_size, None).await
+    }
+
+    /// Download file using parallel connections with progress callback
+    async fn download_file_parallel_with_progress(
+        &self,
+        url: String,
+        target_path: PathBuf,
+        file_size: u64,
+        progress_callback: Option<ProgressCallback>,
     ) -> Result<()> {
         let start_time = Instant::now();
         info!("⚡ Starting parallel HTTP download with {} connections", PARALLEL_CONNECTIONS);
@@ -136,23 +161,29 @@ impl HttpFileClient {
         // Start progress monitor
         let bytes_downloaded_monitor = bytes_downloaded.clone();
         let download_complete_monitor = download_complete.clone();
+        let progress_callback_clone = progress_callback.clone();
         let monitor_handle = tokio::spawn(async move {
             let mut last_bytes = 0u64;
             let mut last_time = Instant::now();
-            
+
             while !download_complete_monitor.load(Ordering::Relaxed) {
-                tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+                tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
                 let current_bytes = bytes_downloaded_monitor.load(Ordering::Relaxed);
                 let current_time = Instant::now();
                 let elapsed = current_time.duration_since(last_time).as_secs_f64();
-                
+
                 if elapsed > 0.0 && file_size > 0 {
                     let speed_mbps = ((current_bytes - last_bytes) as f64 * 8.0) / (elapsed * 1_000_000.0);
                     let progress = (current_bytes as f64 / file_size as f64) * 100.0;
-                    
+
                     info!("⬇️ Progress: {:.1}% - Speed: {:.1} Mbps", progress, speed_mbps);
+
+                    // Call progress callback if provided
+                    if let Some(ref callback) = progress_callback_clone {
+                        callback(current_bytes, file_size);
+                    }
                 }
-                
+
                 last_bytes = current_bytes;
                 last_time = current_time;
             }
@@ -301,6 +332,17 @@ impl HttpFileClient {
         target_path: PathBuf,
         expected_size: Option<u64>,
     ) -> Result<()> {
+        self.download_file_single_with_progress(url, target_path, expected_size, None).await
+    }
+
+    /// Download file using single connection with progress callback
+    async fn download_file_single_with_progress(
+        &self,
+        url: String,
+        target_path: PathBuf,
+        expected_size: Option<u64>,
+        progress_callback: Option<ProgressCallback>,
+    ) -> Result<()> {
         let start_time = Instant::now();
         info!("⬇️ Starting HTTP download from: {}", url);
 
@@ -361,27 +403,33 @@ impl HttpFileClient {
         // Download with optimized buffering
         let bytes_downloaded = Arc::new(AtomicU64::new(0));
         let bytes_downloaded_monitor = bytes_downloaded.clone();
+        let progress_callback_clone = progress_callback.clone();
 
         // Start progress monitor
         let monitor_handle = tokio::spawn(async move {
             let mut last_bytes = 0u64;
             let mut last_time = Instant::now();
-            
+
             loop {
-                tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+                tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
                 let current_bytes = bytes_downloaded_monitor.load(Ordering::Relaxed);
                 let current_time = Instant::now();
                 let elapsed = current_time.duration_since(last_time).as_secs_f64();
-                
+
                 if elapsed > 0.0 && file_size > 0 {
                     let speed_mbps = ((current_bytes - last_bytes) as f64 * 8.0) / (elapsed * 1_000_000.0);
                     let progress = (current_bytes as f64 / file_size as f64) * 100.0;
-                    
+
                     if current_bytes < file_size {
                         info!("⬇️ Progress: {:.1}% - Speed: {:.1} Mbps", progress, speed_mbps);
+
+                        // Call progress callback if provided
+                        if let Some(ref callback) = progress_callback_clone {
+                            callback(current_bytes, file_size);
+                        }
                     }
                 }
-                
+
                 last_bytes = current_bytes;
                 last_time = current_time;
                 
