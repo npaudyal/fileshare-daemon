@@ -120,8 +120,22 @@ impl HttpTransferManager {
         target_path: PathBuf,
         expected_size: Option<u64>,
     ) -> Result<()> {
+        self.download_file_with_progress::<fn(u64)>(url, target_path, expected_size, None).await
+    }
+
+    /// Download a file from HTTP URL with progress callback
+    pub async fn download_file_with_progress<F>(
+        &self,
+        url: String,
+        target_path: PathBuf,
+        expected_size: Option<u64>,
+        progress_callback: Option<F>,
+    ) -> Result<()>
+    where
+        F: Fn(u64) + Send + Sync + 'static,
+    {
         info!("⬇️ Starting optimized HTTP download to: {:?}", target_path);
-        
+
         // Create transfer tracking
         let transfer_id = Uuid::new_v4();
         let stats = TransferStats {
@@ -130,27 +144,30 @@ impl HttpTransferManager {
             start_time: std::time::Instant::now(),
             speed_mbps: 0.0,
         };
-        
+
         {
             let transfers = self.active_transfers.write().await;
             transfers.insert(transfer_id, stats);
         }
-        
+
         // Ensure target directory exists
         if let Some(parent) = target_path.parent() {
             tokio::fs::create_dir_all(parent).await
                 .map_err(|e| FileshareError::FileOperation(format!("Failed to create directory: {}", e)))?;
         }
 
+        // Note: progress_callback is not used yet - future enhancement
+        let _ = progress_callback;
+
         // Use optimized client with parallel downloads for large files
         let result = self.http_client.download_file(url.clone(), target_path, expected_size).await;
-        
+
         // Remove from active transfers
         {
             let transfers = self.active_transfers.write().await;
             transfers.remove(&transfer_id);
         }
-        
+
         result
     }
 

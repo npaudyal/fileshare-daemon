@@ -4,6 +4,7 @@ use crate::{
     network::{discovery::DeviceInfo, protocol::*},
     pairing::PairingManager,
     quic::{QuicConnectionManager, StreamManager},
+    transfer::{TransferManager, TransferDirection},
     FileshareError, Result,
 };
 use std::collections::HashMap;
@@ -72,6 +73,8 @@ pub struct PeerManager {
     http_transfer_manager: Arc<HttpTransferManager>,
     // Pairing manager reference
     pub pairing_manager: Option<Arc<RwLock<PairingManager>>>,
+    // Transfer progress manager
+    pub transfer_manager: Option<Arc<RwLock<TransferManager>>>,
 }
 
 impl PeerManager {
@@ -104,6 +107,7 @@ impl PeerManager {
             incoming_stream_managers: Arc::new(RwLock::new(HashMap::new())),
             http_transfer_manager,
             pairing_manager: None, // Will be set later by set_pairing_manager
+            transfer_manager: None, // Will be set later by set_transfer_manager
         };
 
         // Start accepting QUIC connections
@@ -118,6 +122,11 @@ impl PeerManager {
     // Set the pairing manager reference after creation
     pub fn set_pairing_manager(&mut self, pairing_manager: Arc<RwLock<PairingManager>>) {
         self.pairing_manager = Some(pairing_manager);
+    }
+
+    // Set the transfer manager reference after creation
+    pub fn set_transfer_manager(&mut self, transfer_manager: Arc<RwLock<TransferManager>>) {
+        self.transfer_manager = Some(transfer_manager);
     }
 
     // Check if a device is paired
@@ -1019,6 +1028,12 @@ impl PeerManager {
                     *file_size as f64 / (1024.0 * 1024.0)
                 );
 
+                // Get peer device name for transfer tracking
+                let peer_device_name = self.peers
+                    .get(&resolved_peer_id)
+                    .map(|p| p.device_info.name.clone())
+                    .unwrap_or_else(|| "Unknown Device".to_string());
+
                 // Check if device is paired (if pairing is required)
                 if self.settings.security.require_pairing {
                     let is_paired = if let Some(pairing_manager) = &self.pairing_manager {
@@ -1061,23 +1076,51 @@ impl PeerManager {
                 });
                 self.send_message_to_peer(peer_id, response).await?;
 
-                // Start HTTP download
+                // Create transfer record if transfer manager is available
+                let transfer_id = if let Some(transfer_manager) = &self.transfer_manager {
+                    let tm = transfer_manager.read().await;
+                    let id = tm.create_transfer(
+                        filename.clone(),
+                        PathBuf::from(filename), // Source path on remote device
+                        resolved_peer_id,
+                        peer_device_name.clone(),
+                        target_path.clone(),
+                        *file_size,
+                        TransferDirection::Incoming,
+                    ).await;
+                    Some(id)
+                } else {
+                    None
+                };
+
+                // Start HTTP download with transfer tracking
                 let http_client = self.http_transfer_manager.clone();
                 let download_url_clone = download_url.clone();
                 let filename_clone = filename.clone();
                 let file_size_val = *file_size;
+                let transfer_manager_clone = self.transfer_manager.clone();
 
                 tokio::spawn(async move {
-                    match http_client
+                        // For now, we'll track progress through polling since HTTP client doesn't support callbacks yet
+                    // Start the download
+                    let download_result = http_client
                         .download_file(
                             download_url_clone.clone(),
                             target_path.clone(),
                             Some(file_size_val),
                         )
-                        .await
+                        .await;
+
+                    match download_result
                     {
                         Ok(()) => {
                             info!("✅ HTTP download completed: {:?}", target_path);
+
+                            // Mark transfer as completed
+                            if let (Some(transfer_id), Some(tm)) = (transfer_id, transfer_manager_clone.as_ref()) {
+                                let transfer_manager = tm.read().await;
+                                transfer_manager.mark_transfer_completed(transfer_id);
+                            }
 
                             // Show success notification
                             notify_rust::Notification::new()
@@ -1092,6 +1135,12 @@ impl PeerManager {
                         }
                         Err(e) => {
                             error!("❌ HTTP download failed: {}", e);
+
+                            // Mark transfer as failed
+                            if let (Some(transfer_id), Some(tm)) = (transfer_id, transfer_manager_clone.as_ref()) {
+                                let transfer_manager = tm.read().await;
+                                transfer_manager.mark_transfer_failed(transfer_id, e.to_string());
+                            }
 
                             // Show error notification
                             notify_rust::Notification::new()

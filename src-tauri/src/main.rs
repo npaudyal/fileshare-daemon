@@ -3,6 +3,7 @@
 
 use fileshare_daemon::{
     config::Settings, pairing::session::PairingError, service::FileshareDaemon,
+    transfer::TransferManager,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -723,6 +724,7 @@ struct AppState {
     settings: Arc<RwLock<Settings>>,
     daemon_ref: Arc<Mutex<Option<Arc<FileshareDaemon>>>>,
     device_manager: Arc<RwLock<DeviceManager>>,
+    transfer_manager: Arc<RwLock<TransferManager>>,
 }
 
 // Enhanced device discovery with metadata
@@ -1195,29 +1197,44 @@ async fn refresh_devices(_state: tauri::State<'_, AppState>) -> Result<(), Strin
 // Transfer progress and control commands
 #[tauri::command]
 async fn get_active_transfers(
-    _state: tauri::State<'_, AppState>,
-) -> Result<Vec<serde_json::Value>, String> {
-    // With optimized QUIC transfers, we don't track transfers in the old way
-    // Transfers are handled directly by stream managers
-    Ok(Vec::new())
+    state: tauri::State<'_, AppState>,
+) -> Result<Vec<fileshare_daemon::transfer::Transfer>, String> {
+    let transfer_manager = state.transfer_manager.read().await;
+    Ok(transfer_manager.get_active_transfers())
 }
 
 #[tauri::command]
 async fn toggle_transfer_pause(
-    _transfer_id: String,
-    _state: tauri::State<'_, AppState>,
+    transfer_id: String,
+    state: tauri::State<'_, AppState>,
 ) -> Result<(), String> {
-    // Optimized QUIC transfers don't support pause/resume yet
-    Err("Transfer pause/resume not supported with optimized QUIC transfers".to_string())
+    let transfer_uuid = Uuid::parse_str(&transfer_id)
+        .map_err(|e| format!("Invalid transfer ID: {}", e))?;
+
+    let transfer_manager = state.transfer_manager.read().await;
+
+    // Check current status and toggle
+    if let Some(transfer) = transfer_manager.get_transfer(&transfer_uuid) {
+        if transfer.is_paused {
+            transfer_manager.resume_transfer(transfer_uuid).await
+        } else {
+            transfer_manager.pause_transfer(transfer_uuid).await
+        }
+    } else {
+        Err("Transfer not found".to_string())
+    }
 }
 
 #[tauri::command]
 async fn cancel_transfer(
-    _transfer_id: String,
-    _state: tauri::State<'_, AppState>,
+    transfer_id: String,
+    state: tauri::State<'_, AppState>,
 ) -> Result<(), String> {
-    // Optimized QUIC transfers don't support cancellation yet
-    Err("Transfer cancellation not supported with optimized QUIC transfers".to_string())
+    let transfer_uuid = Uuid::parse_str(&transfer_id)
+        .map_err(|e| format!("Invalid transfer ID: {}", e))?;
+
+    let transfer_manager = state.transfer_manager.read().await;
+    transfer_manager.cancel_transfer(transfer_uuid).await
 }
 
 #[tauri::command]
@@ -1280,6 +1297,56 @@ fn determine_device_type_and_platform(device_name: &str) -> (String, Option<Stri
     (device_type, platform)
 }
 
+// Additional Transfer Management Commands
+
+#[tauri::command]
+async fn get_all_transfers(
+    state: tauri::State<'_, AppState>,
+) -> Result<Vec<fileshare_daemon::transfer::Transfer>, String> {
+    let transfer_manager = state.transfer_manager.read().await;
+    Ok(transfer_manager.get_all_transfers())
+}
+
+#[tauri::command]
+async fn get_transfer_progress(
+    transfer_id: String,
+    state: tauri::State<'_, AppState>,
+) -> Result<Option<fileshare_daemon::transfer::Transfer>, String> {
+    let transfer_uuid = Uuid::parse_str(&transfer_id)
+        .map_err(|e| format!("Invalid transfer ID: {}", e))?;
+
+    let transfer_manager = state.transfer_manager.read().await;
+    Ok(transfer_manager.get_transfer(&transfer_uuid))
+}
+
+#[tauri::command]
+async fn set_window_mode(
+    mode: fileshare_daemon::transfer::WindowMode,
+    state: tauri::State<'_, AppState>,
+) -> Result<(), String> {
+    let transfer_manager = state.transfer_manager.read().await;
+    transfer_manager.set_window_mode(mode).await;
+    Ok(())
+}
+
+#[tauri::command]
+async fn get_window_mode(
+    state: tauri::State<'_, AppState>,
+) -> Result<fileshare_daemon::transfer::WindowMode, String> {
+    let transfer_manager = state.transfer_manager.read().await;
+    Ok(transfer_manager.get_window_mode().await)
+}
+
+#[tauri::command]
+async fn create_mock_transfer(
+    state: tauri::State<'_, AppState>,
+) -> Result<String, String> {
+    info!("🧪 Creating mock transfer for testing");
+    let transfer_manager = state.transfer_manager.read().await;
+    let transfer_id = transfer_manager.create_mock_transfer().await;
+    Ok(transfer_id.to_string())
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt()
@@ -1295,6 +1362,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         settings: Arc::new(RwLock::new(settings)),
         daemon_ref: Arc::new(Mutex::new(None)),
         device_manager: Arc::new(RwLock::new(DeviceManager::default())),
+        transfer_manager: Arc::new(RwLock::new(TransferManager::new())),
     };
 
     tauri::Builder::default()
@@ -1334,9 +1402,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             get_active_pairing_sessions,
             test_hotkey_system,
             test_isolated_hotkey,
+            // Transfer commands
             get_active_transfers,
+            get_all_transfers,
+            get_transfer_progress,
             toggle_transfer_pause,
             cancel_transfer,
+            set_window_mode,
+            get_window_mode,
+            create_mock_transfer,
             quit_app,
             hide_window
         ])
@@ -1405,6 +1479,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     .build(app)?;
             }
 
+            // Initialize transfer manager with app handle
+            let app_handle_for_transfer = app.handle().clone();
+            let transfer_manager_clone = app.state::<AppState>().transfer_manager.clone();
+            tokio::spawn(async move {
+                let mut transfer_manager = transfer_manager_clone.write().await;
+                transfer_manager.set_app_handle(app_handle_for_transfer);
+                info!("✅ Transfer manager initialized with app handle");
+            });
+
             // Start daemon with shared ownership architecture
             let app_handle = app.handle().clone();
             tokio::spawn(async move {
@@ -1445,6 +1528,13 @@ async fn start_daemon(app_handle: tauri::AppHandle) -> Result<(), Box<dyn std::e
     {
         let mut daemon_ref = state.daemon_ref.lock().await;
         *daemon_ref = Some(daemon.clone());
+    }
+
+    // Set transfer manager in PeerManager
+    {
+        let mut peer_manager = daemon.peer_manager.write().await;
+        peer_manager.set_transfer_manager(state.transfer_manager.clone());
+        info!("✅ Transfer manager set in PeerManager");
     }
 
     info!("✅ Daemon reference stored for UI access");
