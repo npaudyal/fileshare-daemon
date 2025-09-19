@@ -1252,6 +1252,26 @@ async fn hide_window(app: tauri::AppHandle) -> Result<(), String> {
     Ok(())
 }
 
+#[tauri::command]
+async fn bring_window_to_front(app: tauri::AppHandle) -> Result<(), String> {
+    if let Some(window) = app.get_webview_window("main") {
+        // First ensure window is visible
+        if !window.is_visible().unwrap_or(false) {
+            window.show().map_err(|e| e.to_string())?;
+        }
+        // Bring to front and focus
+        window.set_focus().map_err(|e| e.to_string())?;
+        window.set_always_on_top(true).map_err(|e| e.to_string())?;
+        // After a short delay, remove always on top (just stay on top initially)
+        let window_clone = window.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+            let _ = window_clone.set_always_on_top(false);
+        });
+    }
+    Ok(())
+}
+
 // Enhanced device type detection
 fn determine_device_type_and_platform(device_name: &str) -> (String, Option<String>) {
     let name_lower = device_name.to_lowercase();
@@ -1412,7 +1432,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             get_window_mode,
             create_mock_transfer,
             quit_app,
-            hide_window
+            hide_window,
+            bring_window_to_front
         ])
         .setup(|app| {
             let _main_window = WebviewWindowBuilder::new(app, "main", WebviewUrl::default())

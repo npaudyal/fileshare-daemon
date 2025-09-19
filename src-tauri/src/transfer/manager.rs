@@ -4,7 +4,7 @@ use dashmap::DashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::SystemTime;
-use tauri::Emitter;
+use tauri::{Emitter, Manager};
 use tokio::sync::RwLock;
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
@@ -245,6 +245,26 @@ impl TransferManager {
         if matches!(*current_mode, WindowMode::Normal) {
             drop(current_mode);
             self.set_window_mode(WindowMode::Transfer).await;
+
+            // Bring window to front when switching to transfer mode
+            if let Some(app_handle) = &self.app_handle {
+                if let Some(window) = app_handle.get_webview_window("main") {
+                    // Show window if hidden
+                    if !window.is_visible().unwrap_or(false) {
+                        let _ = window.show();
+                    }
+                    // Focus and bring to front
+                    let _ = window.set_focus();
+                    let _ = window.set_always_on_top(true);
+
+                    // Remove always on top after a brief moment (keeps it on top initially)
+                    let window_clone = window.clone();
+                    tokio::spawn(async move {
+                        tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+                        let _ = window_clone.set_always_on_top(false);
+                    });
+                }
+            }
         }
     }
 

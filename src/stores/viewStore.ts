@@ -28,7 +28,7 @@ interface ViewState {
     isTransitioning: boolean;
 
     // Actions
-    setWindowMode: (mode: WindowMode) => void;
+    setWindowMode: (mode: WindowMode, fromBackend?: boolean) => void;
     addTransfer: (transfer: Transfer) => void;
     updateTransfer: (id: string, updates: Partial<Transfer>) => void;
     removeTransfer: (id: string) => void;
@@ -46,12 +46,15 @@ export const useViewStore = create<ViewState>((set, get) => ({
     transfers: new Map(),
     isTransitioning: false,
 
-    setWindowMode: async (mode: WindowMode) => {
+    setWindowMode: async (mode: WindowMode, fromBackend: boolean = false) => {
         set({ windowMode: mode });
-        try {
-            await invoke('set_window_mode', { mode });
-        } catch (error) {
-            console.error('Failed to set window mode:', error);
+        // Only invoke backend if this change didn't originate from backend
+        if (!fromBackend) {
+            try {
+                await invoke('set_window_mode', { mode });
+            } catch (error) {
+                console.error('Failed to set window mode:', error);
+            }
         }
     },
 

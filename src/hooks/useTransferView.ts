@@ -88,7 +88,7 @@ export const useTransferView = () => {
 
                 updateTransfer(payload.transfer_id, {
                     transferred_bytes: payload.transferred_mb * 1024 * 1024,
-                    speed_bps: payload.speed_mbps * 1024 * 1024 * 8,
+                    speed_bps: payload.speed_mbps * 1024 * 1024 * 8,  // mbps to bits per second
                     eta_seconds: payload.eta_seconds,
                     status: payload.status
                 });
@@ -128,7 +128,8 @@ export const useTransferView = () => {
             const unlistenMode = await listen<WindowMode>('window-mode-changed', (event) => {
                 console.log('Window mode changed:', event.payload);
                 if (event.payload !== windowMode) {
-                    setWindowMode(event.payload);
+                    // Pass true to indicate this change came from backend
+                    setWindowMode(event.payload, true);
                 }
             });
 
@@ -143,7 +144,8 @@ export const useTransferView = () => {
             // Load initial state
             try {
                 const currentMode = await invoke<WindowMode>('get_window_mode');
-                setWindowMode(currentMode);
+                // Set initial mode without triggering backend call
+                setWindowMode(currentMode, true);
 
                 const activeTransfers = await invoke<Transfer[]>('get_active_transfers');
                 activeTransfers.forEach(transfer => {
