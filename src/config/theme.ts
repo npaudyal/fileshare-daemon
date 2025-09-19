@@ -3,7 +3,7 @@ export const themes = {
     name: 'dark',
     colors: {
       // Base colors
-      background: '#0D0D0D',
+      background: '#0C0C0C',
       backgroundSecondary: '#1A1A1A',
       backgroundTertiary: '#242424',
 

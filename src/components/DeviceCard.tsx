@@ -306,7 +306,6 @@ const DeviceCard: React.FC<DeviceCardProps> = ({
                                 e.currentTarget.style.borderColor = theme.colors.border;
                             }}
                         >
-                            <span className="text-xs">More</span>
                             <MoreVertical className="w-3 h-3" />
                         </motion.button>
 

@@ -9,24 +9,22 @@ interface HeaderProps {
 const Header: React.FC<HeaderProps> = ({ deviceName }) => {
     const { theme } = useTheme();
 
+
     return (
         <div
-            className="px-6 py-4 flex items-center justify-between border-b transition-all duration-300"
-            style={{ borderColor: theme.colors.border }}
+            className="px-10 py-5 flex items-center justify-between border-b transition-all duration-300"
+            style={{
+                backgroundColor: theme.colors.backgroundSecondary,
+                borderColor: theme.colors.border
+            }}
         >
-            <div className="flex items-center gap-2">
-                <Aperture
-                    className="w-4 h-4"
-                    style={{ color: theme.colors.accent1 }}
-                />
+            <div className="flex items-center">
                 <h1
-                    className="text-xl font-medium"
+                    className="text-4xl"
                     style={{
-                        color: theme.colors.text,
-                        background: theme.gradients.accent,
-                        backgroundClip: 'text',
-                        WebkitBackgroundClip: 'text',
-                        WebkitTextFillColor: 'transparent'
+                        fontFamily: '"Gasoek One", sans-serif',
+                        fontWeight: 400,
+                        color: theme.colors.text
                     }}
                 >
                     Yeet
@@ -35,11 +33,11 @@ const Header: React.FC<HeaderProps> = ({ deviceName }) => {
             {deviceName && (
                 <div className="flex items-center gap-2">
                     <Laptop2
-                        className="w-4 h-4"
-                        style={{ color: theme.colors.accent2 }}
+                        className="w-5 h-5"
+                        style={{ color: theme.colors.textSecondary }}
                     />
                     <span
-                        className="text-sm"
+                        className="text-sm font-medium"
                         style={{ color: theme.colors.textSecondary }}
                     >
                         {deviceName}

@@ -377,7 +377,6 @@ function App() {
             style={{
                 background: theme.gradients.primary,
                 borderColor: theme.colors.border,
-                border: '1px solid',
             }}
         >
             {/* Transfer View */}
@@ -406,56 +405,56 @@ function App() {
                     </SlideIn>
 
                     {/* Content */}
-                    <div className="p-4 min-h-[375px] overflow-y-auto">
-                <AnimatePresence mode="wait">
-                    {activeTab === 'devices' && (
-                        <FadeIn key="devices">
-                            <DevicesList
-                                devices={devices}
-                                filteredDevices={pairedDevices}
-                                isLoading={isLoading}
-                                searchTerm={searchTerm}
-                                selectedDevices={selectedDevices}
-                                showBulkActions={showBulkActions}
-                                favoriteDevices={favoriteDevices}
-                                onSearchChange={setSearchTerm}
-                                onSortChange={handleSortChange}
-                                onDeviceSelect={handleDeviceSelect}
-                                onSelectAll={handleSelectAll}
-                                onClearSelection={handleClearSelection}
-                                onBulkAction={handleBulkAction}
-                                onRefresh={handleRefresh}
-                                deviceActions={deviceActions}
-                            />
-                        </FadeIn>
-                    )}
+                    <div className="p-6 min-h-[345px] overflow-y-auto">
+                        <AnimatePresence mode="wait">
+                            {activeTab === 'devices' && (
+                                <FadeIn key="devices">
+                                    <DevicesList
+                                        devices={devices}
+                                        filteredDevices={pairedDevices}
+                                        isLoading={isLoading}
+                                        searchTerm={searchTerm}
+                                        selectedDevices={selectedDevices}
+                                        showBulkActions={showBulkActions}
+                                        favoriteDevices={favoriteDevices}
+                                        onSearchChange={setSearchTerm}
+                                        onSortChange={handleSortChange}
+                                        onDeviceSelect={handleDeviceSelect}
+                                        onSelectAll={handleSelectAll}
+                                        onClearSelection={handleClearSelection}
+                                        onBulkAction={handleBulkAction}
+                                        onRefresh={handleRefresh}
+                                        deviceActions={deviceActions}
+                                    />
+                                </FadeIn>
+                            )}
 
-                    {activeTab === 'pairing' && (
-                        <FadeIn key="pairing">
-                            <PairingTab
-                                onRefresh={handleRefresh}
-                            />
-                        </FadeIn>
-                    )}
+                            {activeTab === 'pairing' && (
+                                <FadeIn key="pairing">
+                                    <PairingTab
+                                        onRefresh={handleRefresh}
+                                    />
+                                </FadeIn>
+                            )}
 
-                    {activeTab === 'settings' && settings && (
-                        <FadeIn key="settings">
-                            <AdvancedSettings
-                                settings={settings}
-                                onSettingsChange={(newSettings) => {
-                                    setSettings(newSettings);
-                                    loadDevices();
-                                }}
-                            />
-                        </FadeIn>
-                    )}
+                            {activeTab === 'settings' && settings && (
+                                <FadeIn key="settings">
+                                    <AdvancedSettings
+                                        settings={settings}
+                                        onSettingsChange={(newSettings) => {
+                                            setSettings(newSettings);
+                                            loadDevices();
+                                        }}
+                                    />
+                                </FadeIn>
+                            )}
 
-                    {activeTab === 'info' && (
-                        <FadeIn key="info">
-                            <EnhancedInfo />
-                        </FadeIn>
-                    )}
-                </AnimatePresence>
+                            {activeTab === 'info' && (
+                                <FadeIn key="info">
+                                    <EnhancedInfo />
+                                </FadeIn>
+                            )}
+                        </AnimatePresence>
                     </div>
 
                     {/* Transfer Progress */}
@@ -474,38 +473,38 @@ function App() {
                             className="p-4 border-t transition-all duration-300"
                             style={{ borderColor: theme.colors.border }}
                         >
-                    <div className="flex items-center justify-between">
-                        {/* Theme Switcher - Left Side */}
-                        <ThemeToggle />
+                            <div className="flex items-center justify-between">
+                                {/* Theme Switcher - Left Side */}
+                                <ThemeToggle />
 
-                        {/* Quit Button - Right Side */}
-                        <motion.button
-                            whileHover={{ scale: 1.02 }}
-                            whileTap={{ scale: 0.98 }}
-                            onClick={() => invoke('quit_app')}
-                            className="flex items-center space-x-2 px-4 py-2 rounded-lg transition-all duration-300"
-                            style={{
-                                color: theme.colors.textSecondary,
-                                backgroundColor: theme.colors.backgroundSecondary,
-                                border: `1px solid ${theme.colors.border}`,
-                            }}
-                            onMouseEnter={(e) => {
-                                e.currentTarget.style.color = theme.colors.error;
-                                e.currentTarget.style.borderColor = theme.colors.error;
-                                e.currentTarget.style.boxShadow = `0 0 12px ${theme.colors.error}40`;
-                            }}
-                            onMouseLeave={(e) => {
-                                e.currentTarget.style.color = theme.colors.textSecondary;
-                                e.currentTarget.style.borderColor = theme.colors.border;
-                                e.currentTarget.style.boxShadow = 'none';
-                            }}
-                        >
-                            <Power className="w-4 h-4" />
-                            <span className="text-sm font-medium">Quit Fileshare</span>
-                        </motion.button>
-                    </div>
-                </div>
-            </SlideIn>
+                                {/* Quit Button - Right Side */}
+                                <motion.button
+                                    whileHover={{ scale: 1.02 }}
+                                    whileTap={{ scale: 0.98 }}
+                                    onClick={() => invoke('quit_app')}
+                                    className="flex items-center space-x-2 px-4 py-2 rounded-lg transition-all duration-300"
+                                    style={{
+                                        color: theme.colors.textSecondary,
+                                        backgroundColor: theme.colors.backgroundSecondary,
+                                        border: `1px solid ${theme.colors.border}`,
+                                    }}
+                                    onMouseEnter={(e) => {
+                                        e.currentTarget.style.color = theme.colors.error;
+                                        e.currentTarget.style.borderColor = theme.colors.error;
+                                        e.currentTarget.style.boxShadow = `0 0 12px ${theme.colors.error}40`;
+                                    }}
+                                    onMouseLeave={(e) => {
+                                        e.currentTarget.style.color = theme.colors.textSecondary;
+                                        e.currentTarget.style.borderColor = theme.colors.border;
+                                        e.currentTarget.style.boxShadow = 'none';
+                                    }}
+                                >
+                                    <Power className="w-4 h-4" />
+                                    <span className="text-sm font-medium">Quit Fileshare</span>
+                                </motion.button>
+                            </div>
+                        </div>
+                    </SlideIn>
                 </div>
             </ViewTransition>
         </div>
